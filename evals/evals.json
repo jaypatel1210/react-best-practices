@@ -1,0 +1,55 @@
+{
+  "skill_name": "react-best-practices",
+  "evals": [
+    {
+      "id": 1,
+      "name": "laggy-dashboard",
+      "prompt": "Typing in the customer search box on our analytics dashboard is really laggy, and dragging the window edge to resize makes the whole page stutter. The chart, KPI grid and activity feed are all pretty heavy. Can you fix evals/files/Dashboard.tsx? Write the fixed file and explain what you changed.",
+      "expected_output": "Search state (and its results) moved into its own small component so typing no longer re-renders the heavy widgets; the resize hook replaced or changed so the dashboard only re-renders when the narrow/wide breakpoint flips (for example matchMedia or storing a boolean); root cause explained; memoization not used as the primary fix.",
+      "files": ["evals/files/Dashboard.tsx"],
+      "expectations": [
+        "The search input's state no longer lives in the component that renders KpiGrid, RevenueChart and ActivityFeed (moved into a separate component, or those widgets are passed in as children/element props)",
+        "CustomerSearchResults still receives the current query and only renders when there is a query",
+        "Resizing no longer re-renders the dashboard on every resize event: the hook stores or subscribes to a coarse value (a boolean or breakpoint, e.g. via matchMedia or useSyncExternalStore) instead of raw width/height objects",
+        "RevenueChart still receives a correct compact flag and the stacked layout class still toggles at the 900px breakpoint",
+        "The primary fix is structural; the heavy widgets are not simply wrapped in React.memo with useCallback/useMemo added everywhere (any memoization is secondary and justified)",
+        "The explanation states that a state update re-renders the owning component and everything it renders, and that state inside a custom hook belongs to the component that calls it"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "debounced-search-race",
+      "prompt": "Our product search (evals/files/ProductSearch.tsx) calls the API on every keystroke, and sometimes after I stop typing the list shows results for an older search term. Please add a 300ms debounce and fix the wrong-results bug. We don't have lodash or any data-fetching library and I don't want to add dependencies. Write the updated file.",
+      "expected_output": "A debounce whose timer survives re-renders (debounced value with clearTimeout cleanup, or a debounced function created once per instance), the input's own state update left immediate, stale responses prevented with AbortController or an ignore flag in effect cleanup, HTTP errors checked, AbortError not surfaced as an error, category changes still refetch, no new dependencies.",
+      "files": ["evals/files/ProductSearch.tsx"],
+      "expectations": [
+        "The debounce keeps one timer across re-renders: either a debounced value implemented with an effect that clears the previous timeout in its cleanup, or a debounced function created once per component instance; debounce is not re-created in the render body or on every keystroke",
+        "The input's own value state still updates immediately on every keystroke (only the request is debounced)",
+        "An older response can no longer overwrite newer results (AbortController aborted in effect cleanup, an ignore/active flag, or an explicit latest-request check)",
+        "Pending timers and in-flight requests are cleaned up when the component unmounts",
+        "The code checks response.ok (or the status) before using the data, and an AbortError is not treated as a user-facing error",
+        "Changing the category still triggers a new search with the current query",
+        "No new npm dependencies are added"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "orders-page-review",
+      "prompt": "Can you review evals/files/OrdersPage.tsx before I merge it? Focus on real bugs and performance problems, most important first. Save the review as a markdown file.",
+      "expected_output": "A prioritized review that finds the nine planted issues with concrete failure scenarios and fixes.",
+      "files": ["evals/files/OrdersPage.tsx"],
+      "expectations": [
+        "Flags the orders fetch as a race condition when customerId changes (older response can overwrite newer) and recommends AbortController or an ignore flag; ideally also notes the missing response.ok check",
+        "Flags that debounce() is called during render, so a new debouncer is created on every render and the note is saved for every keystroke (just delayed); recommends creating it once per instance with access to the latest customerId",
+        "Flags OrderRow being defined inside OrdersPage, causing every row (including RowMenu's open state) to remount on each render",
+        "Flags key={index} on the sorted list: after re-sorting, row state such as an open RowMenu sticks to the position instead of the order; recommends key={order.id}",
+        "Flags that memo(OrderSummaryPanel) is defeated by the inline options object (a new object each render), so the ~60 ms panel re-renders on every keystroke in the note",
+        "Flags the unmemoized context provider value, which re-renders every consumer (OrderDetailsDrawer) whenever OrdersPage renders, e.g. on every note keystroke",
+        "Flags that the note textarea's state lives in OrdersPage, so typing re-renders the whole table and panels; recommends moving that state into its own component",
+        "Flags the row menu problems: clicks on the menu bubble to the row's onClick (selecting the row), and/or the absolutely positioned list with z-index 9999 inside the overflow-x: auto wrapper gets clipped; recommends stopPropagation and a portal (or top-layer popover)",
+        "Notes that the useCallback in RowMenu is unnecessary because it is only passed to a DOM button (low severity)",
+        "Findings are ordered by severity/impact and each gives a concrete scenario and a fix"
+      ]
+    }
+  ]
+}

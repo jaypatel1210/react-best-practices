@@ -1,0 +1,7 @@
+node_modules/
+eval-workspace/
+coverage/
+*.pdf
+.DS_Store
+.claude/settings.local.json
+.claude/.cc-writes/

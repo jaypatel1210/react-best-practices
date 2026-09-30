@@ -1,0 +1,27 @@
+{
+  "name": "react-best-practices",
+  "owner": {
+    "name": "Jay Patel",
+    "url": "https://github.com/jaypatel1210"
+  },
+  "metadata": {
+    "description": "Skills that teach Claude to write, review and debug React the way senior React engineers do.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "react-best-practices",
+      "source": "./",
+      "description": "React best-practice skills: re-renders and composition, memoization, reconciliation and keys, component API design, context, refs and closures, layout and portals, data fetching, and error handling.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Jay Patel",
+        "url": "https://github.com/jaypatel1210"
+      },
+      "homepage": "https://github.com/jaypatel1210/react-best-practices",
+      "license": "MIT",
+      "category": "development",
+      "keywords": ["react", "performance", "hooks", "code-review"]
+    }
+  ]
+}

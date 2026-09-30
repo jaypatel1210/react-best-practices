@@ -1,0 +1,23 @@
+{
+  "name": "react-best-practices",
+  "version": "1.0.0",
+  "description": "React best-practice skills: re-renders and composition, memoization, reconciliation and keys, component API design, context, refs and closures, layout and portals, data fetching, and error handling. Includes worked before/after examples, a code-review checklist, and tested utility hooks.",
+  "author": {
+    "name": "Jay Patel",
+    "url": "https://github.com/jaypatel1210"
+  },
+  "homepage": "https://github.com/jaypatel1210/react-best-practices",
+  "repository": "https://github.com/jaypatel1210/react-best-practices",
+  "license": "MIT",
+  "keywords": [
+    "react",
+    "performance",
+    "re-renders",
+    "memoization",
+    "hooks",
+    "context",
+    "data-fetching",
+    "error-boundaries",
+    "code-review"
+  ]
+}
