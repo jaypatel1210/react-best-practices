@@ -14,6 +14,10 @@ Context delivers data from a provider to any descendant without threading props 
 2. **All of them re-render**, including those that read a part of the value that didn't change. Destructuring (`const { open } = useContext(Ctx)`) doesn't narrow the subscription.
 3. **`memo` on a consumer doesn't prevent it.** Reading context behaves like owning state: the component re-renders even when its props are equal.
 
+## Before creating a context: compose
+
+Prop drilling through layout layers is often a composition problem. Create the deep element where the data lives and pass it down as `children` or a slot (`sidebar={<AccountMenu user={user} />}`), so the layers in between never see the data (`react-composition`). Reach for context when many components in different parts of the tree need the same value.
+
 ## Pattern 1: the provider owns the state and renders `children`
 
 ```tsx
@@ -89,6 +93,8 @@ Context has no built-in selectors. In order of preference:
 | Compound component internals (`Tabs`, `Menu`) | Context |
 | Frequently-changing state read by many components in different slices (editors, canvases, real-time dashboards, large forms) | External store with selectors |
 | Server data (lists, entities, pagination) | A data-fetching cache (TanStack Query, SWR, RTK Query, Apollo), not context |
+
+When a store is used, prefer **one store per provider instance** over a module-level singleton when the app renders on the server (each request needs its own state), when the same widget appears several times with independent state (two editors on a page), or when tests need a fresh store. Zustand's `createStore` with `useStore(store, selector)`, Jotai's `Provider` and Redux's `<Provider store>` all support this; context carries the store, and selectors keep re-renders narrow.
 
 ## Anti-patterns
 

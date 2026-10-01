@@ -24,7 +24,7 @@ The flow is always: render, measure the DOM, set state, re-render adjusted.
 - **With `useLayoutEffect`**, React runs the effect after DOM mutations but *before the browser paints*. State updates inside it are processed synchronously before paint, so the user sees only the final layout.
 - **The cost:** layout effects block painting. Keep them small: read the measurements you need, compute, set state. Never fetch or do heavy work there. Everything that doesn't affect the first visible frame belongs in `useEffect`, or in no effect at all.
 - **Re-measure with `ResizeObserver`** on the element rather than listening for window resize. Containers change size when fonts load, sidebars collapse, or content changes.
-- **Batch reads before writes.** Reading layout (`getBoundingClientRect`, `offsetWidth`) after writing styles in a loop forces repeated synchronous layout.
+- **Batch reads before writes.** Reading layout (`getBoundingClientRect`, `offsetWidth`) after writing styles in a loop forces repeated synchronous layout. Many components each measuring themselves in their own layout effect interleave the same way; see `react-animation` for both.
 - **Prefer CSS when it can do the job**: flex-wrap with overflow, container queries, `line-clamp`, `text-overflow`, CSS anchor positioning where supported. CSS doesn't flicker, works with SSR, and costs no JavaScript.
 
 ## SSR and hydration

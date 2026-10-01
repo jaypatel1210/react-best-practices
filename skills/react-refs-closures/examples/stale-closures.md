@@ -121,6 +121,28 @@ const handlerRef = useRef(() => console.log(filters)); // initial value only, ne
 
 `useRef(initial)` uses its argument only on the first render. A function stored this way is frozen at mount. Refresh it after every commit (as `useLatestCallback` does), or don't store functions in refs.
 
+## 5. Values read after `await`, or right after a setter
+
+```tsx
+async function handleCheckout() {
+  setStatus('submitting');
+  console.log(status);                  // still the old status: setters don't change this render's variables
+
+  const order = await placeOrder(cart); // the component re-renders while this is pending
+  if (couponCode) {                     // couponCode from the render that started the handler
+    await applyCoupon(order.id, couponCode);
+  }
+  setCart({ items: [] });
+}
+```
+
+Two different cases:
+
+- **Right after a setter**, the state variable keeps the value of the current render. Setting state schedules a new render; it doesn't reassign `status`. Use the value you just passed to the setter, or compute it first: `const next = …; setStatus(next); use(next);`.
+- **After an `await`**, the handler still runs inside the closure of the render that started it. If the user edited the coupon field while the order was being placed, the handler uses the old code. Decide which you want:
+  - **The values at the time of the click** (usually right for submissions): capture them in local constants at the top of the handler, so the intent is explicit.
+  - **The latest values**: read them through a ref kept current after each commit (`useLatestCallback` for functions), and use functional updates (`setCart((prev) => …)`) for state that may have changed meanwhile.
+
 ## How to recognize stale closures in review
 
 - `// eslint-disable-next-line react-hooks/exhaustive-deps` next to an effect or callback that reads props or state.
@@ -128,3 +150,4 @@ const handlerRef = useRef(() => console.log(filters)); // initial value only, ne
 - A custom `memo` comparator that skips function props.
 - `useRef(someFunction)`, or a debounced or throttled wrapper created once from a function that reads state.
 - A bug report that says "it uses the old value" or "the first value", or "only works after I change something else".
+- State read right after its setter, or after an `await`, in an event handler.

@@ -14,12 +14,16 @@ Use this list when reviewing or auditing React code. Each item gives a pattern t
 8. [Layout, overlays and portals](#7-layout-overlays-and-portals)
 9. [Data fetching](#8-data-fetching)
 10. [Error handling](#9-error-handling)
-11. [Output format](#output-format)
+11. [Responsiveness](#10-responsiveness)
+12. [Large lists](#11-large-lists)
+13. [Loading performance](#12-loading-performance)
+14. [Animation and styling](#13-animation-and-styling)
+15. [Output format](#output-format)
 
 ## Severity guide
 
-- **High (bug):** users see wrong data, lose input or state, hit a crash or blank screen, or data is written to the wrong place. Race conditions, state leaking between entities, remount-on-every-render, missing root error boundary.
-- **Medium (performance on a hot path):** work that repeats on keystrokes, scroll, pointer moves, resize or animation frames, or on large lists. Also broken memoization on components that are demonstrably expensive.
+- **High (bug):** users see wrong data, lose input or state, hit a crash or blank screen, or data is written to the wrong place. Race conditions, state leaking between entities, remount-on-every-render, missing root error boundary, effects that loop or leak listeners that fire repeatedly.
+- **Medium (performance on a hot path):** work that repeats on keystrokes, scroll, pointer moves, resize or animation frames, or on large lists; synchronous work that blocks interactions; avoidable delays to the first screen (LCP) or layout shifts. Also broken memoization on components that are demonstrably expensive.
 - **Low (maintainability):** noise memoization, configuration-prop explosion, legacy patterns with no current cost.
 
 Only call something a performance issue when it sits on a path that runs often or is expensive. "This re-renders" is not a finding by itself; "this re-renders the 2,000-row table on every keystroke" is.
@@ -66,7 +70,12 @@ Only call something a performance issue when it sits on a path that runs often o
 | Rendered values stored in refs | UI doesn't update when they change | Use state. `react-refs-closures` |
 | Boolean "trigger" props for imperative actions (`shouldFocus`, `openNow`) | Fire once, then need resetting, which is fragile | Expose a ref or imperative handle. `react-refs-closures` |
 | `debounce(...)`/`throttle(...)` called in the render body, or re-created whenever state changes | Behaves like a delay: every call still fires | Create once per instance and call the latest callback via a ref; cancel on unmount. `react-refs-closures` |
-| Effect used for logic that belongs to an event (e.g., "after submit, POST") | Runs at the wrong time, runs twice in dev, is hard to follow | Put it in the event handler. |
+| Effect used for logic that belongs to an event (e.g., "after submit, POST") | Runs at the wrong time, runs twice in dev, is hard to follow | Put it in the event handler. `react-effects` |
+| Effect chains (an effect sets state that triggers another effect), or `setState` in an effect body to mirror other state | One render per link, and frames where values disagree | Derive during render; set related state together in the handler. `react-effects` |
+| Object, array or function created during render used as an effect dependency | The effect re-runs every render; with `setState` inside, it loops (silently, if async) | Build it inside the effect and depend on primitives, or stabilize it at the source. `react-effects` |
+| Effect acquires a timer, listener, subscription, observer, socket, worker, widget or object URL without releasing it | Leaks grow with each mount; handlers fire N times after N visits | Return a cleanup; use `{ signal }` for listeners. `react-effects` |
+| Mutation or side effects in updaters, reducers, initializers or render | Doubled side effects in StrictMode; state changes React can't see | Return new values; move side effects to handlers or effects. `react-effects` |
+| Subscription to a browser API or external store via `useState` + `useEffect` | Stale values between render and effect; SSR crashes | `useSyncExternalStore`. `react-effects` |
 
 ## 5. Context and shared state
 
@@ -115,6 +124,46 @@ Only call something a performance issue when it sits on a path that runs often o
 | Errors in event handlers or promises neither handled nor surfaced | Silent failures | Handle locally, or re-throw into the boundary. `react-error-handling` |
 | `setState` inside a `catch` during render | Infinite render loop | Return fallback UI, or let a boundary handle it. `react-error-handling` |
 | Boundary without reporting or without a way to recover | Errors go unseen; users stuck | Add `componentDidCatch`/`onError` reporting and reset (`resetKeys`, a retry button). `react-error-handling` |
+
+## 10. Responsiveness
+
+| Look for | Why it matters | Fix |
+|---|---|---|
+| A click, select or keystroke that synchronously re-renders an expensive subtree | The interaction waits for the render (poor INP) | Transition or deferred value with a `memo` consumer; or restructure. `react-responsiveness` |
+| A controlled input's own value updated inside `startTransition` | The field lags and drops characters | Update the input urgently; defer only the expensive consumer. `react-responsiveness` |
+| Synchronous loops, parsing or sorting over ~50 ms in handlers, effects or render | Blocks all input and painting | Chunk with yields, or move to a Web Worker. `react-responsiveness` |
+| `setState` on every `pointermove`, `scroll` or drag event in a component with a large subtree | Re-renders at event rate | Write styles through a ref once per frame; commit on gesture end. `react-responsiveness` |
+| `flushSync` used to "make updates faster" | Defeats batching; can force Suspense fallbacks | Remove it unless the DOM must be read immediately. `react-responsiveness` |
+
+## 11. Large lists
+
+| Look for | Why it matters | Fix |
+|---|---|---|
+| `.map()` over hundreds or thousands of items into rows, with no pagination or virtualization | Slow mount, scroll and filter; huge DOM | Paginate or virtualize; `content-visibility` for long pages of sections. `react-large-lists` |
+| Virtualized list with index keys, an unbounded container, or state kept inside rows | Wrong row state after scroll; nothing virtualized; state resets | Data-ID keys, a bounded scroll container, state lifted and keyed by ID. `react-large-lists` |
+| Scroll listeners calling `getBoundingClientRect` to detect visibility | Main-thread work on every scroll event | `IntersectionObserver`, or `loading="lazy"` for images and iframes. `react-large-lists` |
+| Infinite scroll without guards for loading, errors and the last page | Duplicate requests, request loops on errors | Guard the trigger; retry button; end state. `react-large-lists` |
+
+## 12. Loading performance
+
+| Look for | Why it matters | Fix |
+|---|---|---|
+| Heavy libraries (editors, charts, PDF, maps) imported statically into routes that don't need them on first paint | Larger entry chunk; later LCP and interactivity | Lazy-load at the boundary that uses them; preload on intent. `react-loading-performance` |
+| `lazy()` called inside a component | Remounts and reloads on every render | Call `lazy` at module scope. `react-loading-performance` |
+| Whole-library imports (`import _ from 'lodash'`), `import * as` with dynamic access, barrels of a package without `"sideEffects"` | Tree-shaking can't drop unused code | Named or per-module imports; declare `"sideEffects"`. `react-loading-performance` |
+| LCP image lazy-loaded, rendered only after a client fetch, or set as a CSS background | The most important resource starts late | Server-render an `<img>` with `fetchPriority="high"`, or preload it. `react-loading-performance` |
+| Images, embeds or late sections without reserved dimensions | Layout shift (CLS) | `width`/`height`, `aspect-ratio`, `min-height`, sized fallbacks. `react-loading-performance` |
+| Fonts from third-party CSS, no `font-display`, or preloads without `crossorigin` | Invisible or shifting text; double downloads | Self-host WOFF2, choose `font-display`, match fallback metrics. `react-loading-performance` |
+
+## 13. Animation and styling
+
+| Look for | Why it matters | Fix |
+|---|---|---|
+| Animations or transitions of `width`, `height`, `top`, `left` or `margin` on large or many elements | Layout and paint every frame | Animate `transform`/`opacity`; FLIP for layout changes. `react-animation` |
+| Animation driven by `setState` on a timer or every frame | Re-renders per frame; freezes during main-thread work | CSS, the Web Animations API, or refs in `requestAnimationFrame`. `react-animation` |
+| Layout reads interleaved with style writes in a loop, or per-item measure-and-adjust layout effects | Forced synchronous layout, N times per frame | Read all, then write all; measure once in the parent; `ResizeObserver`. `react-animation` |
+| CSS-in-JS interpolating continuously changing values (`${(p) => p.$width}px`), or `css`/`styled` declared inside components | A new class per value; serialization every render | One static rule with a custom property; hoist static styles. `react-animation` |
+| `will-change` on many elements or left on permanently; reduced-motion preference ignored | Layer memory; accessibility | Apply `will-change` around the animation only; honor `prefers-reduced-motion`. `react-animation` |
 
 ## Output format
 

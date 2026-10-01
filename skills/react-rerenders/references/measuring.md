@@ -18,6 +18,7 @@ Optimize only what you have measured. A re-render that costs a fraction of a mil
 - **Throttle the CPU** by 4–6× in Chrome DevTools → Performance → CPU. Developer laptops hide problems that mid-range phones show immediately.
 - **Use realistic data volumes**: the real number of rows, real text length, real images.
 - **Measure the interaction users feel.** Measure the keystroke, the click that opens a menu, the scroll, not "page load" in the abstract. Interaction to Next Paint (INP) is the user-centric metric for this; aim for under 200 ms.
+- **Translate milliseconds into frames.** A frame lasts 16.7 ms at 60 Hz and 8.3 ms at 120 Hz. A 50 ms render during a drag or scroll drops about three frames at 60 Hz, which users see as a stutter. That's why the example below flags renders over 16 ms.
 
 ## 2. React DevTools: see what renders and why
 
@@ -37,7 +38,8 @@ Record the interaction in the Performance panel to see the whole picture: script
 
 - **Long tasks** (red-flagged, over 50 ms) during the interaction are what users feel as jank.
 - Recent React versions add React-specific tracks to this panel (scheduler priorities and component render timings) when using a development or profiling build. They make it easier to see whether time goes to React rendering, effects, or the browser's layout and paint.
-- If most time goes to **Layout** or **Recalculate Style**, the problem is CSS or DOM size, not re-renders. Check for layout thrashing (reading `offsetHeight` after writing styles in a loop), huge DOM trees, and expensive selectors.
+- If most time goes to **Layout** or **Recalculate Style**, the problem is CSS or DOM size, not re-renders. Check for layout thrashing (reading `offsetHeight` after writing styles in a loop), huge DOM trees, and expensive selectors. See `react-animation/references/rendering-pipeline.md` and `react-large-lists`.
+- **Mark your own operations** with `performance.mark()` and `performance.measure()`; they appear in the panel's *Timings* track next to React's work (`react-loading-performance/references/core-web-vitals.md`).
 
 ## 4. The Profiler API in code
 

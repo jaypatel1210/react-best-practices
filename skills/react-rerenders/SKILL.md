@@ -128,8 +128,8 @@ When two distant components share state, lifting it to their common ancestor re-
 
 ## When the expensive render is unavoidable
 
-- **Keep input responsive while heavy content catches up.** Use `useDeferredValue(query)`, or wrap the non-urgent update in `startTransition`, and pair it with a `memo`-ed consumer so the deferred render can be skipped or interrupted.
-- **Render less.** Virtualize long lists (TanStack Virtual, react-window) and lazy-load hidden panels.
+- **Keep input responsive while heavy content catches up.** Use `useDeferredValue(query)`, or wrap the non-urgent update in `startTransition`, and pair it with a `memo`-ed consumer so the deferred render can be skipped or interrupted. More patterns, and what to do when one computation is the bottleneck: `react-responsiveness`.
+- **Render less.** Virtualize long lists and lazy-load hidden panels (`react-large-lists`).
 - **Then memoize precisely.** Follow the rules in the `react-memoization` skill; they are easy to get wrong.
 
 Debouncing is for **side effects** like network requests. For **rendering cost**, prefer deferred values. See `react-refs-closures` for debounce.

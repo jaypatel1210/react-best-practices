@@ -14,7 +14,7 @@ Check the project's React version (`package.json`, lockfile) and build setup bef
 
 ## React 18
 
-- **Automatic batching**: state updates inside promises, timeouts and native handlers are batched like those in React event handlers. Several `setState` calls in one tick cause one render.
+- **Automatic batching**: state updates inside promises, timeouts and native handlers are batched like those in React event handlers. Several `setState` calls in one tick cause one render. It requires `createRoot`; apps still on `ReactDOM.render` keep React 17 behavior. Under `createRoot`, `unstable_batchedUpdates` wrappers are redundant.
 - **Concurrent features**: `startTransition`/`useTransition` mark updates as non-urgent, and `useDeferredValue` lets a value lag behind during heavy renders. These are the tools for "typing is slow because the list is expensive" (`react-rerenders`).
 - **StrictMode in development** simulates an unmount and remount on mount (keeping state and DOM), so effects run setup → cleanup → setup. It exposes missing cleanups (fetch races, subscriptions, timers). Don't work around it with "has run" refs.
 - **New hooks**: `useId` (stable IDs that match between server and client), `useSyncExternalStore` (subscribing to external stores, the basis for selector-based state libraries), `useInsertionEffect` (for CSS-in-JS libraries, and useful for keeping a latest-callback ref updated early).
@@ -38,6 +38,7 @@ Check the project's React version (`package.json`, lockfile) and build setup bef
 - **StrictMode** also double-invokes ref callbacks on mount, and reuses the first-render result of `useMemo`/`useCallback` during the double render.
 - **Better hydration errors**: mismatches report a diff. Fix the cause (render-time `window` checks, dates, random values) rather than suppressing the warning.
 - **`useDeferredValue(value, initialValue)`** accepts an initial value, which is useful for showing a cheap first render.
+- **Document metadata and resources**: `<title>`, `<meta>` and `<link>` rendered anywhere are hoisted into `<head>` (stylesheets need a `precedence` prop), and `react-dom` exports `preconnect`, `prefetchDNS`, `preload`, `preloadModule`, `preinit` and `preinitModule` for resource hints that dedupe and stream early (`react-loading-performance`).
 
 ## React 19.2
 
@@ -50,7 +51,7 @@ Check the project's React version (`package.json`, lockfile) and build setup bef
 
 ## React 19.3
 
-- **`<ViewTransition>`** (with `addTransitionType`) for animating between UI states with the browser's View Transitions API, and **Fragment refs**, are stable.
+- **`<ViewTransition>`** (with `addTransitionType`) for animating between UI states with the browser's View Transitions API, and **Fragment refs**, are stable. A `<ViewTransition>` animates only for updates in `startTransition`, `useDeferredValue`, Actions or Suspense reveals; urgent updates commit without animation. Patterns and the `flushSync` fallback for older versions: `react-animation`.
 - Check the release notes before relying on newer APIs, and follow the version in the project's lockfile.
 
 ## React Compiler
@@ -69,6 +70,9 @@ In frameworks with Server Components (such as the Next.js App Router):
 - **Client Components (`"use client"`) are the interactive leaves.** Keep that boundary low, and keep state in the smallest client component that needs it. This is the same colocation rule as "move state down".
 - **Server Components can be passed as `children` to Client Components.** This is "wrap, don't own" at the architecture level: a client wrapper (a scroll container, tabs, a modal) can host server-rendered content without turning it into client code or re-rendering it.
 - **Context, state, effects and refs exist only in Client Components.** Put providers in a client component near the root and render server content inside them through `children`.
+- **Server Components are not SSR.** SSR still ships a component's code and hydrates it; a Server Component ships no component code and never hydrates or re-renders on the client. Everything imported from a `"use client"` module becomes client code, so a Client Component can't import a Server Component; it receives server content through `children` or props.
+- **Guard server-only modules** with `import 'server-only'`, so importing one from client code fails the build instead of leaking secrets.
+- **Server Functions** (`"use server"`, formerly called Server Actions) are public HTTP endpoints. Validate input and check authorization inside each one, whatever the calling component checks.
 
 ## Quick translation table
 

@@ -104,14 +104,25 @@ function Badge({ color, children }: { color: string; children: React.ReactNode }
 }
 ```
 
-Define the styled component once and pass dynamic values as props (or CSS variables):
+Define the styled component once, at module scope. For a handful of known values (a palette of badge colors), an interpolated prop is fine:
 
 ```tsx
-const Pill = styled.span<{ $color: string }>`background: ${(p) => p.$color};`;
-function Badge({ color, children }: BadgeProps) {
-  return <Pill $color={color}>{children}</Pill>;
+const Pill = styled.span<{ $tone: BadgeTone }>`background: ${(p) => toneColors[p.$tone]};`;
+function Badge({ tone, children }: BadgeProps) {
+  return <Pill $tone={tone}>{children}</Pill>;
 }
 ```
+
+For arbitrary or continuously changing values (a user-picked color, a width while dragging), interpolation creates a new CSS class for every distinct value. Use one static rule that reads a custom property instead:
+
+```tsx
+const Pill = styled.span`background: var(--pill-color);`;
+function Badge({ color, children }: { color: string; children: React.ReactNode }) {
+  return <Pill style={{ '--pill-color': color } as React.CSSProperties}>{children}</Pill>;
+}
+```
+
+More on runtime styling costs: `react-animation/examples/dynamic-styles.md`.
 
 ## What is fine
 

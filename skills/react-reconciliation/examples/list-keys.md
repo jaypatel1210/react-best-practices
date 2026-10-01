@@ -52,6 +52,11 @@ rows.map((row) => <ImportRowEditor key={row.id} row={row} />);
 
 If rows come from a server that lacks IDs, derive a stable key from content that's unique and doesn't change while the row is on screen (for example `${row.date}:${row.account}`). Otherwise, add IDs when you receive the response.
 
+Two details:
+
+- **`crypto.randomUUID()` exists only in secure contexts** (HTTPS and `localhost`). On a plain-HTTP origin, such as a dev server opened by LAN IP or an internal tool, it's `undefined` and the call throws. A module-level counter works everywhere: ``let nextId = 0; const id = `row-${nextId++}`;``.
+- **Don't use `useId` for list keys.** It generates IDs for accessibility attributes and is tied to a component's position in the tree, not to your data.
+
 ## Scenario 3: IDs unique only within groups
 
 ```tsx

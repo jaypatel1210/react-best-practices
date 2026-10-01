@@ -88,6 +88,7 @@ It works because the stable function captures the ref *object*, which never chan
 
 - **Debounce**: run after calls stop for N ms. Use it for search-as-you-type, validation, and "resize finished".
 - **Throttle**: run at most once per N ms, with a trailing call carrying the latest arguments. Use it for autosave while typing, drag and scroll tracking, and analytics.
+- **Starting values:** around 250–400 ms for search requests, about a second or more for autosave, and one animation frame (not a millisecond interval) for anything visual, such as drag or scroll effects (`react-responsiveness` has a frame-throttled hook). Tune against the real backend and the feel of the interaction.
 
 Rules:
 

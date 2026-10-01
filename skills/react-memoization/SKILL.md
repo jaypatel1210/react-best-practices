@@ -52,6 +52,8 @@ Wrap a component in `memo` only when all three hold:
 - its render is measurably expensive;
 - you can keep *all* of its props stable.
 
+Place it at the root of a branch that doesn't read the changing value, so one check skips the whole branch, rather than on many leaves. A `memo` component with no props always passes its check (it still re-renders for its own state and the contexts it reads).
+
 ## How `memo` silently breaks
 
 One unstable prop defeats the whole check. Look for:
@@ -67,6 +69,7 @@ One unstable prop defeats the whole check. Look for:
 | Default params `items = []`, `config = {}` | New value each render when the prop is omitted | Module-level `const EMPTY: Item[] = []` |
 | `data.map(…)`, `list.filter(…)` passed as props | New array each render | `useMemo` the derived array |
 | A memoized value with an unstable dependency | Cache busts every render | Fix stability at the top of the chain |
+| Items from a fetch or JSON parse | Every response creates new objects, even for unchanged items, so every `memo` row re-renders after a refetch | Structural sharing (TanStack Query keeps unchanged parts identical by default), or merge by ID and keep the previous object when it's equal |
 
 Two more ways `memo` looks broken:
 

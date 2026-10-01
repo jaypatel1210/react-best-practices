@@ -1,6 +1,6 @@
 # React Best Practices: Skills for Claude
 
-Ten Agent Skills that teach Claude to write, review and debug React the way experienced React engineers do. They cover re-render performance, memoization, component identity, API design, context, refs and closures, overlays, data fetching and error handling.
+Fifteen Agent Skills that teach Claude to write, review and debug React the way experienced React engineers do. They cover re-render performance, memoization, component identity, API design, context, effects, refs and closures, overlays, data fetching, error handling, interaction responsiveness, large lists, page-load performance, and animation.
 
 The skills are tuned to React 18 and 19, including React 19.2 and React Compiler, and work with any framework: Next.js, Vite, Remix, React Router, or React Native (except the DOM-specific parts).
 
@@ -18,6 +18,11 @@ The skills are tuned to React 18 and 19, including React 19.2 and React Compiler
 | `react-layout-portals` | fix flicker after mount, measure the DOM, or build modals, tooltips and dropdowns (z-index, clipping) |
 | `react-data-fetching` | fetch data, fix request waterfalls or race conditions, or design loading states |
 | `react-error-handling` | add error boundaries, handle async and event-handler errors, or set up reporting |
+| `react-effects` | write or review `useEffect`, hit effect loops or double-firing, or chase memory leaks and missing cleanups |
+| `react-responsiveness` | report clicks or typing that freeze the page, poor INP or long tasks, or process large data on the client |
+| `react-large-lists` | render long lists, tables, feeds or long pages, or build infinite scroll |
+| `react-loading-performance` | fight a large bundle, slow first load, poor LCP or CLS, or add images, fonts, code splitting and preloading |
+| `react-animation` | build or fix animations, drags and transitions, animate reorders (FLIP, View Transitions), or see heavy layout and paint work or CSS-in-JS overhead |
 
 Each skill follows the same layout:
 
@@ -26,7 +31,7 @@ skills/<skill-name>/
 ├── SKILL.md       # the rules, loaded when the skill triggers (kept lean)
 ├── examples/      # worked before/after scenarios, loaded only when relevant
 ├── references/    # deeper material (checklists, cheat sheets), loaded on demand
-└── assets/        # ready-to-copy, tested code (refs-closures, error-handling)
+└── assets/        # ready-to-copy, tested code (refs-closures, error-handling, responsiveness, large-lists)
 ```
 
 Claude reads `SKILL.md` first and opens an example or reference only when the task needs it, so every file stays out of the context window until it's useful.
@@ -39,6 +44,9 @@ Claude reads `SKILL.md` first and opens an example or reference only when the ta
 | `skills/react-refs-closures/assets/use-debounced-callback.ts` | A debounce that survives re-renders, with `cancel`/`flush`/`isPending` and optional flush on unmount |
 | `skills/react-refs-closures/assets/use-throttled-callback.ts` | A leading + trailing throttle with the same guarantees |
 | `skills/react-error-handling/assets/error-boundary.tsx` | `ErrorBoundary` (`fallback`, `fallbackRender`, `onError`, `onReset`, `resetKeys`) and `useThrowToBoundary()` |
+| `skills/react-responsiveness/assets/use-frame-throttled-callback.ts` | A stable function that runs the latest callback at most once per animation frame, with `cancel`/`flush`/`isPending` |
+| `skills/react-responsiveness/assets/yield-to-main.ts` | `yieldToMain()` (uses `scheduler.yield()` with a fallback) and `runInChunks()` for breaking long loops into short tasks, with `AbortSignal` support |
+| `skills/react-large-lists/assets/use-in-view.ts` | `useInView()`, an `IntersectionObserver` hook with a callback ref, thresholds, root margins and a `once` latch |
 
 They're dependency-free, typed, tested against React 18 and React 19, and clean under the React Compiler lint rules (see [Maintaining](#maintaining)).
 
@@ -79,6 +87,9 @@ There's nothing to invoke. Work normally, and Claude loads the relevant skill fr
 - "Add a 300 ms debounce to this search input; it also sometimes shows results for an old query."
 - "Our modal shows up under the sticky header even with `z-index: 9999`."
 - "Should I wrap this handler in `useCallback`?"
+- "Our audit log table has 20,000 rows and scrolling is unusable."
+- "Lighthouse says our LCP is 4 seconds; the hero image loads late."
+- "Clicking a tab freezes the page for half a second."
 
 To force a skill, name it: "use the react-memoization skill to review this component".
 

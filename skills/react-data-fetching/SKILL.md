@@ -79,6 +79,7 @@ Related points:
 - **It doesn't parallelize anything by itself.** If a parent suspends and its child starts fetching only when it renders, that's still a waterfall. Start requests early (loaders, prefetching, promises passed down from Server Components).
 - **React 19 commits the fallback immediately** and pre-renders suspended siblings afterwards. Requests started *inside* suspending children begin later than in React 18, which is one more reason to start them before rendering.
 - **`use(promise)` needs a promise created outside render**, from a cache, a loader, or a Server Component. `use(fetch(url))` inline in a Client Component creates a new promise on every render.
+- **Hand-rolled "throw a promise" resources** (a `read()` that throws a pending promise) are not a supported API. Use `use()` with a cached promise, or the data library's Suspense hooks.
 - **Place boundaries to match the loading sequence**: one boundary around content that should appear together, separate boundaries around independent regions.
 
 ## Checklist

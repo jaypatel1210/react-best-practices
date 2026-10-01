@@ -38,7 +38,7 @@ function CustomerDirectory({ customers }: { customers: Customer[] }) {
   return (
     <>
       <input value={query} onChange={(e) => setQuery(e.target.value)} />
-      <div style={{ opacity: isStale ? 0.6 : 1 }}>
+      <div className={isStale ? 'directory directory--stale' : 'directory'}>
         <CustomerTable rows={visible} />
       </div>
     </>

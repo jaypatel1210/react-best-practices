@@ -22,7 +22,11 @@ The patterns in `SKILL.md` are library-independent. This table shows how each ma
 | Keep old data while the key changes | `placeholderData: keepPreviousData` |
 | Errors to an error boundary | `throwOnError: true` (or a function), or `useSuspenseQuery` |
 | Suspense | `useSuspenseQuery` inside `<Suspense>` boundaries; prefetch to avoid suspense waterfalls |
-| Derived data | `select` with a stable function reference |
+| Derived data | `select` with a stable function reference. The selected result is compared too, so a component that selects `data.items.length` re-renders only when the count changes |
+| Stable identity across refetches | `structuralSharing` (on by default) keeps every unchanged part of refetched data referentially identical, so `memo` rows skip. It only works for JSON-compatible data; for huge or non-JSON payloads, set it to `false` or pass a function |
+| Fewer re-renders per component | Results are tracked: a component re-renders only when the fields it reads change (reading only `data` ignores background `isFetching` flips). Spreading the result (`const { data, ...rest } = useQuery(…)`) reads every field and disables this; `notifyOnChangeProps` overrides it |
+| Update one item without refetching the list | Cache items under their own keys (`['todo', id]`) next to the list (`['todos']`), seeded with `setQueryData` or fetched with `useQueries`. Keys match by prefix, so `invalidateQueries({ queryKey: ['todo', id] })` touches one item |
+| Pass a mutation to children | `mutate` and `mutateAsync` are stable; the object `useMutation` returns is not, so don't pass it as a prop or list it as a dependency |
 | Check HTTP status | Your `queryFn` must throw on `!res.ok`; the library can't know a 404 is an error |
 
 Define query options once and reuse them, so keys and functions stay consistent between prefetching and components:
