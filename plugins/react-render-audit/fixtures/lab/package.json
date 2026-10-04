@@ -1,0 +1,16 @@
+{
+  "name": "render-audit-lab",
+  "private": true,
+  "description": "Test app for react-render-audit: the same store with planted re-render problems (?variant=broken), fixed (?variant=fixed), and a fix that changes behavior (?variant=wrong). It runs on the repository's own react, react-dom and vite.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.config.mjs --port 5199 --strictPort"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "vite": "*"
+  }
+}

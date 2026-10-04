@@ -1,0 +1,29 @@
+{
+  "name": "store",
+  "description": "Search for products, add two to the cart, then narrow the window.",
+  "steps": [
+    {
+      "name": "type \"ra\" in search",
+      "action": "type",
+      "target": { "role": "textbox", "name": "Search products" },
+      "text": "ra",
+      "delayMs": 80
+    },
+    {
+      "name": "add Trail Runner",
+      "action": "click",
+      "target": { "role": "button", "name": "Add Trail Runner to cart" }
+    },
+    {
+      "name": "add Canvas Tote",
+      "action": "click",
+      "target": { "role": "button", "name": "Add Canvas Tote to cart" }
+    },
+    {
+      "name": "narrow the window",
+      "action": "resize",
+      "width": 1000,
+      "height": 800
+    }
+  ]
+}
