@@ -1,0 +1,9 @@
+{
+  "name": "render-audit-react18",
+  "private": true,
+  "description": "React 18 for the tracker unit tests (npm install here; see tests/tracker-react18.test.mjs).",
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}

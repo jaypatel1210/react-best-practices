@@ -2,7 +2,7 @@
   "name": "react-best-practices-skills",
   "version": "1.0.0",
   "private": true,
-  "description": "Maintainer tooling for the react-best-practices skills: type-checks and tests the code shipped in skills/*/assets.",
+  "description": "Maintainer tooling for the react-best-practices skills: type-checks and tests the code shipped in skills/*/assets, and tests the react-render-audit plugin.",
   "author": "Jay Patel (https://github.com/jaypatel1210)",
   "license": "MIT",
   "repository": {
@@ -13,10 +13,12 @@
   "packageManager": "bun@1.4.0",
   "scripts": {
     "test": "vitest run",
+    "test:render-audit": "vitest run --config plugins/react-render-audit/vitest.config.mjs",
+    "e2e:render-audit": "node plugins/react-render-audit/tests/e2e.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "validate": "claude plugin validate --strict .",
-    "check": "bun run typecheck && bun run lint && bun run test"
+    "check": "bun run typecheck && bun run lint && bun run test && bun run test:render-audit"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.3",

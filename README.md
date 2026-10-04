@@ -93,6 +93,17 @@ There's nothing to invoke. Work normally, and Claude loads the relevant skill fr
 
 To force a skill, name it: "use the react-memoization skill to review this component".
 
+## Cut re-renders in your app: `/optimize-renders`
+
+[`plugins/react-render-audit`](plugins/react-render-audit/) is a second, opt-in plugin in this marketplace. It puts the skills to work on a real codebase:
+
+```
+/plugin install react-render-audit@react-best-practices
+/optimize-renders
+```
+
+It asks which directories and which user flow to target, then replays the flow in headless Chrome. A tracker injected before React loads counts every component render and why it happened (state, context, unstable props, parent, remounts, effect cascades), with no change to your code. It fixes the worst causes in your scope one at a time using these skills. A fix is kept only if your type check, lint and tests pass, behavior is identical at every step (text, accessibility tree, DOM, network, console) and renders went down; otherwise the files are restored. It ends with a before/after report. It works with Next.js (both routers), Vite and other React DOM apps on React 18 and 19. See [its README](plugins/react-render-audit/README.md).
+
 ## Maintaining
 
 The tooling uses [Bun](https://bun.sh) as its package manager and script runner. The skills themselves have no runtime dependencies.
