@@ -1,8 +1,8 @@
 {
   "name": "react-render-audit",
   "displayName": "React Render Audit",
-  "version": "0.1.0",
-  "description": "Measure and cut React re-renders in a real React or Next.js app without changing behavior: /optimize-renders replays a user flow in headless Chrome, counts every component render and why it happened, fixes the worst causes with the react-best-practices skills, proves each fix kept behavior identical, and writes a before/after report.",
+  "version": "0.2.0",
+  "description": "Measure and cut React re-renders in a real React or Next.js app without changing behavior, then prove the speed-up: /optimize-renders replays a user flow in headless Chrome, counts every component render and why, fixes the worst causes with the react-best-practices skills, proves each fix kept behavior identical, times old and new code side by side on mobile and desktop profiles with confidence intervals, and writes a before/after report.",
   "author": {
     "name": "Jay Patel",
     "url": "https://github.com/jaypatel1210"
@@ -10,6 +10,20 @@
   "homepage": "https://github.com/jaypatel1210/react-best-practices/tree/main/plugins/react-render-audit",
   "repository": "https://github.com/jaypatel1210/react-best-practices",
   "license": "MIT",
-  "keywords": ["react", "nextjs", "performance", "re-renders", "profiling", "audit", "refactoring", "chrome-devtools-protocol"],
-  "dependencies": ["react-best-practices"]
+  "keywords": [
+    "react",
+    "nextjs",
+    "performance",
+    "re-renders",
+    "profiling",
+    "audit",
+    "refactoring",
+    "inp",
+    "web-vitals",
+    "benchmark",
+    "chrome-devtools-protocol"
+  ],
+  "dependencies": [
+    "react-best-practices"
+  ]
 }

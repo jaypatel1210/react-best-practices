@@ -1,10 +1,13 @@
 // Builds the before/after report (self-contained HTML plus Markdown) from an audit directory:
-// the baseline, the final measurement, the change log and the comparisons.
+// the baseline, the final measurement, the change log and the comparisons, plus the timing
+// benchmark and field data when they exist. A benchmark alone also makes a report.
 import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { analyzeScenario, scenariosOf } from './analyze.mjs';
+import { benchMarkdown, comparisonRows, flowLine, ms, responseMs, speedHeadline } from './bench.mjs';
 import { readChanges } from './changes.mjs';
 import { compareScenario } from './compare.mjs';
+import { ratingLabel } from './stats.mjs';
 import { percentChange, readJson, round } from './util.mjs';
 
 const esc = (value) =>
@@ -56,6 +59,93 @@ function bars(rows) {
     .join('');
 }
 
+/** The benchmark to report: the one named, or the newest. Returns { label, dir, data } or null. */
+function benchOf(audit, requested) {
+  const root = join(audit, 'bench');
+  if (!existsSync(root)) return null;
+  const labels = readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && existsSync(join(root, entry.name, 'bench.json')))
+    .map((entry) => ({ name: entry.name, time: statSync(join(root, entry.name, 'bench.json')).mtimeMs }))
+    .sort((a, b) => a.time - b.time)
+    .map((entry) => entry.name);
+  if (requested && !labels.includes(requested)) throw new Error(`--bench ${requested} not found (have: ${labels.join(', ') || 'none'})`);
+  const label = requested || labels[labels.length - 1];
+  return label ? { label, dir: join('bench', label), data: readJson(join(root, label, 'bench.json')) } : null;
+}
+
+function fieldOf(audit) {
+  const dir = join(audit, 'field');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .sort()
+    .map((name) => ({ name: name.replace(/\.json$/, ''), ...readJson(join(dir, name)) }));
+}
+
+const IMPACT_CLASS = { high: 'good', medium: 'good', low: 'muted', none: 'muted' };
+function impactHtml(impact) {
+  if (!impact || impact.level === 'none') return '<span class="muted">no measurable change</span>';
+  if (impact.direction === 'worse') return `<span class="bad">slower · ${esc(impact.level)}</span>`;
+  return `<span class="${IMPACT_CLASS[impact.level]}">${esc(impact.level)}</span>`;
+}
+
+function speedHtml(bench) {
+  if (!bench) return [];
+  const { data } = bench;
+  const compare = data.mode === 'compare';
+  const html = [`<h2>Measured speed${compare ? '-up' : ''}</h2>`];
+  html.push(`<p class="verdict">${esc(speedHeadline(data))}</p>`);
+  html.push(`<p class="muted">Timed separately from the render counts, with no tracker in the page: ${compare ? `A = ${esc(data.sides.a.label)}${data.sides.a.sha ? ` (<code>${esc(data.sides.a.sha.slice(0, 10))}</code>)` : ''}, B = ${esc(data.sides.b.label)}${data.sides.b.sha ? ` (<code>${esc(data.sides.b.sha.slice(0, 10))}</code>)` : ''}, run back to back in alternating order` : `${esc(data.sides.a.label)}`}. A change is reported only when its 95% confidence interval excludes zero; impact is judged on the cautious end of that interval.</p>`);
+  for (const item of data.results) {
+    const vp = item.viewport;
+    html.push(`<div class="panel"><h3>${esc(item.scenario)} · ${esc(item.profile)} <span class="muted">(${vp.width}×${vp.height}, CPU ${esc(item.cpuRate)}×, ${esc(item.pairs)} ${compare ? 'pairs' : 'runs'})</span></h3>`);
+    if (compare) {
+      html.push('<table class="wide"><thead><tr><th>#</th><th>Step</th><th>Measured</th><th>Before → after</th><th>Change (95% CI)</th><th>Rating</th><th>Impact</th></tr></thead><tbody>');
+      for (const row of comparisonRows(item)) {
+        html.push(`<tr><td>${esc(row.index)}</td><td>${esc(row.name)}${row.impact.level !== 'none' ? `<br><span class="muted">${esc(row.reasons.join('; '))}</span>` : ''}</td><td>${esc(row.metric)}</td><td><span class="was">${esc(row.beforeText)}</span> → <strong>${esc(row.afterText)}</strong></td><td>${esc(row.change)}${row.relative ? `<br><span class="muted">${esc(row.relative)}</span>` : ''}</td><td>${esc(row.rating)}</td><td>${impactHtml(row.impact)}</td></tr>`);
+      }
+      html.push('</tbody></table>');
+      html.push(`<p><strong>Whole flow:</strong> ${esc(flowLine(item))} — ${impactHtml(item.analysis.flow.impact)}</p>`);
+      const notes = [];
+      if (item.aa) notes.push(!item.aa.judged ? `A/A noise estimate from ${esc(item.aa.pairs)} pairs` : item.aa.ok ? 'A/A check passed (identical runs showed no difference)' : '<span class="bad">A/A check failed: identical runs differed, so small differences deserve caution</span>');
+      if (item.replay && item.replay.requests) notes.push(`${esc(item.replay.distinct)} API request(s) recorded once and replayed to both sides`);
+      if (item.traces && item.traces.a) notes.push(`Chrome traces: <a href="${esc(join(bench.dir, item.traces.a))}">before</a>${item.traces.b ? ` · <a href="${esc(join(bench.dir, item.traces.b))}">after</a>` : ''} (open in DevTools → Performance → Load profile)`);
+      if (notes.length) html.push(`<p class="muted">${notes.join(' · ')}</p>`);
+    } else {
+      html.push('<table class="wide"><thead><tr><th>#</th><th>Step</th><th>Response time (95% CI)</th><th>Rating</th><th>Main thread</th><th>Blocking time</th></tr></thead><tbody>');
+      for (const step of item.analysis.steps) {
+        html.push(`<tr><td>${esc(step.index)}</td><td>${esc(step.name)}</td><td>${step.inp ? `${esc(responseMs(step.inp.median))} <span class="muted">(${esc(round(step.inp.low, 1))}–${esc(round(step.inp.high, 1))})</span>` : '—'}</td><td>${step.inp ? esc(ratingLabel(step.rating)) : ''}</td><td>${esc(ms(step.mainThread.median))}</td><td>${esc(ms(step.tbt.median))}</td></tr>`);
+      }
+      html.push('</tbody></table>');
+    }
+    html.push('</div>');
+  }
+  html.push(`<p class="muted">Raw runs: <a href="${esc(join(bench.dir, 'bench.json'))}">${esc(join(bench.dir, 'bench.json'))}</a>. Reproduce with <code>render-audit bench</code> on the same commits; the milliseconds depend on the machine, the verdicts shouldn't.</p>`);
+  return html;
+}
+
+function fieldHtml(entries) {
+  if (!entries.length) return [];
+  const html = ['<h2>Real users</h2>'];
+  for (const entry of entries) {
+    if (entry.kind === 'compare') {
+      const r = entry.result;
+      const o = r.overall;
+      html.push(`<div class="panel"><h3>${esc(entry.name)}: ${esc(r.metric)} p75 before → after</h3><p>${esc(r.metric === 'CLS' ? round(o.a, 2) : ms(o.a))} → <strong>${esc(r.metric === 'CLS' ? round(o.b, 2) : ms(o.b))}</strong> (${esc(ratingLabel(o.ratingBefore))} → ${esc(ratingLabel(o.ratingAfter))}), ${esc(o.n[0])} and ${esc(o.n[1])} samples: ${o.verdict === 'better' ? '<span class="good">faster</span>' : o.verdict === 'worse' ? '<span class="bad">slower</span>' : `<span class="muted">${esc(o.verdict === 'same' ? 'no measurable change' : o.verdict)}</span>`}.</p></div>`);
+    } else if (entry.kind === 'crux') {
+      const what = entry.result.key ? entry.result.key.origin || entry.result.key.url : '';
+      if (entry.split) {
+        const items = Object.entries(entry.split.metrics).map(([name, item]) => `${name}: ${item.before ? (name === 'CLS' ? item.before.p75 : ms(item.before.p75)) : '—'} → ${item.after ? (name === 'CLS' ? item.after.p75 : ms(item.after.p75)) : 'not yet'}`);
+        html.push(`<div class="panel"><h3>Chrome UX Report, ${esc(what)}</h3><p>28-day p75 around the deploy on ${esc(entry.split.deploy)}: ${esc(items.join(' · '))}.</p><p class="muted">${Object.values(entry.split.metrics).some((item) => !item.after) ? `The first window made only of post-deploy visits ends ${esc(entry.split.firstCleanWindowEnds)}. ` : ''}CrUX covers all Chrome users over 28 days, so other changes in that time count too.</p></div>`);
+      } else if (entry.result.metrics) {
+        const items = Object.entries(entry.result.metrics).map(([name, metric]) => `${name} ${name === 'CLS' ? metric.p75 : ms(metric.p75)} (${ratingLabel(metric.rating)})`);
+        html.push(`<div class="panel"><h3>Chrome UX Report, ${esc(what)}</h3><p>${esc(items.join(' · '))}${entry.result.period ? `, ${esc(entry.result.period.first)} to ${esc(entry.result.period.last)}` : ''}.</p></div>`);
+      }
+    }
+  }
+  return html;
+}
+
 const CSS = `
 :root{--bg:#fbfbfa;--panel:#fff;--text:#1d1d1f;--muted:#6b6b70;--line:#e6e4e0;--accent:#4f46e5;--accent-soft:#e0e7ff;--before:#c9c6bf;--good:#0f7b45;--bad:#b42318;--code:#f4f3f0}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121214;--panel:#1b1b1f;--text:#ececef;--muted:#9a9aa3;--line:#2c2c33;--accent:#8b8cf8;--accent-soft:#2a2a52;--before:#4a4a52;--good:#4ade80;--bad:#f87171;--code:#232329}}
@@ -86,15 +176,55 @@ pre{background:var(--code);padding:12px;border-radius:8px;overflow-x:auto;white-
 details summary{cursor:pointer;color:var(--accent);margin-top:6px}
 .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}.shots figure{margin:0}.shots img{width:100%;border:1px solid var(--line);border-radius:8px}.shots figcaption{font-size:12px;color:var(--muted)}
 ul.tight{margin:6px 0;padding-left:20px}
+a{color:var(--accent)}
+table.wide{min-width:720px}
 footer{margin-top:48px;color:var(--muted);font-size:13px}
 @media (max-width:640px){h1{font-size:24px}.bar-row{grid-template-columns:110px 1fr}.bar-num{grid-column:2}}
 `;
 
-export function writeReport(config, { final: requested } = {}) {
+function writeSpeedReport(config, bench, field) {
+  const audit = config.audit;
+  const project = (config.detected && config.detected.name) || basename(config.appRoot || audit);
+  const date = new Date().toISOString().slice(0, 10);
+  const html = [];
+  html.push(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Speed benchmark</title><style>${CSS}</style></head><body><main>`);
+  html.push(`<p class="eyebrow">React speed benchmark</p><h1>${esc(project)}</h1><p class="meta">${date}</p>`);
+  html.push(...speedHtml(bench), ...fieldHtml(field));
+  html.push(...methodHtml(bench));
+  html.push(`<footer>Generated by react-render-audit from <code>${esc(audit)}</code>.</footer></main></body></html>`);
+  const md = [`# Speed benchmark: ${project}`, '', date, ''];
+  if (bench) md.push(benchMarkdown(bench.data), '');
+  const htmlFile = join(audit, 'report.html');
+  const mdFile = join(audit, 'report.md');
+  writeFileSync(htmlFile, html.join('\n'));
+  writeFileSync(mdFile, `${md.join('\n')}\n`);
+  return { html: htmlFile, markdown: mdFile };
+}
+
+function methodHtml(bench) {
+  if (!bench) return [];
+  const data = bench.data;
+  const env = data.environment || {};
+  const items = [];
+  items.push(`Timing benchmark, protocol v${esc(data.protocol)}: ${data.mode === 'compare' ? 'both sides served by fresh development servers and replayed back to back, alternating which goes first; a same-vs-same (A/A) check first measured the noise and set the number of pairs' : 'the app replayed repeatedly'}. Each run uses a fresh browser profile and real (trusted) input.`);
+  items.push(`Device profiles as in Lighthouse: mobile is 412×823 at 1.75× density with a phone user agent and the CPU slowed to a mid-tier phone${data.calibration ? ` (this machine's BenchmarkIndex ${esc(data.calibration.hostIndex)}, so ${esc(data.calibration.rate)}× slowdown, measured ${esc(data.calibration.throttledIndex)} against a target of ${esc(data.calibration.target)})` : ''}; desktop is 1350×940 at full speed.`);
+  items.push('Response time is the slowest interaction in a step as Event Timing reports it (the way INP is measured), so ratings use the Core Web Vitals bands (good up to 200 ms, poor above 500 ms). Main-thread time is Chrome\'s own task time; blocking time is the part of each task beyond 50 ms.');
+  items.push('Statistics: the median of the paired differences with a sign-test 95% confidence interval (distribution-free, no randomness, so anyone can recompute it from the raw runs). Impact: high when an interaction changes Core Web Vitals band or by 100 ms or more; medium for at least one frame (16.7 ms) or 20% of main-thread time; low below that.');
+  if (data.settings && data.settings.replay) items.push('The first run recorded the app\'s API responses; every later run, on both sides, got the same responses instantly, so backend speed and changing data didn\'t affect the comparison.');
+  items.push(`Development builds on both sides: absolute times are higher than in production, but the comparison is like for like. Environment: ${esc(env.chrome || 'Chrome')}, ${esc(env.cpu || '?')} (${esc(env.cores || '?')} cores), ${esc(env.os || '')}${env.power ? `, ${esc(env.power)}` : ''}${env.ci ? ', CI runner' : ''}.`);
+  return [`<h2>How the speed was measured</h2><div class="panel"><ul class="tight">${items.map((item) => `<li>${item}</li>`).join('')}</ul></div>`];
+}
+
+export function writeReport(config, { final: requested, bench: benchLabel } = {}) {
   const audit = config.audit;
   const changes = readChanges(audit);
   const labels = labelsOf(audit);
-  if (!labels.includes('baseline')) throw new Error(`No baseline in ${audit}/runs. Measure with --label baseline first.`);
+  const bench = benchOf(audit, benchLabel);
+  const field = fieldOf(audit);
+  if (!labels.includes('baseline')) {
+    if (bench || field.length) return writeSpeedReport(config, bench, field);
+    throw new Error(`No baseline in ${audit}/runs. Measure with --label baseline first (or run bench).`);
+  }
   const final = pickFinal(audit, changes, requested);
   if (final && !labels.includes(final)) throw new Error(`--final ${final} was never measured (have: ${labels.join(', ')})`);
   const rel = (file) => (file ? relative(config.appRoot, file) || '.' : '');
@@ -146,6 +276,7 @@ export function writeReport(config, { final: requested } = {}) {
   if (!scoped) html.push(tile('React commits', B('commits'), A('commits'), { hasAfter }));
   html.push(tile('Longest frame', maxOf('longFrameMs', 'before'), maxOf('longFrameMs', 'after'), { unit: ' ms', hasAfter }));
   html.push('</section>');
+  html.push(...speedHtml(bench), ...fieldHtml(field));
 
   for (const item of scenarios) {
     const description = item.baseline.meta.description;
@@ -246,9 +377,10 @@ export function writeReport(config, { final: requested } = {}) {
   html.push('<h2>How this was measured</h2><div class="panel"><ul class="tight">');
   html.push(`<li>Each scenario was replayed ${esc(meta.runs || '?')} time(s) after ${esc(meta.warmup || 0)} warm-up run(s) in headless ${esc(meta.chrome || 'Chrome')}, each run in a fresh browser profile, with real (trusted) mouse and keyboard input. Numbers are medians.</li>`);
   html.push(`<li>React ${esc((react && react.version) || '?')} ${react && react.development ? 'development build' : ''}. A tracker installed before React loads counts one render per component per commit, so StrictMode double-rendering doesn't inflate counts. A render is <em>wasted</em> when the component's props were equal (or only new objects/functions with the same content) and its own state and context didn't change.</li>`);
-  html.push(`<li>CPU slowed ${esc(meta.cpu || 1)}× during interactions. Timings come from a development build: compare them with each other, not with production.</li>`);
+  html.push(`<li>CPU slowed ${esc(meta.cpu || 1)}× during interactions. ${bench ? 'Timings in the tables above the speed section come from the render-count runs (tracker attached); the speed section has the clean timings.' : 'Timings here come from a development build with the tracker attached: compare them with each other, not with production. Run the timing benchmark (<code>bench</code>) for clean timings.'}</li>`);
   html.push('<li>Behavior check: after every step, the visible text, accessibility tree, DOM (with generated ids and CSS-in-JS hashes normalized), data requests and console errors are compared with the baseline. Lines that already varied between baseline runs are ignored as noise. It proves equivalence only for the steps in the scenarios.</li>');
   html.push('</ul></div>');
+  html.push(...methodHtml(bench));
   html.push(`<footer>Generated by react-render-audit from <code>${esc(audit)}</code>.</footer>`);
   html.push('<script>(function(){try{var t=localStorage.getItem("ra-theme");if(t)document.documentElement.dataset.theme=t;}catch(e){}})();</script>');
   html.push('</main></body></html>');
@@ -262,6 +394,7 @@ export function writeReport(config, { final: requested } = {}) {
     md.push(`| ${label} | ${B(field)} | ${hasAfter ? A(field) : '—'} | ${hasAfter ? percentChange(B(field), A(field)) : '—'} |`);
   }
   md.push('');
+  if (bench) md.push(benchMarkdown(bench.data), '');
   for (const item of scenarios) {
     md.push(`## Scenario: ${item.scenario}`, '');
     md.push('| # | Step | Renders | Wasted | Behavior |', '|---:|---|---:|---:|---|');

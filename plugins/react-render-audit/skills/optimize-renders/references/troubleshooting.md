@@ -42,6 +42,18 @@ Lines that already differed between baseline runs are ignored automatically. If 
 
 `detect` looks for a root script like `dev:<app>` that also builds workspace packages. Set `--root` to the app folder; components from workspace packages resolve to their source files and count as project code. Add those package directories to the scope if they're the target.
 
-## Production timings (optional)
+## Timing benchmark
 
-Counts are measured on the development build because it keeps component names and file locations. To confirm timing gains in production, build with React's profiling build (`next build --profile`, or aliasing `react-dom/client` to `react-dom/profiling`), serve it, and measure the same scenario under a different label. Names may be minified there, so compare totals and long frames rather than per-component counts.
+- **Sandboxed shells.** `bench` and `baseline` need an unsandboxed shell: Chrome, local ports, and `git worktree add` in the user's repository. Pass `--dir` to `baseline` (or keep the default temp folder), and run both commands from the same kind of shell, because `TMPDIR` can differ between them.
+- **"Something already answers at <url>".** Another server is on that port. Stop it, or pick other ports for `--a` and `--b`.
+- **"The server stopped before answering" or "didn't answer".** Read `bench/<label>/server-a.log` (or `-b`). The usual causes:
+  - The dev command ignored `{port}`. Check how its script passes the port (`next dev -p`, `vite --port`, `-- --port`).
+  - The baseline copy lacks something the working tree has. Only untracked `.env*` files in the repository root and the app folder are linked. Generated files need `baseline --setup "<command>"`, such as code generation.
+- **The baseline install failed.** Read `baseline-install.log` in the audit folder. Pass `--install "<command>"` for an unusual setup, or `--install none` if the copy already has dependencies.
+- **The baseline can't reach the API (CORS).** Some APIs only allow the usual dev origin, like `http://localhost:3000`. Add `--disable-cors` to `bench`: Chrome then skips CORS checks for both sides alike.
+- **A step fails only on mobile.** The phone layout hides or moves the target. Check with `inspect --profile mobile`, then write a mobile variant of the scenario, or run `--profiles desktop`.
+- **"No measurable change", wide intervals or a failed A/A check.** The machine was noisy: on battery (`bench` warns), busy with other apps, or a shared CI runner. Plug in, close heavy apps, and run again, raising `--max-pairs` (default 20) if needed. Renders that fell while timing didn't move are a real result: those renders were cheap.
+- **"≤16 ms".** The browser doesn't report interactions faster than 16 ms, so the true time is somewhere below that.
+- **"N not in the recording".** Those API requests changed between runs, typically a timestamp or random id in the body, so they went to the network live. Stable test data fixes it. `--no-replay` turns replay off entirely.
+- **Large traces.** Each trace is 5–50 MB. `--no-trace` skips them.
+- **Production builds.** `bench` compares whatever two servers it's given. Build each side first (for the baseline, `baseline --setup "<build command>"`), then pass production start commands: `--a-cmd "pnpm next start -p {port}"`, `--b-cmd` likewise. Component names are irrelevant here, since the benchmark doesn't use the tracker.

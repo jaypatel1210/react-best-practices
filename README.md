@@ -102,7 +102,22 @@ To force a skill, name it: "use the react-memoization skill to review this compo
 /optimize-renders
 ```
 
-It asks which directories and which user flow to target, then replays the flow in headless Chrome. A tracker injected before React loads counts every component render and why it happened (state, context, unstable props, parent, remounts, effect cascades), with no change to your code. It fixes the worst causes in your scope one at a time using these skills. A fix is kept only if your type check, lint and tests pass, behavior is identical at every step (text, accessibility tree, DOM, network, console) and renders went down; otherwise the files are restored. It ends with a before/after report. It works with Next.js (both routers), Vite and other React DOM apps on React 18 and 19. See [its README](plugins/react-render-audit/README.md).
+It asks which directories and which user flow to target, then replays the flow in headless Chrome. A tracker injected before React loads counts every component render and why it happened (state, context, unstable props, parent, remounts, effect cascades), with no change to your code.
+
+It fixes the worst causes in your scope one at a time using these skills. A fix is kept only if:
+- your type check, lint and tests pass;
+- behavior is identical at every step (text, accessibility tree, DOM, network, console);
+- renders went down.
+
+Otherwise the files are restored.
+
+Then it proves the speed-up. The old and new code run side by side on Lighthouse's mobile and desktop profiles, with the CPU calibrated to a mid-tier phone. Each interaction's response time is measured the way INP is, and every change comes with a 95% confidence interval and an impact level.
+
+It ends with a before/after report, and can also:
+- read real-user data (the Chrome UX Report, or your own `web-vitals` data);
+- add a pull-request benchmark to CI.
+
+It works with Next.js (both routers), Vite and other React DOM apps on React 18 and 19. See [its README](plugins/react-render-audit/README.md).
 
 ## Maintaining
 

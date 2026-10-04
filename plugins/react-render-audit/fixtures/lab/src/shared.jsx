@@ -34,10 +34,12 @@ export function CartBadge() {
   return <span aria-label="Cart">{cart.items.length} in cart</span>;
 }
 
-// Burn a little CPU so render cost is visible in timings.
+// Burn a little CPU so render cost is visible in timings. ?cost=N multiplies it, so the timing
+// benchmark's tests can make wasted renders expensive enough to measure.
+const COST = Number(new URLSearchParams(window.location.search).get('cost')) || 1;
 export function work(units) {
   let x = 0;
-  for (let i = 0; i < units * 1000; i++) x += Math.sqrt(i);
+  for (let i = 0; i < units * COST * 1000; i++) x += Math.sqrt(i);
   return x;
 }
 

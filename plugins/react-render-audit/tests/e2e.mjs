@@ -1,27 +1,42 @@
-// End-to-end check in real Chrome against the lab fixture. Needs Chrome and a free port 5199,
+// End-to-end check in real Chrome against the lab fixture. Needs Chrome and free ports 5193-5199,
 // so it isn't part of the unit suite. Run it with:  node plugins/react-render-audit/tests/e2e.mjs
+// (SKIP_BENCH=1 skips the timing benchmark runs, the slowest part.)
 //
 // 1. Ground truth: for every lab variant (with and without StrictMode), the tracker's render
 //    count for each component in each step must equal the lab's own commit counters.
 // 2. The CLI pipeline: measure the broken, fixed and wrong variants, then analyze, compare and
 //    report. The fixed variant must pass the equivalence check with fewer renders; the wrong one
 //    (a "fix" that shows fewer suggestions) must fail it.
+// 3. The timing collector: its interaction times must equal what Google's web-vitals library
+//    reports for the same interactions.
+// 4. Network replay: a second origin gets the first run's API answer, CORS included.
+// 5. CPU calibration lands near the mid-tier phone target.
+// 6. The real-user reporter sends INP with attribution, and `field compare` reads it.
+// 7. The benchmark: same code on two servers shows no meaningful change; broken -> fixed is
+//    faster on both profiles; fixed -> broken fails with --fail-on slower; the report shows it.
+// 8. `ci` writes a workflow and `inspect --profile mobile` emulates the phone.
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchChrome } from '../skills/optimize-renders/scripts/lib/chrome.mjs';
-import { TRACKER_PATH } from '../skills/optimize-renders/scripts/lib/measure.mjs';
+import { inPageSource } from '../skills/optimize-renders/scripts/lib/inpage.mjs';
 import { NetworkLog, evaluate, navigate, openPage, performAction, settle, sleep } from '../skills/optimize-renders/scripts/lib/page.mjs';
+import { MOBILE_TARGET_INDEX, calibrate } from '../skills/optimize-renders/scripts/lib/profiles.mjs';
+import { NetworkReplay } from '../skills/optimize-renders/scripts/lib/replay.mjs';
 import { loadScenario } from '../skills/optimize-renders/scripts/lib/scenario.mjs';
+import { startServer } from '../skills/optimize-renders/scripts/lib/servers.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..', '..', '..');
 const labDir = join(here, '..', 'fixtures', 'lab');
 const cli = join(here, '..', 'skills', 'optimize-renders', 'scripts', 'render-audit.mjs');
 const LAB = 'http://127.0.0.1:5199';
-const scenario = loadScenario(join(labDir, 'scenarios', 'store.json'));
+const scenarioFile = join(labDir, 'scenarios', 'store.json');
+const scenario = loadScenario(scenarioFile);
+const VITE = `node ${join(repo, 'node_modules', 'vite', 'bin', 'vite.js')} --config ${join(labDir, 'vite.config.mjs')} --port {port} --strictPort`;
 
 let failures = 0;
 function check(condition, message) {
@@ -55,8 +70,7 @@ async function startLab() {
 }
 
 async function groundTruth(browser, variant, strict) {
-  const tracker = readFileSync(TRACKER_PATH, 'utf8');
-  const { page, close } = await openPage(browser, { tracker });
+  const { page, close } = await openPage(browser, { source: inPageSource('tracker') });
   const network = new NetworkLog(page);
   const mismatches = [];
   let before = {};
@@ -98,14 +112,43 @@ async function groundTruth(browser, variant, strict) {
   return mismatches;
 }
 
-function run(args) {
-  const result = spawnSync(process.execPath, [cli, ...args], { cwd: repo, encoding: 'utf8' });
-  return { code: result.status, out: `${result.stdout}${result.stderr}` };
+// The collector and web-vitals watch the same page; their slowest interaction must agree.
+async function crossCheckWebVitals(browser) {
+  const webVitals = readFileSync(join(repo, 'node_modules', 'web-vitals', 'dist', 'web-vitals.attribution.iife.js'), 'utf8');
+  const listen = 'webVitals.onINP((metric) => { window.__webVitalsINP = metric.value; }, { reportAllChanges: true, durationThreshold: 16 });';
+  const { page, close } = await openPage(browser, { source: `${inPageSource('vitals')}\n${webVitals}\n${listen}` });
+  const network = new NetworkLog(page);
+  try {
+    await navigate(page, `${LAB}/?variant=broken&cost=60`);
+    await settle(page, network, { quietMs: 300 });
+    await evaluate(page, '__RA_VITALS__.end()');
+    let ours = 0;
+    let interactions = 0;
+    for (const [i, step] of scenario.steps.entries()) {
+      await evaluate(page, `__RA_VITALS__.begin(${i + 1}, ${JSON.stringify(step.name)})`);
+      await performAction(page, step);
+      await settle(page, network, { quietMs: 300 });
+      const data = await evaluate(page, '__RA_VITALS__.end()');
+      if (data.inp !== null) ours = Math.max(ours, data.inp);
+      interactions += data.interactions.count;
+    }
+    const theirs = await evaluate(page, 'window.__webVitalsINP ?? null');
+    return { ours, theirs, interactions };
+  } finally {
+    await close();
+  }
+}
+
+function run(args, options = {}) {
+  const result = spawnSync(process.execPath, [cli, ...args], { cwd: repo, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...options });
+  return { code: result.status, out: `${result.stdout}${result.stderr}`, stdout: result.stdout };
 }
 
 async function main() {
   const server = await startLab();
   const audit = mkdtempSync(join(tmpdir(), 'render-audit-e2e-'));
+  const work = mkdtempSync(join(tmpdir(), 'render-audit-e2e-work-'));
+  const cleanups = [];
   try {
     console.log('Ground truth (tracker vs. the lab components’ own commit counters)');
     const browser = await launchChrome();
@@ -116,12 +159,88 @@ async function main() {
           check(mismatches.length === 0, `${variant}${strict ? ' + StrictMode' : ''}: every component's renders match${mismatches.length ? `\n       ${mismatches.join('\n       ')}` : ''}`);
         }
       }
+
+      console.log('Timing collector vs. web-vitals');
+      const vitals = await crossCheckWebVitals(browser);
+      check(vitals.interactions >= 3, `the collector saw the interactions (${vitals.interactions})`);
+      check(vitals.ours > 16 && vitals.ours === vitals.theirs, `slowest interaction: collector ${vitals.ours} ms, web-vitals INP ${vitals.theirs} ms`);
+
+      console.log('Network replay');
+      let hits = 0;
+      const api = createServer((request, response) => {
+        hits++;
+        // Only the lab's usual origin may read this answer.
+        response.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': LAB });
+        response.end(JSON.stringify({ count: hits }));
+      });
+      await new Promise((resolve) => api.listen(5196, '127.0.0.1', resolve));
+      cleanups.push(() => new Promise((resolve) => api.close(resolve)));
+      const second = await startServer({ name: 'second lab', command: VITE, cwd: repo, url: 'http://127.0.0.1:5193/', logFile: join(work, 'second-lab.log') });
+      cleanups.push(() => second.stop());
+      check(!!second.pid, 'a second dev server started from a {port} command');
+      const replay = new NetworkReplay();
+      const answerOn = async (origin) => {
+        const { page, close } = await openPage(browser, { source: inPageSource('vitals') });
+        const counters = await replay.attach(page, { appOrigin: origin });
+        try {
+          await navigate(page, `${origin}/?variant=fixed&api=${encodeURIComponent('http://127.0.0.1:5196/count')}`);
+          let text = '';
+          for (let i = 0; i < 50 && !/answer: (\d+|failed)/.test(text); i++) {
+            await sleep(100);
+            text = await evaluate(page, 'document.querySelector("[data-testid=api-answer]")?.textContent || ""');
+          }
+          return { text, counters };
+        } finally {
+          await close();
+        }
+      };
+      const recorded = await answerOn(LAB);
+      replay.freeze();
+      const replayed = await answerOn('http://127.0.0.1:5193');
+      check(recorded.text === 'API answer: 1' && recorded.counters.recorded === 1, `the first run recorded the API answer (${recorded.text})`);
+      check(replayed.text === 'API answer: 1' && replayed.counters.served === 1 && hits === 1, `another origin got the recorded answer, CORS rewritten, without hitting the API (${replayed.text}, ${hits} hit)`);
+
+      console.log('CPU calibration');
+      const calibration = await calibrate(browser);
+      check(calibration.rate >= 1 && calibration.rate <= 20, `slowdown ${calibration.rate}× for BenchmarkIndex ${calibration.hostIndex}`);
+      check(Math.abs(calibration.throttledIndex - MOBILE_TARGET_INDEX) / MOBILE_TARGET_INDEX < 0.2 || calibration.rate === 1, `throttled index ${calibration.throttledIndex} is within 20% of the target ${Math.round(MOBILE_TARGET_INDEX)}`);
+
+      console.log('Real-user reporter');
+      await fetch(`${LAB}/__vitals`); // clear
+      {
+        const { page, close } = await openPage(browser, {});
+        const network = new NetworkLog(page);
+        try {
+          await navigate(page, `${LAB}/?variant=broken&cost=200&rum=1&release=r1`);
+          for (let i = 0; i < 50 && !(await evaluate(page, 'window.__rumReady === true')); i++) await sleep(100);
+          await settle(page, network, { quietMs: 300 });
+          await performAction(page, scenario.steps[1]);
+          await settle(page, network, { quietMs: 300 });
+          await navigate(page, 'about:blank');
+        } finally {
+          await close();
+        }
+      }
+      let records = [];
+      for (let i = 0; i < 30 && !records.some((record) => record.name === 'INP'); i++) {
+        await sleep(100);
+        records = records.concat(await (await fetch(`${LAB}/__vitals`)).json());
+      }
+      const inp = records.find((record) => record.name === 'INP');
+      check(!!inp && inp.value > 0 && inp.interactionType === 'pointer' && inp.release === 'r1' && inp.page === '/', `the reporter sent INP with attribution (${inp ? `${inp.value} ms on ${inp.target}` : 'nothing'})`);
+      check(records.some((record) => record.name === 'LCP'), 'and LCP');
+      const before = join(work, 'before.jsonl');
+      const after = join(work, 'after.jsonl');
+      writeFileSync(before, Array.from({ length: 60 }, (_, i) => JSON.stringify({ ...inp, value: inp.value + 100 + i })).join('\n'));
+      writeFileSync(after, Array.from({ length: 60 }, (_, i) => JSON.stringify({ ...inp, value: inp.value + i })).join('\n'));
+      const field = run(['field', 'compare', '--before', before, '--after', after, '--by', 'page', '--audit', audit, '--save', 'rum']);
+      check(field.code === 0 && /faster/.test(field.out) && existsSync(join(audit, 'field', 'rum.json')), `field compare reads the reporter's records${field.code ? `\n${field.out}` : ''}`);
     } finally {
       await browser.close();
+      for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
     }
 
     console.log('CLI pipeline');
-    const scenarioFile = join(labDir, 'scenarios', 'store.json');
     let r = run(['init', '--audit', audit, '--root', labDir, '--url', `${LAB}/`, '--scope', 'src', '--runs', '2', '--cpu', '1']);
     check(r.code === 0, `init (${r.code})${r.code ? `\n${r.out}` : ''}`);
     for (const [label, variant] of [['baseline', 'broken'], ['after-1', 'fixed'], ['after-wrong', 'wrong']]) {
@@ -147,11 +266,51 @@ async function main() {
 
     r = run(['changes', 'add', '--audit', audit, '--title', 'Move search text into SearchArea', '--status', 'kept', '--component', 'Store', '--file', join(labDir, 'src', 'broken.jsx'), '--skill', 'react-rerenders', '--rule', 'Move state down', '--safety', 'auto', '--measure', 'after-1', '--gates', 'typecheck=pass,lint=pass,tests=skip']);
     check(r.code === 0, 'changes add');
-    r = run(['report', '--audit', audit, '--final', 'after-1']);
+
+    if (!process.env.SKIP_BENCH) {
+      console.log('Timing benchmark');
+      const common = ['bench', '--audit', audit, '--scenario', scenarioFile, '--quiet', '250'];
+      // The same code on two servers: nothing may come out as a meaningful change.
+      r = run([...common, '--label', 'same', '--a', 'http://127.0.0.1:5193/?variant=broken&cost=80', '--a-cmd', VITE, '--a-cwd', repo, '--b', `${LAB}/?variant=broken&cost=80`, '--profiles', 'desktop', '--pairs', '8', '--aa', '0', '--no-trace', '--json']);
+      const same = r.code === 0 ? JSON.parse(r.stdout.slice(0, r.stdout.lastIndexOf('}') + 1)) : null;
+      const sameLevels = same ? [same.results[0].analysis.flow.impact.level, ...same.results[0].analysis.steps.map((step) => step.impact.level)] : [];
+      check(!!same && sameLevels.every((level) => level === 'none' || level === 'low'), `same code, two servers: no meaningful difference (${sameLevels.join(', ') || r.out.slice(-600)})`);
+
+      const summary = join(work, 'summary.md');
+      r = run([...common, '--label', 'final', '--a', `${LAB}/?variant=broken&cost=150`, '--a-label', 'broken', '--b', `${LAB}/?variant=fixed&cost=150`, '--b-label', 'fixed', '--pairs', '8', '--cpu-mobile', '4', '--markdown', summary, '--fail-on', 'slower']);
+      check(r.code === 0, `broken -> fixed benchmark (exit ${r.code})${r.code ? `\n${r.out.slice(-1500)}` : ''}`);
+      const final = existsSync(join(audit, 'bench', 'final', 'bench.json')) ? JSON.parse(readFileSync(join(audit, 'bench', 'final', 'bench.json'), 'utf8')) : null;
+      for (const item of final ? final.results : []) {
+        const click = item.analysis.steps.find((step) => step.name === 'add Trail Runner');
+        check(click.impact.direction === 'better' && click.impact.level !== 'low', `${item.profile}: the click is faster (${click.impact.level}: ${click.impact.reasons.join('; ')})`);
+        check(item.analysis.flow.impact.direction === 'better', `${item.profile}: the whole flow is faster (${item.analysis.flow.mainThread.a} -> ${item.analysis.flow.mainThread.b} ms main thread)`);
+        check(existsSync(join(audit, 'bench', 'final', item.traces.a)) && existsSync(join(audit, 'bench', 'final', item.traces.b)), `${item.profile}: Chrome traces saved`);
+      }
+      check(!!final && final.results.length === 2, 'both profiles measured');
+      check(existsSync(summary) && readFileSync(summary, 'utf8').includes('## Measured speed-up'), 'markdown summary written');
+      if (process.env.VERBOSE) console.log(r.out);
+
+      r = run([...common, '--label', 'reverse', '--a', `${LAB}/?variant=fixed&cost=150`, '--b', `${LAB}/?variant=broken&cost=150`, '--profiles', 'desktop', '--pairs', '8', '--aa', '0', '--no-trace', '--fail-on', 'slower']);
+      check(r.code === 4, `fixed -> broken fails with --fail-on slower (exit ${r.code})`);
+    }
+
+    r = run(['report', '--audit', audit, '--final', 'after-1', ...(process.env.SKIP_BENCH ? [] : ['--bench', 'final'])]);
     check(r.code === 0 && existsSync(join(audit, 'report.html')) && existsSync(join(audit, 'report.md')), `report written${r.code ? `\n${r.out}` : ''}`);
+    const html = existsSync(join(audit, 'report.html')) ? readFileSync(join(audit, 'report.html'), 'utf8') : '';
+    if (!process.env.SKIP_BENCH) check(html.includes('Measured speed-up') && html.includes('Real users'), 'the report has the speed and real-user sections');
+
+    console.log('CI workflow and device profiles');
+    const workflow = join(work, 'render-benchmark.yml');
+    r = run(['ci', '--app', labDir, '--scenario', scenarioFile, '--dev', 'bun run dev -- --port {port}', '--paths', 'plugins/react-render-audit/fixtures/lab/**', '--out', workflow]);
+    const yaml = existsSync(workflow) ? readFileSync(workflow, 'utf8') : '';
+    check(r.code === 0 && yaml.includes('uses: oven-sh/setup-bun@v2') && yaml.includes('--scenario "plugins/react-render-audit/fixtures/lab/scenarios/store.json"'), `ci wrote a workflow for this repository${r.code ? `\n${r.out}` : ''}`);
+    r = run(['inspect', '--url', `${LAB}/`, '--root', labDir, '--profile', 'mobile']);
+    check(r.code === 0 && r.out.includes('(mobile profile)') && r.out.includes('Add Trail Runner to cart'), `inspect emulates the phone${r.code ? `\n${r.out}` : ''}`);
     if (process.env.KEEP) console.log(`Audit kept at ${audit}`);
   } finally {
+    for (const cleanup of cleanups.reverse()) await cleanup();
     if (!process.env.KEEP) rmSync(audit, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
     if (server) server.kill();
   }
   console.log(failures ? `\n${failures} check(s) failed` : '\nAll checks passed');

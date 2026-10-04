@@ -1,17 +1,17 @@
 // Replays a scenario in headless Chrome with the render tracker installed, several times, and
 // writes one JSON file per run (render data per step) plus one snapshot file per run (text, DOM
 // and accessibility tree per step, used for the equivalence check).
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { launchChrome } from './chrome.mjs';
+import { inPageSource } from './inpage.mjs';
 import { ConsoleLog, NetworkLog, axSnapshot, evaluate, navigate, openPage, performAction, resolveTypes, settle } from './page.mjs';
 import { stepLabel } from './scenario.mjs';
 import { writeJson } from './util.mjs';
 
-export const TRACKER_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'tracker.js');
+export { TRACKER_PATH } from './inpage.mjs';
 
-function absoluteUrl(url, base) {
+export function absoluteUrl(url, base) {
   try {
     return new URL(url || '', base || undefined).href;
   } catch {
@@ -23,7 +23,7 @@ async function runScenario(browser, scenario, options, screenshotDir) {
   const { width, height, appRoot, repoRoot, mapCache, cpu, quietMs, maxSettleMs, baseUrl } = options;
   const ignoreSelectors = [...(options.ignoreSelectors || []), ...scenario.ignoreSelectors];
   const { page, close } = await openPage(browser, {
-    tracker: options.trackerSource,
+    source: options.trackerSource,
     width,
     height,
     cookies: options.cookies,
@@ -136,7 +136,7 @@ export async function measure(options) {
     log = (line) => process.stderr.write(`${line}\n`),
   } = options;
   mkdirSync(outDir, { recursive: true });
-  const trackerSource = readFileSync(TRACKER_PATH, 'utf8');
+  const trackerSource = inPageSource('tracker');
   const startedAt = new Date().toISOString();
   const browser = await launchChrome({ headless, width, height });
   const shared = {
