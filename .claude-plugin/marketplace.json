@@ -5,8 +5,8 @@
     "url": "https://github.com/jaypatel1210"
   },
   "metadata": {
-    "description": "Skills that teach Claude to write, review and debug React the way senior React engineers do, plus a tool that measures and cuts re-renders in your app.",
-    "version": "1.2.0"
+    "description": "Skills that teach Claude to write, review and debug React the way senior React engineers do, plus a tool that measures and cuts re-renders in your app and proves the speed-up.",
+    "version": "1.3.0"
   },
   "plugins": [
     {
@@ -33,8 +33,8 @@
     {
       "name": "react-render-audit",
       "source": "./plugins/react-render-audit",
-      "description": "Measure and cut React re-renders in a real React or Next.js app without changing behavior: /optimize-renders replays a user flow in headless Chrome, counts every component render and why, fixes the worst causes with the react-best-practices skills, proves each fix kept behavior identical, and writes a before/after report.",
-      "version": "0.1.0",
+      "description": "Measure and cut React re-renders in a real React or Next.js app without changing behavior, then prove the speed-up: /optimize-renders counts every component render and why, fixes the worst causes with the react-best-practices skills, proves behavior stayed identical, and times old and new code side by side on mobile and desktop profiles with confidence intervals.",
+      "version": "0.2.0",
       "author": {
         "name": "Jay Patel",
         "url": "https://github.com/jaypatel1210"
@@ -47,7 +47,9 @@
         "nextjs",
         "performance",
         "re-renders",
-        "profiling"
+        "profiling",
+        "web-vitals",
+        "benchmark"
       ]
     }
   ]

@@ -1,6 +1,6 @@
-// Page-level helpers shared by `measure` and `inspect`: opening an isolated tab with the tracker,
-// waiting for the page to settle, driving input through CDP, capturing network, console and
-// accessibility state, and resolving component source locations.
+// Page-level helpers shared by `measure`, `inspect` and `bench`: opening an isolated tab with the
+// in-page scripts, waiting for the page to settle, driving input through CDP, capturing network,
+// console and accessibility state, and resolving component source locations.
 import { loadSourceMap, originalPosition, toFilePath } from './sourcemap.mjs';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -219,8 +219,12 @@ export class ConsoleLog {
 // ---------------------------------------------------------------------------------------------
 // Opening a page
 
-/** Opens a tab in a fresh browser context (own cookies, storage and cache) with the tracker. */
-export async function openPage(browser, { tracker, width = 1280, height = 800, cookies, headers } = {}) {
+/**
+ * Opens a tab in a fresh browser context (own cookies, storage and cache) with `source` (the
+ * scripts from inpage.mjs) injected before the page's own. `userAgent` and `userAgentMetadata`
+ * override the browser's for device profiles.
+ */
+export async function openPage(browser, { source, width = 1280, height = 800, deviceScaleFactor = 1, mobile = false, userAgent, userAgentMetadata, cookies, headers } = {}) {
   const { conn } = browser;
   const { browserContextId } = await conn.send('Target.createBrowserContext', { disposeOnDetach: true });
   const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', browserContextId });
@@ -232,13 +236,15 @@ export async function openPage(browser, { tracker, width = 1280, height = 800, c
   await page.send('Log.enable');
   await page.send('DOM.enable');
   await page.send('Accessibility.enable');
-  if (tracker) await page.send('Page.addScriptToEvaluateOnNewDocument', { source: tracker });
-  await page.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+  if (source) await page.send('Page.addScriptToEvaluateOnNewDocument', { source });
+  await page.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor, mobile });
+  if (userAgent) await page.send('Emulation.setUserAgentOverride', userAgentMetadata ? { userAgent, userAgentMetadata } : { userAgent });
   if (cookies && cookies.length) await page.send('Network.setCookies', { cookies });
   if (headers && Object.keys(headers).length) await page.send('Network.setExtraHTTPHeaders', { headers });
   const close = async () => {
     await conn.send('Target.closeTarget', { targetId }).catch(() => {});
     await conn.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+    page.dispose();
   };
   return { page, close };
 }
@@ -266,23 +272,27 @@ export async function navigate(page, url, timeoutMs = 90000) {
   }
 }
 
+// Time since React last committed, from the render tracker or the timing collector.
+const IDLE_EXPRESSION = 'typeof __RENDER_AUDIT__ === "object" ? __RENDER_AUDIT__.idleMs() : typeof __RA_VITALS__ === "object" ? __RA_VITALS__.idleMs() : Infinity';
+
 /**
- * Waits until React has been idle (no commit) and the network quiet for `quietMs`, or `maxMs`
- * passes. Returns { settled, ms }.
+ * Waits until React has been idle (no commit) and the network quiet for `quietMs` since the
+ * action, or `maxMs` passes. Quiet time before the action doesn't count: a resize, a timer or a
+ * request the action starts a frame later must still land in this step. Returns { settled, ms }.
  */
 export async function settle(page, network, { quietMs = 500, maxMs = 10000 } = {}) {
   const started = Date.now();
   for (;;) {
     let idle;
     try {
-      idle = await evaluate(page, 'typeof __RENDER_AUDIT__ === "object" ? __RENDER_AUDIT__.idleMs() : Infinity');
+      idle = await evaluate(page, IDLE_EXPRESSION);
     } catch {
       idle = 0; // the page is between documents
     }
     if (idle === null || idle === undefined) idle = Infinity;
     const networkQuiet = network ? network.quietFor() : Infinity;
     const elapsed = Date.now() - started;
-    if (idle >= quietMs && networkQuiet >= quietMs) return { settled: true, ms: elapsed };
+    if (Math.min(idle, elapsed) >= quietMs && Math.min(networkQuiet, elapsed) >= quietMs) return { settled: true, ms: elapsed };
     if (elapsed >= maxMs) return { settled: false, ms: elapsed, inflight: network ? network.inflight() : 0 };
     await sleep(100);
   }
@@ -322,7 +332,7 @@ async function findByRole(page, target) {
 
 async function findInPage(page, target) {
   const response = await page.send('Runtime.evaluate', {
-    expression: `__RENDER_AUDIT__.find(${JSON.stringify(target)})`,
+    expression: `__RENDER_AUDIT_FIND__(${JSON.stringify(target)})`,
     objectGroup: 'ra-find',
   });
   const result = response.result;
@@ -454,8 +464,11 @@ export function expandEnv(text) {
   });
 }
 
-/** Performs one scenario step. Navigation steps are handled by the runner. */
-export async function performAction(page, step, { width = 1280, height = 800 } = {}) {
+/**
+ * Performs one scenario step. Navigation steps are handled by the runner. The options describe
+ * the emulated screen, which `resize` keeps (only its size changes).
+ */
+export async function performAction(page, step, { width = 1280, height = 800, deviceScaleFactor = 1, mobile = false } = {}) {
   const timeout = step.timeoutMs || 10000;
   switch (step.action) {
     case 'click': {
@@ -501,7 +514,7 @@ export async function performAction(page, step, { width = 1280, height = 800 } =
       return;
     }
     case 'resize':
-      await page.send('Emulation.setDeviceMetricsOverride', { width: step.width || width, height: step.height || height, deviceScaleFactor: 1, mobile: false });
+      await page.send('Emulation.setDeviceMetricsOverride', { width: step.width || width, height: step.height || height, deviceScaleFactor, mobile });
       return;
     case 'wait':
       await sleep(step.ms ?? 500);

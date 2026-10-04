@@ -117,15 +117,26 @@ export class Connection {
     return () => set.delete(handler);
   }
 
-  /** A view of the connection bound to one attached target. */
+  /** A view of the connection bound to one attached target. `dispose()` drops its listeners. */
   session(sessionId) {
+    const listeners = new Set();
     return {
       id: sessionId,
       send: (method, params) => this.send(method, params, sessionId),
-      on: (method, handler) =>
-        this.on(method, (params, from) => {
+      on: (method, handler) => {
+        const off = this.on(method, (params, from) => {
           if (from === sessionId) handler(params);
-        }),
+        });
+        listeners.add(off);
+        return () => {
+          listeners.delete(off);
+          off();
+        };
+      },
+      dispose: () => {
+        for (const off of listeners) off();
+        listeners.clear();
+      },
     };
   }
 
@@ -191,7 +202,7 @@ function withTimeout(promise, ms, message) {
  * Flags keep timers and rendering running at full speed in the background and turn off
  * features that add network noise.
  */
-export async function launchChrome({ executablePath = findChrome(), headless = true, width = 1280, height = 800 } = {}) {
+export async function launchChrome({ executablePath = findChrome(), headless = true, width = 1280, height = 800, args: extraArgs = [] } = {}) {
   if (!executablePath) {
     throw new Error('No Chrome or Chromium found. Install Google Chrome, or set CHROME_PATH to a Chromium-based browser.');
   }
@@ -219,8 +230,12 @@ export async function launchChrome({ executablePath = findChrome(), headless = t
     '--use-mock-keychain',
     '--force-color-profile=srgb',
     `--window-size=${width},${height}`,
+    ...extraArgs,
   ];
   if (headless) args.push('--headless');
+  // CI containers often can't give Chrome's sandbox the kernel features it needs.
+  if (process.platform === 'linux' && (process.env.CI || (process.getuid && process.getuid() === 0))) args.push('--no-sandbox');
+  if (process.env.CHROME_FLAGS) args.push(...process.env.CHROME_FLAGS.split(/\s+/).filter(Boolean));
   args.push('about:blank');
 
   const child = spawn(executablePath, args, { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });

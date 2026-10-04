@@ -1,16 +1,18 @@
 // One page load with the tracker: is React there, what renders on load, and which elements a
 // scenario can target.
-import { readFileSync } from 'node:fs';
 import { relative } from 'node:path';
 import { launchChrome } from './chrome.mjs';
-import { TRACKER_PATH } from './measure.mjs';
+import { inPageSource } from './inpage.mjs';
 import { NetworkLog, evaluate, interactiveElements, navigate, openPage, resolveTypes, settle } from './page.mjs';
+import { chromeMajor, profile as profileOf } from './profiles.mjs';
 import { table } from './util.mjs';
 
-export async function inspect({ url, width = 1280, height = 800, headless = true, appRoot, repoRoot, cookies, headers }) {
+/** `profile` ('mobile' or 'desktop') emulates the benchmark's device, to check targets exist there too. */
+export async function inspect({ url, width = 1280, height = 800, profile, headless = true, appRoot, repoRoot, cookies, headers }) {
   const browser = await launchChrome({ headless, width, height });
   try {
-    const { page, close } = await openPage(browser, { tracker: readFileSync(TRACKER_PATH, 'utf8'), width, height, cookies, headers });
+    const screen = profile ? profileOf(profile, { chromeMajor: chromeMajor(browser.version.product) || '140' }) : { width, height };
+    const { page, close } = await openPage(browser, { source: inPageSource('tracker'), ...screen, cookies, headers });
     try {
       const network = new NetworkLog(page);
       const started = Date.now();
@@ -21,7 +23,7 @@ export async function inspect({ url, width = 1280, height = 800, headless = true
       const types = await resolveTypes(page, { appRoot, repoRoot, mapCache: new Map() });
       const elements = await interactiveElements(page);
       const title = await evaluate(page, 'document.title');
-      return { url, title, loadMs: Date.now() - started, settled, stats, status, types, elements, chrome: browser.version.product };
+      return { url, title, profile: profile || null, loadMs: Date.now() - started, settled, stats, status, types, elements, chrome: browser.version.product };
     } finally {
       await close();
     }
@@ -33,7 +35,7 @@ export async function inspect({ url, width = 1280, height = 800, headless = true
 export function formatInspect(result, { appRoot } = {}) {
   const lines = [];
   const renderer = result.status.renderers[0];
-  lines.push(`Page: ${result.title || '(no title)'} — ${result.url}`);
+  lines.push(`Page: ${result.title || '(no title)'} — ${result.url}${result.profile ? ` (${result.profile} profile)` : ''}`);
   if (renderer) {
     const build = renderer.bundleType === 1 ? 'development build' : 'production build (component names may be minified)';
     lines.push(`React ${renderer.version || '?'} (${build}), ${result.status.renderers.length} renderer(s), tracker ${result.status.hook}`);
