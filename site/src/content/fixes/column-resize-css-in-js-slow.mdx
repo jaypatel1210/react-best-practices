@@ -1,0 +1,140 @@
+---
+title: "Resizing a column is slow because CSS-in-JS makes a class per pixel"
+description: "Interpolating a drag width into styled-components creates a new class and CSS rule per pixel. Use one static rule with a CSS custom property, set once per frame."
+skill: react-animation
+kind: performance
+symptom: "Dragging a column's resize handle lags behind the pointer, the stylesheet keeps growing, and the console warns that a styled component generated over 200 classes."
+cause: "The width is interpolated into the styled template, so each new pixel value serializes the styles and inserts a new class and rule, and every pointer move re-renders the header."
+fix: "Keep one static rule that reads var(--column-width), write the variable through a ref at most once per frame, and commit the width to state when the drag ends."
+tags: [styled-components, Emotion, CSS custom properties, CSS-in-JS, pointermove]
+react: "All versions"
+order: 3
+source: skills/react-animation/examples/dynamic-styles.md
+published: 2026-10-01
+related: [drag-stutters-on-pointermove, huge-table-slow-to-scroll, expanding-panel-stutters]
+featured: false
+---
+
+A reporting app has a data grid with resizable columns, styled with styled-components. Dragging a column edge feels sticky: the edge trails the pointer, and the longer you drag, the worse it gets. After a few drags, the console shows a development warning that starts with "Over 200 classes were generated for component", and the page's style sheet holds hundreds of nearly identical rules.
+
+Nothing is wrong with the drag logic. The cost is in how each new width becomes CSS.
+
+## Why it happens
+
+```tsx title="ColumnHeader.tsx" bad error="2,9,13"
+const HeaderCell = styled.th<{ $width: number }>`
+  width: ${(p) => p.$width}px;
+  min-width: 64px;
+`;
+
+function ColumnHeader({ column }: { column: Column }) {
+  const [width, setWidth] = useState(column.defaultWidth);
+  return (
+    <HeaderCell $width={width}>
+      {column.label}
+      <ResizeHandle
+        onResize={(dx) => {
+          setWidth((w) => Math.max(64, w + dx));
+        }}
+      />
+    </HeaderCell>
+  );
+}
+```
+
+Runtime CSS-in-JS does its work during render. Each time `HeaderCell` renders, the library evaluates the template with the current props, serializes the result to a CSS string, and hashes it. A new hash means a new class name and a new rule inserted into the style sheet. Dragging the handle across 300 pixels:
+
+- creates up to 300 classes and 300 CSS rules, and none of them are ever removed;
+- re-serializes and hashes the template on every render;
+- grows the style sheet, so every later style recalculation on the page has more rules to match;
+- re-renders the header, and anything it renders, on every pointer move.
+
+The library is doing exactly what it was asked: one class per distinct set of values. That's cheap for a handful of variants and expensive for a value that changes continuously. The development warning exists for this case, and it always means the same thing: this value belongs in a custom property or an inline style, not in the template.
+
+## The fix
+
+Fix it in two steps. First, give the styles a single static rule and let a custom property carry the width:
+
+```tsx title="ColumnHeader.tsx" good add="2,6"
+const HeaderCell = styled.th`
+  width: var(--column-width);
+  min-width: 64px;
+`;
+
+<HeaderCell style={{ '--column-width': `${width}px` } as React.CSSProperties}>
+```
+
+The class is generated once. Each width change now sets one inline custom property, which costs a style recalculation for that cell instead of a new rule. TypeScript doesn't know custom property names, hence the cast; a small typed helper like `cssVars({ columnWidth: width })` keeps call sites tidy.
+
+Second, stop rendering on every pointer move. The width only needs to be React state when the drag ends:
+
+```tsx title="ColumnHeader.tsx" good add="2-4,6-9,12,15-22"
+function ColumnHeader({ column, onWidthChange }: ColumnHeaderProps) {
+  const cellRef = useRef<HTMLTableCellElement>(null);
+  const startWidthRef = useRef(column.width);
+  const widthRef = useRef(column.width);
+
+  const applyWidth = useFrameThrottledCallback((width: number) => {
+    widthRef.current = width;
+    cellRef.current?.style.setProperty('--column-width', `${width}px`);
+  });
+
+  return (
+    <HeaderCell ref={cellRef} style={{ '--column-width': `${column.width}px` } as React.CSSProperties}>
+      {column.label}
+      <ResizeHandle
+        onResizeStart={() => {
+          startWidthRef.current = widthRef.current = column.width;
+        }}
+        onResize={(offsetX) => applyWidth(Math.max(64, startWidthRef.current + offsetX))}
+        onResizeEnd={() => {
+          applyWidth.flush();
+          onWidthChange(column.id, widthRef.current);
+        }}
+      />
+    </HeaderCell>
+  );
+}
+```
+
+During the drag, React renders nothing. `useFrameThrottledCallback`, a tested hook from the `react-responsiveness` skill, coalesces pointer moves into at most one style write per frame, right before paint. The handle reports the distance from where the drag started, so coalescing moves never loses movement. When the pointer is released, `flush()` applies the last pending width and `onWidthChange` commits it once, for example into a persisted column layout. The committed width flows back through `column.width`, so React stays the source of truth between drags.
+
+## Why the fix works
+
+Pick a styling technique by how often the value changes:
+
+| The value changes… | Technique |
+|---|---|
+| Never | A static class, or a style object at module scope |
+| Between a few variants (size, tone, state) | One class per variant, chosen by lookup or a data attribute |
+| Continuously (a drag offset, a progress percentage, a width) | One static rule reading `var(--x)`, plus `style={{ '--x': value }}` |
+| Every animation frame | Skip React: write it through a ref, or use a CSS or Web Animations API animation |
+
+A column width sits between the last two rows. It changes continuously during a drag, so it goes through a custom property, and it changes at frame rate, so it skips React until the gesture ends.
+
+The width change still causes layout, because the column really does change size. That's the work you want. What's gone is everything around it: style serialization, rule insertion, a growing style sheet and a React render per event. If the table uses `table-layout: fixed`, the browser sizes columns from the first row instead of measuring every cell, so each width change lays out less.
+
+The warning itself suggests `.attrs` with a style object. That works too: it's an inline style, so it stops the class churn, but the component still re-renders on every pointer move.
+
+## How to confirm the fix
+
+1. Count the rules before and after a drag. In production, styled-components inserts rules through the CSS object model, so they don't appear as text. Run this in the console instead:
+
+   ```js title="Console"
+   document.querySelector('style[data-styled]')?.sheet?.cssRules.length
+   ```
+
+   Before the fix, the number climbs with every pixel you drag. After it, the number stays put.
+2. Record a drag in the React DevTools Profiler. Before, `ColumnHeader` renders once per pointer move. After, there are no renders during the drag and one when it ends.
+3. Record the same drag in the Performance panel with 4× CPU throttling. The long *Recalculate Style* blocks shrink, and at most one style and layout pass runs per frame.
+4. The "Over 200 classes" warning no longer appears.
+
+## Watch out for
+
+- **Styles declared inside a component.** A `css={{ … }}` object or a `styled(...)` call in a component body is serialized again on every render, and `styled` in render also creates a new component type, which remounts the subtree. Hoist static styles to module scope.
+- **Server Components.** Runtime CSS-in-JS runs only in Client Components, and the Next.js App Router needs a style registry to collect styles during server rendering. Build-time tools (CSS Modules, Tailwind, vanilla-extract, Linaria, Panda, StyleX) have no runtime cost and turn dynamic values into custom properties.
+- **Gradual migration.** Move new components first, then the hottest paths: lists, tables and anything that animates.
+
+## When this isn't enough
+
+If the grid has thousands of rows, a column resize lays out every rendered cell in that column, so the cost grows with the row count. Render only the visible rows: see <FixLink slug="huge-table-slow-to-scroll" />. For other drag interactions that update state on every event, the same frame-throttling approach is covered in <FixLink slug="drag-stutters-on-pointermove" />.

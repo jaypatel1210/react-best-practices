@@ -1,0 +1,147 @@
+---
+title: "The screen flashes to a spinner every time you open the next item"
+description: "Clearing data or remounting on every selection swaps content for a skeleton. Keep the previous item on screen, with a loading indicator, until the next one arrives."
+skill: react-data-fetching
+kind: performance
+symptom: "Opening the next item collapses the details panel to a skeleton, resets scroll and focus, and makes the layout jump, even when the data arrives in 100 ms."
+cause: "The component throws away the current item as soon as a new ID arrives, by clearing state, remounting with a key, or reading a query that has no data for the new key yet."
+fix: "Keep showing the previous item, dimmed, with a loading indicator, until the next one arrives. Derive the loading flag, or use keepPreviousData or a transition."
+tags: [data fetching, loading states, keepPreviousData, useTransition, Suspense]
+react: "18 and 19"
+order: 3
+source: skills/react-data-fetching/examples/race-conditions.md
+published: 2026-10-01
+related: [tab-switch-blanks-screen, toggling-wrapper-resets-state, search-shows-stale-results]
+featured: false
+---
+
+A billing screen lists invoices on the left and shows the selected invoice's details on the right. Finance staff work through the list with the arrow keys: open an invoice, check the line items, move to the next.
+
+Each move blanks the right side. The details collapse into a gray skeleton, the panel's scroll position jumps back to the top, the layout shifts as the skeleton's height differs from the invoice's, and focus lands on the page body. The data often arrives in under 150 ms, so the skeleton is a flash. People who review two hundred invoices a day call the screen "flickery" and complain about eye strain.
+
+## Why it happens
+
+Here's the details panel. It cancels stale requests correctly, then clears the old invoice so the user "knows it's loading":
+
+```tsx title="InvoiceDetails.tsx" bad error="6,11"
+function InvoiceDetails({ invoiceId }: { invoiceId: string }) {
+  const [invoice, setInvoice] = useState<Invoice | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setInvoice(null); // clear the old invoice while the next one loads
+    fetchInvoice(invoiceId, controller.signal).then(setInvoice).catch(ignoreAbort);
+    return () => controller.abort();
+  }, [invoiceId]);
+
+  if (!invoice) return <DetailsSkeleton />;
+  return <InvoiceView invoice={invoice} />;
+}
+```
+
+Returning a different element type in the same place unmounts the old one. When `invoice` becomes `null`, React removes the whole `InvoiceView` subtree and mounts `DetailsSkeleton` in its place. When the next invoice arrives, it does the reverse. Everything that lived in that subtree goes with it:
+
+- **Scroll position** inside the panel, because the scrolled element is a new DOM node.
+- **Focus**, if it was on a line item or a button inside the view.
+- **Local state**, such as an expanded section or a half-typed note.
+- **Layout**, because the skeleton rarely has the same height as the content.
+
+The same blank appears with two other common patterns:
+
+- **`key={invoiceId}` on the details component**, often added to fix a race. A new key remounts the component, and a fresh mount starts from `null`.
+- **A data library with a new key and no placeholder.** `useQuery({ queryKey: ['invoice', id] })` has no data for an ID it hasn't seen, so `data` is `undefined` and the component renders its loading branch.
+
+## The fix
+
+Show the skeleton only on the very first load. After that, keep the current invoice on screen, and derive whether it's out of date:
+
+```tsx title="InvoiceDetails.tsx" good add="10-11,14-16"
+function InvoiceDetails({ invoiceId }: { invoiceId: string }) {
+  const [invoice, setInvoice] = useState<Invoice | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchInvoice(invoiceId, controller.signal).then(setInvoice).catch(ignoreAbort);
+    return () => controller.abort();
+  }, [invoiceId]);
+
+  if (!invoice) return <DetailsSkeleton />; // first load only
+  const isLoadingNext = invoice.id !== invoiceId;
+
+  return (
+    <div className="invoice-details" aria-busy={isLoadingNext}>
+      {isLoadingNext && <LoadingBar label={`Loading invoice ${invoiceId}`} />}
+      <InvoiceView invoice={invoice} dimmed={isLoadingNext} actionsDisabled={isLoadingNext} />
+    </div>
+  );
+}
+```
+
+What changed:
+
+- **Nothing clears the old invoice.** The effect only fetches. The previous invoice stays in state until the next one replaces it.
+- **The loading flag is derived, not stored.** The invoice on screen either is the one requested or isn't. Comparing IDs during render can't drift out of sync the way a separate `isLoading` state can.
+- **The view stays mounted.** `InvoiceView` re-renders with new props instead of unmounting, so scroll, focus and local state survive, and nothing shifts.
+- **Actions are disabled while the content is stale.** A **Refund** button on invoice 041 must not run while the list highlights invoice 042.
+
+## Why the fix works
+
+A loading state is information about the *next* screen. It doesn't have to destroy the current one. React keeps a component's DOM and state for as long as the same component type stays in the same position, so the way to keep the panel stable is to keep rendering `InvoiceView` there, and put the loading signal next to it.
+
+The rule: **keep existing data visible during refetches, with a subtle indicator, instead of swapping in a spinner.** Reserve the full skeleton for the moment there's nothing to show yet.
+
+Libraries provide this directly:
+
+- **TanStack Query:** `useQuery({ ...invoiceQuery(invoiceId), placeholderData: keepPreviousData })`. While the new key loads, `data` holds the previous result, and `isPlaceholderData` is `true`, which is your `isLoadingNext`.
+- **SWR:** `useSWR(key, fetcher, { keepPreviousData: true })`.
+
+## With Suspense: use a transition
+
+When the details read data through Suspense, with `useSuspenseQuery` or `use(promise)`, a new ID suspends the component, and the nearest `<Suspense>` boundary replaces the content with its fallback. Mark the selection change as a transition instead:
+
+```tsx title="BillingScreen.tsx" good add="2,7,9"
+function BillingScreen() {
+  const [isPending, startTransition] = useTransition();
+  const [invoiceId, setInvoiceId] = useState('inv_041');
+
+  return (
+    <>
+      <InvoiceList selectedId={invoiceId} onSelect={(id) => startTransition(() => setInvoiceId(id))} />
+      <Suspense fallback={<DetailsSkeleton />}>
+        <InvoiceDetails invoiceId={invoiceId} dimmed={isPending} />
+      </Suspense>
+    </>
+  );
+}
+```
+
+During a transition, React doesn't hide content that a boundary has already revealed. It keeps the old details on screen, and `isPending` is `true` until the new ones are ready. The fallback shows only on the first load. `useTransition` and this behavior are available in React 18 and 19. For the same pattern applied to tabs, see <FixLink slug="tab-switch-blanks-screen" />.
+
+## How to confirm the fix
+
+1. In the **Network** panel, throttle to "Slow 4G", so each invoice takes about a second.
+2. Scroll halfway down an invoice's line items, then move to the next invoice with the keyboard.
+3. Before the fix, the panel blanks, scroll returns to the top and focus is lost. After it, the old invoice dims, the loading bar appears, and the new invoice replaces it in place.
+4. In React DevTools, use **Highlight updates when components render**. `InvoiceView` should update on each selection, and the skeleton should never appear after the first load.
+
+A test can check the in-between state directly:
+
+```tsx title="InvoiceDetails.test.tsx"
+it('keeps the previous invoice visible while the next one loads', async () => {
+  const { rerender } = render(<InvoiceDetails invoiceId="inv_041" />);
+  expect(await screen.findByText('Invoice 041')).toBeTruthy();
+
+  rerender(<InvoiceDetails invoiceId="inv_042" />);
+  expect(screen.getByText('Invoice 041')).toBeTruthy(); // still on screen
+  expect(screen.getByRole('button', { name: 'Refund' })).toHaveProperty('disabled', true);
+  expect(await screen.findByText('Invoice 042')).toBeTruthy();
+});
+```
+
+## Watch out for
+
+- **Stale content that looks current.** Dim it, mark it `aria-busy`, and disable actions. Otherwise users read, or act on, the wrong item.
+- **Errors for the next item.** If invoice 042 fails to load, don't leave 041 on screen as if nothing happened. Show the error in place of the details, for 042.
+- **Unrelated items.** Keeping the previous item works when items share a layout. When the next screen is a different kind of thing, such as another customer's account, a fresh mount with `key` is the honest choice: see <FixLink slug="toggling-wrapper-resets-state" /> for how position and keys decide what React keeps.
+
+Keeping old data visible doesn't stop an older response from landing late. Keep the abort in the effect, or let the library key results by ID: <FixLink slug="search-shows-stale-results" />.

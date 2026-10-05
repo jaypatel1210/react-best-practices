@@ -1,0 +1,142 @@
+---
+title: "Text and images shift the layout while the page loads"
+description: "Images without dimensions and a web font that swaps in wider push content around as the page loads. Reserve image space and match the fallback font's metrics."
+skill: react-loading-performance
+kind: performance
+symptom: "While the page loads, paragraphs jump down as screenshots arrive and reflow when the brand font replaces the fallback, and Cumulative Layout Shift is above 0.1."
+cause: "Images render without width and height, so they take no space until they load, and the fallback font has different metrics from the web font that replaces it."
+fix: "Give every image width and height or an aspect-ratio, self-host and preload the first-screen font, choose font-display on purpose, and size-adjust a local fallback font."
+tags: [CLS, font-display, size-adjust, images, layout shift]
+react: "All versions"
+order: 4
+source: skills/react-loading-performance/examples/images-and-fonts.md
+published: 2026-10-01
+related: [hero-image-loads-late, long-page-slow-first-render, tooltip-flickers-into-place]
+featured: false
+---
+
+A product landing page has a feature grid with screenshots, customer logos and a brand typeface. You start reading the first feature, and the paragraph drops 200 px as its screenshot arrives. A moment later, every line reflows when the brand font replaces the fallback, and the button you were about to tap moves.
+
+Field data puts Cumulative Layout Shift (CLS) at 0.21 on mobile. Good is 0.1 or less, and poor is above 0.25.
+
+## Why it happens
+
+Two kinds of late arrival move this page. The first is images without dimensions:
+
+```tsx title="FeatureGrid.tsx" bad error="5"
+function FeatureGrid({ features }: { features: Feature[] }) {
+  return features.map((feature) => (
+    <article key={feature.id} className="feature">
+      <h3>{feature.title}</h3>
+      <img src={feature.shot.src} alt={feature.shot.alt} />
+      <p>{feature.body}</p>
+    </article>
+  ));
+}
+```
+
+The second is a font from a third-party stylesheet:
+
+```html title="index.html" bad
+<link rel="stylesheet" href="https://fonts.example-cdn.com/css2?family=Brand+Sans:wght@300..800" />
+```
+
+Here's what happens to each:
+
+- **An image without `width` and `height` takes no space** until the browser has downloaded enough of the file to learn its size. Then it expands, and everything below it moves down.
+- **The fallback font has different metrics.** Text first renders in the fallback, then the brand font arrives with wider letters and taller lines. Lines rewrap, paragraphs change height, and the content below shifts. The stylesheet-then-font request chain on another origin makes the font arrive later, and the shift more likely.
+
+CLS scores each shift by how much of the viewport moved and how far. Shifts less than a second apart are grouped into windows of up to 5 seconds, and CLS is the worst window, not a lifetime total. Shifts within 500 ms of a click or key press don't count, and neither do changes made with `transform`.
+
+## The fix
+
+### Reserve the space for images
+
+```tsx title="FeatureGrid.tsx" good add="8-9"
+function FeatureGrid({ features }: { features: Feature[] }) {
+  return features.map((feature) => (
+    <article key={feature.id} className="feature">
+      <h3>{feature.title}</h3>
+      <img
+        src={feature.shot.src}
+        alt={feature.shot.alt}
+        width={feature.shot.width}
+        height={feature.shot.height}
+        loading="lazy"
+        decoding="async"
+      />
+      <p>{feature.body}</p>
+    </article>
+  ));
+}
+```
+
+```css title="feature.css" good
+.feature img {
+  width: 100%;
+  height: auto; /* keeps the aspect ratio from width and height */
+}
+```
+
+`width` and `height` give the browser the aspect ratio before the file arrives, so it reserves the right box even when CSS makes the image fluid. When you don't know an image's dimensions, put it in a container with CSS `aspect-ratio`. Lazy loading is right here, because the grid is below the fold.
+
+### Load the font early, and make the fallback the same size
+
+Self-host the font, preload the one file the first screen uses, and describe it with `@font-face`:
+
+```html title="index.html" good
+<link rel="preload" href="/fonts/brand-sans-var.woff2" as="font" type="font/woff2" crossorigin />
+```
+
+```css title="fonts.css" good
+@font-face {
+  font-family: 'Brand Sans';
+  src: url('/fonts/brand-sans-var.woff2') format('woff2');
+  font-weight: 300 800; /* one variable file instead of five static weights */
+  font-display: swap; /* show text in the fallback right away */
+}
+
+@font-face {
+  font-family: 'Brand Sans Fallback';
+  src: local('Arial');
+  size-adjust: 104%;
+  ascent-override: 92%;
+  descent-override: 24%;
+  line-gap-override: 0%;
+}
+
+body {
+  font-family: 'Brand Sans', 'Brand Sans Fallback', system-ui, sans-serif;
+}
+```
+
+The override values above are illustrative. Generate the real ones for your font with Fontaine or Capsize, or let `next/font` do it. With the fallback scaled to the brand font's metrics, the swap changes the letter shapes but barely moves a line.
+
+## Why the fix works
+
+Layout shift happens when the browser has to change its mind about the size of something it already drew. Each fix gives it the right size up front:
+
+- **Image dimensions** turn "unknown until loaded" into a known box.
+- **The adjusted fallback** occupies the same space as the brand font, so the swap is a change of shape, not of size.
+- **Self-hosting and preloading** remove the extra connection and the stylesheet-then-font chain, so the font usually arrives before the first paint, or close to it.
+
+Pick `font-display` on purpose. Without it, most browsers hide text for up to about 3 seconds while the font loads. `swap` shows the fallback at once and swaps later, which is safe once the fallback's metrics match. `optional` uses the web font only if it arrives almost immediately, and otherwise keeps the fallback for that page view, so it never shifts.
+
+Fonts are always requested in CORS mode, so the preload needs `crossorigin` even for a file on your own origin. Without it, the preload is wasted and the font downloads twice. Preload only the one or two files the first screen needs, because everything preloaded competes for early bandwidth.
+
+In this example, CLS went from 0.21 to 0.03. In Next.js, `next/font` self-hosts the font, preloads it and generates the adjusted fallback for you.
+
+## How to confirm the fix
+
+1. Reload with the cache disabled and a slow network profile, and watch for movement.
+2. In the Performance panel, the **Layout shifts** track marks each shift and the elements that moved. The Rendering drawer's **Layout shift regions** option highlights them live.
+3. In the field, `onCLS` from the `web-vitals` attribution build reports `largestShiftTarget` and `largestShiftValue`, which point at the element to fix first.
+
+CLS is reported only by Chromium-based browsers, so field data for it reflects those users only.
+
+## Watch out for
+
+- **Avatars and logos.** Fixed-size images don't need `sizes`, but they still need dimensions. Use density descriptors for sharp images: `srcSet="/logo.png 1x, /logo@2x.png 2x"`.
+- **Content that arrives late.** Ads, embeds, banners and lazily mounted sections need reserved space too, with a `min-height` or a skeleton at the final size. Suspense and lazy fallbacks should match the size of what replaces them.
+- **Content inserted above the reader.** A cookie banner or a "new items" notice pushed in at the top shifts everything below. Overlay it, or insert it only in response to a user action.
+- **Layout that changes after hydration.** If the first client render differs from the server HTML, for example because it reads `window.innerWidth`, the page shifts when React takes over. Render the same markup on the server and on the first client render.

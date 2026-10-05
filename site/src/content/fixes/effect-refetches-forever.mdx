@@ -1,0 +1,150 @@
+---
+title: "useEffect refetches forever because of an object dependency"
+description: "An object built during render is a new dependency on every render, so an effect that fetches and sets state loops. Depend on primitives and build the object inside."
+skill: react-effects
+kind: bug
+symptom: "The network tab fills with the same request over and over while nobody touches the page, and the console stays quiet."
+cause: "An object created during render is a new value on every render, so the effect re-runs after each one, and its own setState causes the next."
+fix: "Depend on the primitive values the object is built from, and create the object inside the effect, or stabilize it where it's made."
+tags: [useEffect, dependency array, infinite loop, exhaustive-deps, data fetching]
+react: "All versions"
+order: 1
+source: skills/react-effects/examples/dependencies-and-loops.md
+published: 2026-10-01
+related: [search-shows-stale-results, memo-component-still-rerenders, handler-sees-old-state]
+featured: true
+---
+
+import EffectLoopDemo from '@/components/demos/EffectLoopDemo';
+
+An analytics app has a reports panel with a status filter and pagination. The panel loads its rows in an effect. It passed code review and QA. Then someone opens the network tab in production and sees `GET /api/reports?status=open&page=1` repeating two or three times a second, for as long as the tab stays open, while the panel sits untouched.
+
+Nothing crashes. There's no error in the console. The list flickers slightly, the API bill grows, and the backend team wants to know why one browser tab sends thousands of identical requests an hour.
+
+## Reproduce it
+
+<EffectLoopDemo client:visible />
+
+With the issue, don't touch anything. **Requests sent** climbs by two or three a second, every request repeats the previous query, and the render counter on `ReportsPanel` climbs with it. The demo stops itself after 25 identical requests; a real app wouldn't. Switch to the fix: one request on mount, then one per change of status or page.
+
+## Why it happens
+
+Here's the panel. The filters are bundled into an object because that's the shape `fetchReports` expects:
+
+```tsx title="ReportsPanel.tsx" bad error="5,11"
+function ReportsPanel() {
+  const [status, setStatus] = useState<ReportStatus>('open');
+  const [page, setPage] = useState(1);
+  const [reports, setReports] = useState<Report[]>([]);
+  const filters = { status, page, pageSize: 25 };
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchReports(filters, controller.signal).then(setReports).catch(ignoreAbort);
+    return () => controller.abort();
+  }, [filters]);
+
+  return (
+    <>
+      <ReportFilters status={status} page={page} onStatusChange={setStatus} onPageChange={setPage} />
+      <ReportTable reports={reports} />
+    </>
+  );
+}
+```
+
+React decides whether to re-run an effect by comparing each dependency with its value from the previous render, using `Object.is`. Strings, numbers and booleans compare by value, so `'open'` equals `'open'`. Objects, arrays and functions compare by identity: two objects with identical fields are still two different objects.
+
+`filters` is created during render, so every render produces a new one. Follow one cycle:
+
+1. The panel renders and creates `filters`.
+2. The effect runs and starts a request.
+3. The response arrives, and `setReports` stores a new array. Parsed JSON is always a new array, even when the rows haven't changed.
+4. The state change renders the panel again, which creates a new `filters`.
+5. React compares it with the previous `filters`, sees a different object, runs the cleanup and then the effect again. Back to step 2.
+
+The cleanup is correct, and it doesn't help. It aborts a request that's still in flight, but in this loop each request has already finished by the time the next render starts the next one.
+
+Why no error? React reports "Maximum update depth exceeded" when updates trigger more updates synchronously, render after render. Here each `setReports` runs in a promise callback, a full network round trip after the render that caused it, so to React every update looks unrelated. The loop is silent, and the API's latency sets its pace: the faster your backend, the more requests per second.
+
+## The fix
+
+Build the object inside the effect, and depend on the values it's made from:
+
+```tsx title="ReportsPanel.tsx" good add="1,10,14"
+const PAGE_SIZE = 25;
+
+function ReportsPanel() {
+  const [status, setStatus] = useState<ReportStatus>('open');
+  const [page, setPage] = useState(1);
+  const [reports, setReports] = useState<Report[]>([]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchReports({ status, page, pageSize: PAGE_SIZE }, controller.signal)
+      .then(setReports)
+      .catch(ignoreAbort);
+    return () => controller.abort();
+  }, [status, page]);
+
+  return (
+    <>
+      <ReportFilters status={status} page={page} onStatusChange={setStatus} onPageChange={setPage} />
+      <ReportTable reports={reports} />
+    </>
+  );
+}
+```
+
+Three things changed:
+
+- **The object lives inside the effect**, so it's no longer a dependency. Each run creates a fresh one, which is harmless, because nothing compares it.
+- **The dependencies are a string and a number.** A re-render caused by `setReports` leaves both unchanged, so the effect stays put.
+- **The page size moved to module scope.** A value that never changes doesn't belong in the component, so it never needs to appear in the array.
+
+`ignoreAbort` is a small helper that swallows the rejection `abort()` causes and re-throws anything else. A production panel would also render an error state.
+
+## Why the fix works
+
+You don't choose an effect's dependencies; the code does. Every reactive value the effect reads belongs in the array, and when the list produces the wrong behavior, you change what the effect reads. The rule to aim for: **each dependency should change exactly when the effect needs to run again.** `status` and `page` change when the user asks for different rows. A freshly built object changes on every render.
+
+When the object comes from somewhere else, the same idea applies at the source:
+
+- **From a parent**, as in `<ReportsPanel filters={{ status, page }} />`: pass `status` and `page` as separate props. If the object has to stay, memoize it where it's created with `useMemo(() => ({ status, page }), [status, page])`. Primitive props are the sturdier choice, because a `useMemo` in the parent is something every future caller has to remember.
+- **From a custom hook** that returns a new object on each call: depend on the fields you use, not on the object.
+
+What doesn't work: deleting `filters` from the array, or silencing `react-hooks/exhaustive-deps`. The loop stops, and so does refetching when the filters really change. That trade swaps a loud bug for a quiet one.
+
+## How to confirm the fix
+
+1. Open the **Network** panel and filter by `reports`. Load the screen and wait ten seconds without touching it. Before the fix, the same request repeats. After it, you see one request. In development with StrictMode you see two, and the first is cancelled, because React runs setup, cleanup, setup on mount to check the cleanup.
+2. Change the status, then the page. Each change sends exactly one request.
+3. If you're unsure which dependency is moving, log them inside the effect: `console.log('fetch reports', { status, page })`. Identical values logged again and again mean a dependency changes identity without changing meaning.
+
+A test pins it down. Return a new array from the mock on each call, like a real response, or the bug can hide:
+
+```tsx title="ReportsPanel.test.tsx"
+vi.mock('./api');
+
+it('fetches once on mount, and again only when a filter changes', async () => {
+  vi.mocked(fetchReports).mockImplementation(async () => [{ id: 'r1', title: 'Churn by plan' }]);
+  render(<ReportsPanel />);
+  await screen.findByText('Churn by plan');
+  await act(() => new Promise((resolve) => setTimeout(resolve, 100))); // time for a loop to show up
+  expect(fetchReports).toHaveBeenCalledTimes(1);
+});
+```
+
+## How to spot this in review
+
+The lint rule finds this one for you. `react-hooks/exhaustive-deps` warns: *The 'filters' object makes the dependencies of useEffect Hook (at line 11) change on every render*, and suggests moving the object into the effect. Treat that warning as a bug report.
+
+By eye, look for any dependency that's built in the component body: an object literal, an array from `.map` or `.filter`, or a function defined with `const load = () => …`. Each one is new on every render.
+
+<Callout type="warn" title="Functions loop the same way">
+A function defined in the component is a new value on every render, too. If the effect only needs it inside, move it into the effect. If it's a callback prop the effect calls but shouldn't re-run for, such as `onLoaded`, read it through `useEffectEvent` on React 19.2+, or through a latest-value ref on earlier versions. See <FixLink slug="handler-sees-old-state" />.
+</Callout>
+
+## When this isn't enough
+
+A stable dependency array stops the loop. It doesn't stop a slow, older response from overwriting a newer one when the user changes filters quickly: that's a race condition, covered in <FixLink slug="search-shows-stale-results" />. Data libraries handle both for you. TanStack Query, for example, hashes the query key, so `queryKey: ['reports', status, page]` refetches only when those values change, and responses for an old key never land in the new one.

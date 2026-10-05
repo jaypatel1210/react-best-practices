@@ -1,0 +1,109 @@
+---
+title: "Hand-written memoization fights the React Compiler"
+description: "With React Compiler on, manual useMemo and useCallback add noise, and a dependency list that hides a read makes it skip the component. Write plain code instead."
+skill: react-memoization
+kind: maintainability
+symptom: "React Compiler is enabled, but some components never get compiled, and new code keeps adding useMemo and useCallback out of habit."
+cause: "Manual memoization duplicates the compiler's work, and a dependency list that disagrees with the code, or a silenced hooks lint rule, makes the compiler skip the component."
+fix: "Write plain code in compiled projects, fix the dependency lists and rule violations that block compilation, and remove old memoization only with tests."
+tags: [React Compiler, useMemo, useCallback, eslint-plugin-react-hooks]
+react: "18 and 19"
+order: 4
+source: skills/react-memoization/references/react-compiler.md
+published: 2026-10-01
+related: [usememo-everywhere-no-faster, react-19-changes-the-advice, ref-value-never-shows-up]
+featured: false
+---
+
+A team turns on React Compiler in a two-year-old codebase. The build passes, the app works, and the plan is to let the compiler handle memoization from now on. A month later, the checkout page still re-renders as much as before.
+
+React DevTools explains part of it. Most components in the **Components** tab carry a **Memo ✨** badge, which means the compiler optimized them. `CheckoutSummary` doesn't. The compiler skipped it without failing the build, and nothing told anyone. Meanwhile, new pull requests keep adding `useCallback`, because that's what reviewers used to ask for.
+
+Hand-written memoization is fighting the compiler in two ways: it duplicates work the compiler already does, and in one component it blocks compilation entirely.
+
+## Why it happens
+
+Here's the component the compiler skipped:
+
+```tsx title="CheckoutSummary.tsx" bad error="8-9"
+const PayButton = memo(function PayButton({ onClick }: { onClick: () => void }) {
+  return <button onClick={onClick}>Pay now</button>;
+});
+
+function CheckoutSummary({ cart, currency, onCheckout }: CheckoutSummaryProps) {
+  const totals = useMemo(() => computeTotals(cart.items, currency), [cart.items, currency]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const handleCheckout = useCallback(() => onCheckout(cart.id), [cart.id]);
+
+  return (
+    <section>
+      <TotalsTable totals={totals} />
+      <PayButton onClick={handleCheckout} />
+    </section>
+  );
+}
+```
+
+Before the compiler, someone noticed that `onCheckout` arrived as a new function on every render of the parent, which broke `memo(PayButton)`. They dropped it from the dependency list and silenced the lint warning. That kept the callback stable, and it also froze it: `handleCheckout` keeps calling the `onCheckout` it captured when `cart.id` last changed, along with whatever parent state that closure saw.
+
+The compiler won't compile this function, for two reasons:
+
+- **A silenced hooks rule.** By default, the compiler skips a component or hook that contains an `eslint-disable` comment for `react-hooks/exhaustive-deps` or `react-hooks/rules-of-hooks`. The comment says the code may break the Rules of React, and the compiler relies on those rules to memoize safely.
+- **A dependency list that disagrees with the code.** The callback reads `onCheckout` and `cart.id`, but the list claims it depends only on `cart.id`. Memoized on what it actually reads, the function would change more often than the code promises, so the compiler can't preserve the manual memoization. It reports this through the `preserve-manual-memoization` lint rule and leaves the component uncompiled.
+
+The rest of the manual memoization in the codebase is mostly redundant. In compiled components, the compiler caches values, callbacks and JSX on its own, at a finer grain than hand-written hooks, including values computed after an early return.
+
+## The fix
+
+Delete the suppression and write the component as plain code. The compiler works out what each value depends on:
+
+```tsx title="CheckoutSummary.tsx" good add="1,6,11"
+function PayButton({ onClick }: { onClick: () => void }) {
+  return <button onClick={onClick}>Pay now</button>;
+}
+
+function CheckoutSummary({ cart, currency, onCheckout }: CheckoutSummaryProps) {
+  const totals = computeTotals(cart.items, currency);
+
+  return (
+    <section>
+      <TotalsTable totals={totals} />
+      <PayButton onClick={() => onCheckout(cart.id)} />
+    </section>
+  );
+}
+```
+
+The compiled `CheckoutSummary` caches `totals` until `cart.items` or `currency` changes, caches the arrow until `onCheckout` or `cart.id` changes, and caches the `<PayButton>` element itself. When the element is the same object as last time, React skips `PayButton`, no `memo` required. The original problem, the parent's unstable `onCheckout`, goes away once the parent compiles too, because its handler is cached the same way.
+
+If removing memoization isn't the task, the smallest fix is to delete the comment and complete the list: `useCallback(() => onCheckout(cart.id), [onCheckout, cart.id])`. That's enough for the compiler to take over. Removing the remaining hooks can change what the compiler produces, so do it in its own change, with tests.
+
+For the rest of the codebase:
+
+- **New code gets no `memo`, `useMemo` or `useCallback`.** Update the review checklist so reviewers stop asking for them.
+- **Existing memoization stays by default.** Leave it unless removing it is the point of the change.
+- **Manual memoization remains an escape hatch.** When a reference must stay stable for correctness, such as a value an effect depends on, a hand-written `useMemo` is still allowed, as long as its dependency list is honest.
+
+On React 17 and 18, the compiler also needs the `react-compiler-runtime` package and a matching `target` option. React 19 includes the runtime.
+
+## Why the fix works
+
+The compiler memoizes based on what the code reads. A hand-written dependency array is a claim about the code, and when the claim is wrong, the compiler can't honor both, so it skips the function rather than change its behavior. Plain code gives it nothing to contradict.
+
+The other common reasons a component isn't compiled work the same way: reading or writing `ref.current` during render, mutating props or state, side effects during render, and conditional hook calls. Each breaks an assumption the compiler depends on, and fixing it usually makes the component more correct too. For refs read during render, see <FixLink slug="ref-value-never-shows-up" />.
+
+## How to confirm the fix
+
+1. **Look for the badge.** In the React DevTools Components tab, `CheckoutSummary` should now show **Memo ✨**.
+2. **Run the lint rules.** `eslint-plugin-react-hooks` 7 and later include the compiler's rules, such as `preserve-manual-memoization`, `refs`, `purity` and `immutability`, in the `recommended` config. In 6.x they were only in `recommended-latest`. The file should report nothing.
+3. **Ask the compiler.** A passing build proves nothing, because the compiler skips functions silently. Its `logger` option reports each function it compiled or skipped, and `panicThreshold` can make CI fail on errors. In built output, a compiled module imports `c` from `react/compiler-runtime`, and each compiled function starts by allocating its cache with it.
+4. **Profile the interaction.** After an unrelated state change on the checkout page, `PayButton` should be gray in the Profiler.
+
+## Watch out for
+
+- **Effects that change timing.** An effect that ran on every render because a dependency was unstable may run only when its inputs really change once the component compiles. That's usually what was intended, but test the flows that relied on the old timing.
+- **Uncompiled parents.** The compiler doesn't wrap components in `memo`. A compiled child under a parent that isn't compiled, such as a library component, a skipped component or a function marked `"use no memo"`, still re-renders whenever that parent does.
+- **Version upgrades.** Pin the compiler version and upgrade deliberately, with tests, because a new release can change what gets memoized.
+
+The compiler removes the bookkeeping of memoization. It doesn't change what re-renders when state changes, so state placement, context design and keys are still yours to get right.

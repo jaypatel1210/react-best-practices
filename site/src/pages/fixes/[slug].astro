@@ -1,0 +1,294 @@
+---
+import { getEntry, render } from 'astro:content';
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import Callout from '@/components/Callout.astro';
+import Compare from '@/components/Compare.astro';
+import DiagnosisCard from '@/components/DiagnosisCard.astro';
+import FixCard from '@/components/FixCard.astro';
+import FixLink from '@/components/FixLink.astro';
+import Icon from '@/components/Icon.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import SiteLink from '@/components/SiteLink.astro';
+import SkillLink from '@/components/SkillLink.astro';
+import Toc from '@/components/Toc.astro';
+import { repoUrl } from '@/config';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { formatDate, getFixes, getSkillTitles, KIND_LABEL, type Fix } from '@/lib/content';
+import { breadcrumbs, techArticle } from '@/lib/seo';
+import { absoluteUrl, fixUrl, ogImageUrl, skillUrl } from '@/lib/urls';
+
+export async function getStaticPaths() {
+  const fixes = await getFixes();
+  return fixes.map((fix, i) => ({
+    params: { slug: fix.id },
+    props: { fix, prev: fixes[i - 1], next: fixes[i + 1] },
+  }));
+}
+
+interface Props {
+  fix: Fix;
+  prev?: Fix;
+  next?: Fix;
+}
+
+const { fix, prev, next } = Astro.props;
+const { title, description, kind, react, symptom, cause, fix: fixLine, tags, source, published, updated } = fix.data;
+const { Content, headings } = await render(fix);
+const skill = await getEntry('skills', fix.data.skill);
+if (!skill) throw new Error(`Fix "${fix.id}" names skill "${fix.data.skill}", which has no page in src/content/skills.`);
+
+const related = (await Promise.all(fix.data.related.map((ref) => getEntry(ref)))).filter(
+  (entry): entry is Fix => Boolean(entry),
+);
+const skillTitles = await getSkillTitles();
+
+const path = `/fixes/${fix.id}/`;
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Fixes', path: '/fixes/' },
+  { name: skill.data.title, path: `/skills/${skill.id}/` },
+  { name: title, path },
+];
+const schema = [
+  techArticle(
+    {
+      path,
+      headline: title,
+      description,
+      section: skill.data.title,
+      keywords: ['React', ...tags],
+      published,
+      updated,
+      image: absoluteUrl(ogImageUrl(`fixes/${fix.id}`), Astro.site),
+    },
+    Astro.site,
+  ),
+  breadcrumbs(crumbs, Astro.site),
+];
+---
+
+<BaseLayout
+  title={title}
+  description={description}
+  og={`fixes/${fix.id}`}
+  type="article"
+  schema={schema}
+  article={{ published, updated, section: skill.data.title, tags }}
+>
+  <div class="container">
+    <article class="fix-page">
+      <header class="fix-head">
+        <Breadcrumbs items={crumbs} />
+        <div class="cluster">
+          <span class="badge badge-dot" data-kind={kind}>{KIND_LABEL[kind]}</span>
+          <a class="badge badge-skill" href={skillUrl(skill.id)}>{skill.id}</a>
+          <span class="badge badge-muted">{/^all/i.test(react) ? 'Any React version' : `React ${react}`}</span>
+        </div>
+        <h1>{title}</h1>
+        <p class="lede">{description}</p>
+        <DiagnosisCard symptom={symptom} cause={cause} fix={fixLine} />
+      </header>
+
+      <div class="fix-body">
+        <div class="prose">
+          <Content components={{ Callout, Compare, FixLink, SiteLink, SkillLink }} />
+        </div>
+        <aside class="fix-aside">
+          <Toc headings={headings} />
+        </aside>
+      </div>
+
+      <section class="claude-box" aria-labelledby="claude-box-title">
+        <div class="claude-copy">
+          <span class="eyebrow"><Icon name="spark" /> Let Claude catch this</span>
+          <h2 id="claude-box-title">This fix ships in the <code>{skill.id}</code> skill</h2>
+          <p>
+            With the skills installed, Claude recognizes this pattern when you describe the symptom, applies the fix,
+            and flags it in code review. Try saying:
+          </p>
+          <blockquote>“{skill.data.prompts[0]}”</blockquote>
+          <a class="button button-secondary button-sm" href={skillUrl(skill.id)}>
+            Everything this skill covers <Icon name="arrowRight" />
+          </a>
+        </div>
+        <InstallBlock compact />
+      </section>
+
+      {
+        related.length > 0 && (
+          <section class="related" aria-labelledby="related-title">
+            <h2 id="related-title">Related fixes</h2>
+            <div class="grid grid-3">
+              {related.map((entry) => (
+                <FixCard fix={entry} skillTitle={skillTitles[entry.data.skill]} />
+              ))}
+            </div>
+          </section>
+        )
+      }
+
+      <nav class="pager" aria-label="Previous and next fix">
+        {
+          prev && (
+            <a class="prev" href={fixUrl(prev.id)} rel="prev">
+              <span>← Previous</span>
+              {prev.data.title}
+            </a>
+          )
+        }
+        {
+          next && (
+            <a class="next" href={fixUrl(next.id)} rel="next">
+              <span>Next →</span>
+              {next.data.title}
+            </a>
+          )
+        }
+      </nav>
+
+      <footer class="fix-meta">
+        <span>
+          Published <time datetime={published.toISOString()}>{formatDate(published)}</time>
+          {
+            updated && (
+              <>
+                {' · Updated '}
+                <time datetime={updated.toISOString()}>{formatDate(updated)}</time>
+              </>
+            )
+          }
+        </span>
+        <span>
+          Drawn from <a href={repoUrl(source)} rel="noopener"><code>{source}</code></a> ·{' '}
+          <a href={repoUrl(`site/src/content/fixes/${fix.id}.mdx`)} rel="noopener">Edit this page</a>
+        </span>
+      </footer>
+    </article>
+  </div>
+</BaseLayout>
+
+<style>
+  .fix-head {
+    display: grid;
+    gap: 16px;
+    padding-block: clamp(28px, 5vw, 48px) 8px;
+    max-width: 920px;
+  }
+
+  .fix-head h1 {
+    font-size: clamp(1.9rem, 4.2vw, 2.85rem);
+    letter-spacing: -0.025em;
+  }
+
+  .fix-head .lede {
+    font-size: clamp(1.05rem, 1.5vw, 1.18rem);
+    color: var(--text-2);
+    max-width: 68ch;
+  }
+
+  .fix-head .diagnosis {
+    margin-top: 8px;
+  }
+
+  .fix-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 230px;
+    gap: 56px;
+    margin-top: 8px;
+  }
+
+  .fix-aside {
+    padding-top: 2.4em;
+  }
+
+  @media (max-width: 1100px) {
+    .fix-body {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .fix-aside {
+      display: none;
+    }
+  }
+
+  .claude-box {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 28px;
+    align-items: center;
+    margin-top: 64px;
+    padding: clamp(20px, 4vw, 32px);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    background:
+      radial-gradient(120% 120% at 0% 0%, var(--brand-soft), transparent 60%),
+      var(--surface);
+  }
+
+  .claude-copy {
+    display: grid;
+    gap: 12px;
+    justify-items: start;
+  }
+
+  .claude-copy h2 {
+    font-size: clamp(1.3rem, 2.4vw, 1.6rem);
+  }
+
+  .claude-copy h2 code {
+    font-size: 0.82em;
+    color: var(--brand);
+  }
+
+  .claude-copy p {
+    color: var(--text-2);
+  }
+
+  .claude-copy blockquote {
+    margin: 0;
+    padding: 10px 14px;
+    border-left: 3px solid var(--brand);
+    border-radius: 0 10px 10px 0;
+    background: var(--surface-2);
+    color: var(--text);
+    font-style: italic;
+  }
+
+  @media (max-width: 860px) {
+    .claude-box {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  .related {
+    margin-top: 56px;
+  }
+
+  .related h2 {
+    font-size: 1.5rem;
+    margin-bottom: 18px;
+  }
+
+  .pager {
+    margin-top: 48px;
+  }
+
+  .fix-meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px 24px;
+    margin-top: 32px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--text-3);
+    font-size: 0.86rem;
+  }
+
+  .fix-meta a {
+    color: var(--text-2);
+  }
+
+  .fix-meta code {
+    font-size: 0.92em;
+  }
+</style>

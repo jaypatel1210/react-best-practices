@@ -1,0 +1,195 @@
+---
+title: "A scroll hook or render prop re-renders more than the part that needs it"
+description: "A scroll hook re-renders its whole host, and a render prop re-renders all it returns. Render only the dependent part through the prop and pass the rest as children."
+skill: react-composition
+kind: performance
+symptom: "Scrolling a report re-renders the expensive report body on every scroll event, whether the scroll logic lives in a hook or in a render-prop component."
+cause: "A hook's state re-renders the component that calls it, and a render prop re-renders everything its function returns, so both re-render the body along with the toolbar."
+fix: "Let a small component own the scroll container and store a coarse value. Pass only the part that reads it through a render prop, and the rest as children."
+tags: [render props, custom hooks, children, scroll, re-renders]
+react: "All versions"
+order: 4
+source: skills/react-composition/examples/render-props-and-hooks.md
+published: 2026-10-01
+related: [wrapper-state-rerenders-children, custom-hook-state-rerenders-host, component-props-keep-growing]
+featured: false
+---
+
+Several screens in an analytics app scroll inside a container rather than the window, and they all want to react to that scroll: a shadow under the sticky toolbar once content slides beneath it, a **Back to top** button, a section that loads as it comes close. You want to write the scroll logic once.
+
+The report page is the first user. Its `ReportBody` renders tables and charts, and takes about 30 ms to render. After you add the toolbar shadow, scrolling the report starts to stutter.
+
+The question people ask is "should this be a hook or a render prop?" The question that matters is: which component owns the state, and which elements does that component create?
+
+## Why it happens
+
+### Option A: a hook plus a ref
+
+```tsx title="useScrollTop.ts" bad
+export function useScrollTop<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onScroll = () => setScrollTop(el.scrollTop);
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  return { ref, scrollTop };
+}
+```
+
+```tsx title="ReportPage.tsx" bad error="2,6"
+function ReportPage({ report }: { report: Report }) {
+  const { ref, scrollTop } = useScrollTop<HTMLDivElement>();
+  return (
+    <div ref={ref} className="report-scroll">
+      <Toolbar elevated={scrollTop > 0} />
+      <ReportBody report={report} />
+    </div>
+  );
+}
+```
+
+A hook's state belongs to the component that calls it. Every scroll event calls `setScrollTop`, so `ReportPage` re-renders, and `ReportBody` with it. Scroll events fire many times per second, each with a new `scrollTop`, so React never gets an identical value it could skip. At 30 ms a render, you drop frames for as long as you scroll.
+
+The hook has a second, quieter bug. Its effect reads `ref.current` once, after the first render. If the container mounts later, say after the report finishes loading, the listener never attaches.
+
+### Option B: a render-prop component
+
+```tsx title="ScrollArea.tsx" bad error="8,19"
+function ScrollArea({ className, children }: {
+  className?: string;
+  children: (scrollTop: number) => React.ReactNode;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
+  return (
+    <div className={className} onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}>
+      {children(scrollTop)}
+    </div>
+  );
+}
+
+function ReportPage({ report }: { report: Report }) {
+  return (
+    <ScrollArea className="report-scroll">
+      {(scrollTop) => (
+        <>
+          <Toolbar elevated={scrollTop > 0} />
+          <ReportBody report={report} />
+        </>
+      )}
+    </ScrollArea>
+  );
+}
+```
+
+This is better. `ScrollArea` renders the element and owns the listener, so there's no ref plumbing and nothing to miss when the container mounts late. `ReportPage` no longer re-renders on scroll.
+
+But `ReportBody` still does. The render function is *defined* in `ReportPage`, but it's *called* during `ScrollArea`'s render. Every scroll creates a new `<ReportBody>` element, and React renders it again.
+
+Both options break the same rule: **an element re-renders when the component that creates it re-renders.** With the hook, `ReportPage` creates `ReportBody` and owns the scroll state. With the render prop, `ScrollArea` creates it, by calling the function, and owns the scroll state. Either way, the owner of the fast-changing state creates the expensive element.
+
+## The fix
+
+Combine the render prop with plain children. Only the part that reads the scroll position goes through the function. Everything else is created by `ReportPage` and passed in as `children`:
+
+```tsx title="ScrollArea.tsx" good add="3-4,6,8-10"
+function ScrollArea({ className, header, children }: {
+  className?: string;
+  header: (state: { isScrolled: boolean }) => React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const [isScrolled, setIsScrolled] = useState(false);
+  return (
+    <div className={className} onScroll={(e) => setIsScrolled(e.currentTarget.scrollTop > 0)}>
+      {header({ isScrolled })}
+      {children}
+    </div>
+  );
+}
+
+function ReportPage({ report }: { report: Report }) {
+  return (
+    <ScrollArea className="report-scroll" header={({ isScrolled }) => <Toolbar elevated={isScrolled} />}>
+      <ReportBody report={report} />
+    </ScrollArea>
+  );
+}
+```
+
+Two changes do the work:
+
+- **`ReportBody` moved out of the function.** `ReportPage` creates it, and `ReportPage` doesn't re-render on scroll. When `ScrollArea` re-renders, `children` is the same element object as before, so React skips the whole body.
+- **The state stores a boolean, not the raw offset.** Most scroll events compute `true` again, and React bails out when the new state is identical to the current one (`Object.is`). So `ScrollArea` and `Toolbar` re-render only when the content crosses the top edge.
+
+Scrolling the report now re-renders two small components, once in each direction.
+
+## Why the fix works
+
+"Hook or render prop" is really a question about where the state lives and who creates the elements around it. State re-renders its owner, and the owner re-renders whatever it creates. So put fast-changing state in a small component, and let a component that doesn't re-render create the expensive parts. <FixLink slug="wrapper-state-rerenders-children" /> applies the same idea to a resizable split pane and a collapsing header.
+
+Use this table to choose:
+
+| Situation | Choose |
+|---|---|
+| The source is global (window size, a media query, online status) and the caller renders little | A hook |
+| The logic needs an element the abstraction should own (a scroll or drag container, a measured box) | A render-prop component, or a hook that returns a callback ref |
+| The value changes many times per second and the caller renders a lot | A component with a render prop for the dependent part and `children` for the rest |
+| Many components deep in the tree need the value | A provider and context, with a memoized value |
+
+None of this needs `memo`. You could wrap `ReportBody` in `memo` to rescue option A or B, but that adds a props comparison to every scroll event, and it stops working the day someone passes the body an inline object. Changing who creates the element removes the work instead of guarding against it.
+
+## How to confirm the fix
+
+1. In React DevTools, open **Profiler** and turn on **Highlight updates when components render** in its settings.
+2. Record while you scroll the report down and back up.
+3. With option A, every commit includes `ReportPage` and `ReportBody`. With option B, every commit includes `ScrollArea` and `ReportBody`. After the fix, there's one commit when the toolbar gains its shadow and one when it loses it, each with only `ScrollArea` and `Toolbar`.
+
+The Performance panel tells the same story: the scripting work that ran on every scroll event disappears.
+
+## When a hook is still the right call
+
+Hooks are the better default for logic that isn't tied to an element. There's less nesting, and the data source is obvious where it's used. For a global value, use a hook that stores only what callers need, such as `useMediaQuery('(max-width: 767px)')` rather than the raw window width. <FixLink slug="custom-hook-state-rerenders-host" /> covers that case.
+
+For element-bound logic, a hook works too if it returns a callback ref, so it attaches whenever the element mounts. Store the coarse value, and call the hook in a small component that receives the heavy content as `children`:
+
+```tsx title="useIsScrolled.ts" good mark="5,22"
+export function useIsScrolled<T extends HTMLElement>() {
+  const [isScrolled, setIsScrolled] = useState(false);
+  const cleanupRef = useRef<(() => void) | null>(null);
+
+  const ref = useCallback((node: T | null) => {
+    cleanupRef.current?.(); // detach from the previous element, if any
+    cleanupRef.current = null;
+    if (!node) return;
+    const onScroll = () => setIsScrolled(node.scrollTop > 0);
+    node.addEventListener('scroll', onScroll, { passive: true });
+    cleanupRef.current = () => node.removeEventListener('scroll', onScroll);
+  }, []);
+
+  return [ref, isScrolled] as const;
+}
+
+function ReportScroller({ children }: { children: React.ReactNode }) {
+  const [ref, isScrolled] = useIsScrolled<HTMLDivElement>();
+  return (
+    <div ref={ref} className="report-scroll">
+      <Toolbar elevated={isScrolled} />
+      {children}
+    </div>
+  );
+}
+```
+
+React calls a callback ref with the node when it attaches the element and with `null` when it detaches it. `useCallback` keeps the function stable, because a new function on every render would make React detach and re-attach the ref each time. On React 19, the callback can return a cleanup function instead of keeping one in a ref.
+
+`ReportScroller` has the same shape as the fixed `ScrollArea`, with a hook inside. The hook was never the problem. Calling it in the component that renders the heavy content was.
+
+## Watch out for
+
+- **Purely visual effects may not need React state at all.** A toolbar shadow can come from CSS, for example `position: sticky` combined with a scroll-driven animation where browsers support it. Then scrolling re-renders nothing.
+- **Throttling the scroll handler isn't the fix.** It re-renders the body less often, but it still re-renders it, and the toolbar reacts late.

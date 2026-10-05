@@ -1,0 +1,197 @@
+---
+title: "Defaults added with cloneElement override the caller's props"
+description: "A Button that injects icon defaults with cloneElement silently overwrites the props callers pass. Let the caller's props win, or move defaults to CSS or a render prop."
+skill: react-composition
+kind: bug
+symptom: "An icon respects its color or size prop everywhere except inside one component, where the component's defaults win and nothing warns you."
+cause: "The component calls cloneElement(child, defaults), and props passed to cloneElement replace the ones already on the element."
+fix: "Spread the defaults first and the child's own props last, or better, style the slot with CSS or pass the defaults through a render prop."
+tags: [cloneElement, isValidElement, slots, render props, props]
+react: "All versions"
+order: 2
+source: skills/react-composition/examples/slots-and-defaults.md
+published: 2026-10-01
+related: [component-props-keep-growing, hoc-swallows-callbacks, render-prop-or-hook]
+featured: false
+---
+
+Your `Button` takes a `startIcon` slot, and it wants icons to match the button: white on primary buttons, 20px on large ones. Someone added `cloneElement` to inject those values, and every button in the app looked right.
+
+Months later, a destructive **Replace file** action needs a red icon. The developer writes `<UploadIcon color="red" />`, and it renders white. The same icon is red in the toolbar and red in the menu, and white only inside `Button`. There's no warning and no type error. The bug report says "icon colors don't work in buttons".
+
+## Why it happens
+
+The design system's icons apply their `size` and `color` props to their own attributes:
+
+```tsx title="UploadIcon.tsx"
+type IconProps = { size?: number | string; color?: string };
+
+export function UploadIcon({ size = '1em', color = 'currentColor' }: IconProps) {
+  return (
+    <svg width={size} height={size} fill={color} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3l5 5h-3v6h-4V8H7l5-5zM5 18h14v2H5z" />
+    </svg>
+  );
+}
+```
+
+And here's the button that gives them defaults:
+
+```tsx title="Button.tsx" bad error="10"
+type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  appearance?: 'primary' | 'secondary';
+  size?: 'md' | 'lg';
+  startIcon?: React.ReactNode;
+};
+
+export function Button({ appearance = 'primary', size = 'md', startIcon, children, ...rest }: ButtonProps) {
+  const defaults = { size: size === 'lg' ? 20 : 16, color: appearance === 'primary' ? 'white' : 'black' };
+  const icon = isValidElement<IconProps>(startIcon)
+    ? cloneElement(startIcon, defaults)
+    : startIcon;
+  return (
+    <button {...rest} className={`btn btn--${appearance} btn--${size}`}>
+      {icon}
+      {children}
+    </button>
+  );
+}
+
+<Button startIcon={<UploadIcon color="red" />}>Replace file</Button>; // renders a white icon
+```
+
+`cloneElement(element, props)` returns a copy of the element with its props merged with the ones you pass, and **the props you pass win**. It works like `{ ...startIcon.props, ...defaults }`. So the caller's `{ color: 'red' }` merged with `{ size: 16, color: 'white' }` comes out as `{ size: 16, color: 'white' }`.
+
+The name suggests a harmless copy, which hides that it's an override. And the merge happens inside `Button`, where nobody reading the call site can see it.
+
+The order is the loud failure. `cloneElement` has quieter ones, even when the order is right:
+
+- **Wrappers get the props instead.** If the caller passes `<Tooltip label="Upload"><UploadIcon /></Tooltip>` or a fragment, the defaults land on the wrapper, not on the icon.
+- **Components that don't expect them ignore them.** An icon that doesn't accept `size` or `color` drops the defaults, or spreads them onto a DOM element as stray attributes.
+- **The data flow is invisible.** Nothing in `<Button startIcon={<UploadIcon />}>` says the icon will be resized and recolored.
+
+React's documentation lists `cloneElement` among its legacy APIs for reasons like these.
+
+## The fix
+
+There are three ways to give slot content defaults. Prefer them in this order.
+
+### 1. CSS, when the defaults are only visual
+
+The icons above already default to `currentColor` and `1em`. So the button doesn't need to touch the icon at all: it sets the values the icon inherits.
+
+```tsx title="Button.tsx" good add="4"
+export function Button({ appearance = 'primary', size = 'md', startIcon, children, ...rest }: ButtonProps) {
+  return (
+    <button {...rest} className={`btn btn--${appearance} btn--${size}`}>
+      {startIcon && <span className="btn__icon" aria-hidden="true">{startIcon}</span>}
+      {children}
+    </button>
+  );
+}
+```
+
+```css title="button.css" good
+.btn--primary { color: white; }                       /* fill="currentColor" follows it */
+.btn__icon { display: inline-flex; font-size: 16px; } /* the 1em size follows it */
+.btn--lg .btn__icon { font-size: 20px; }
+```
+
+Because the stylesheet sets inherited values, not the icon's own attributes, `<UploadIcon color="red" />` still renders red. The caller's prop is the more specific instruction, and CSS inheritance already treats it that way.
+
+### 2. A render prop, when the component must pass values or state
+
+CSS can't express everything. Maybe the icon should fill in while the button is hovered, or a third-party icon set takes `fontSize` instead of `size`. Then have the button pass its values explicitly, and let the caller decide what to do with them:
+
+```tsx title="Button.tsx" good add="6,11-15,29"
+type IconSlotProps = { size: number; color: string; isHovered: boolean };
+
+type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  appearance?: 'primary' | 'secondary';
+  size?: 'md' | 'lg';
+  renderIcon?: (slot: IconSlotProps) => React.ReactNode;
+};
+
+export function Button({ appearance = 'primary', size = 'md', renderIcon, children, ...rest }: ButtonProps) {
+  const [isHovered, setIsHovered] = useState(false);
+  const slot: IconSlotProps = {
+    size: size === 'lg' ? 20 : 16,
+    color: appearance === 'primary' ? 'white' : 'currentColor',
+    isHovered,
+  };
+  return (
+    <button
+      {...rest}
+      className={`btn btn--${appearance} btn--${size}`}
+      onPointerEnter={(e) => {
+        setIsHovered(true);
+        rest.onPointerEnter?.(e);
+      }}
+      onPointerLeave={(e) => {
+        setIsHovered(false);
+        rest.onPointerLeave?.(e);
+      }}
+    >
+      {renderIcon?.(slot)}
+      {children}
+    </button>
+  );
+}
+```
+
+```tsx title="FileActions.tsx" good
+<Button renderIcon={(slot) => <UploadIcon size={slot.size} color="red" />}>Replace file</Button>;
+<Button renderIcon={({ size, isHovered }) => <Heart filled={isHovered} fontSize={size} />}>Like</Button>;
+```
+
+Everything is visible at the call site. The caller sees the values, overrides any of them (`color="red"`), and maps them onto whatever API its icon has.
+
+Notice the pointer handlers, too. The button spreads `rest` first and then calls the caller's handler from its own. Spreading `rest` last would let a caller's `onPointerEnter` replace the button's and break the hover state. It's the same "whose props win" question in another form.
+
+### 3. cloneElement, for simple and controlled cases only
+
+If you keep `cloneElement`, spread the defaults first so the caller's props win:
+
+```tsx title="Button.tsx" good add="3"
+const defaults = { size: size === 'lg' ? 20 : 16, color: appearance === 'primary' ? 'white' : 'black' };
+const icon = isValidElement<IconProps>(startIcon)
+  ? cloneElement(startIcon, { ...defaults, ...startIcon.props }) // the caller's props win
+  : startIcon;
+```
+
+Use it only when the slot's element type is known and controlled, such as icons from your own design system. The wrapper and fragment problems above still apply.
+
+## Why the fix works
+
+The rule is that the more specific instruction wins. A prop written on the element is more specific than a default the parent applies to every element it receives. CSS inheritance encodes that order for free, a render prop makes it explicit, and `{ ...defaults, ...startIcon.props }` restores it for `cloneElement`.
+
+It's also about visibility. With CSS or a render prop, someone reading `<Button renderIcon={…}>` can tell where the size comes from. With `cloneElement`, the data flow lives inside `Button`, and the first sign of it is a bug like this one.
+
+## How to confirm the fix
+
+1. **Inspect the props.** In React DevTools, select the icon inside the button. Before the fix, its `color` prop reads `white` although the call site says `red`. After it, the prop matches the call site.
+2. **Test both cases**: one icon with an explicit prop and one that relies on the default. There's an example below.
+3. **Search for the pattern.** Run `grep -rn "cloneElement(" src` and check each call. `cloneElement(child, { ...defaults, ...child.props })` keeps the caller's props, and `cloneElement(child, defaults)` overrides them.
+
+Here's that test for the `cloneElement` version:
+
+```tsx title="Button.test.tsx"
+it('keeps the icon props the caller set and fills in the rest', () => {
+  const { container } = render(
+    <>
+      <Button startIcon={<UploadIcon color="red" />}>Replace file</Button>
+      <Button startIcon={<UploadIcon />}>Upload</Button>
+    </>,
+  );
+  const [explicit, defaulted] = container.querySelectorAll('svg');
+  expect(explicit.getAttribute('fill')).toBe('red');
+  expect(defaulted.getAttribute('fill')).toBe('white');
+});
+```
+
+## Watch out for
+
+- **Event handlers get replaced too.** `cloneElement(child, { onClick: track })` throws away the child's own `onClick`, so the caller's handler never runs. Compose them instead: `onClick: (e) => { child.props.onClick?.(e); track(e); }`. A higher-order component can make the same mistake, as <FixLink slug="hoc-swallows-callbacks" /> shows.
+- **`key` and `ref` are replaced as well** if you pass them in the props argument.
+- **An explicit `undefined` wins too.** With `{ ...defaults, ...startIcon.props }`, a caller who writes `color={maybeColor}` while `maybeColor` is undefined gets the icon's own default, not the button's.
+- **Injecting props into many children** with `Children.map` and `cloneElement`, for example passing `isActive` to each tab, breaks as soon as someone wraps a tab in a fragment or another component. Build those parts as compound components (`Tabs`, `Tabs.Trigger`, `Tabs.Panel`) that share state through context instead.

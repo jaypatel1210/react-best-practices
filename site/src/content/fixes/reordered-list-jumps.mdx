@@ -1,0 +1,184 @@
+---
+title: "List items jump to their new places instead of moving"
+description: "A re-sorted list snaps into its new order because no CSS property changes. Animate the move with FLIP in useLayoutEffect, or with View Transitions on React 19.3+."
+skill: react-animation
+kind: performance
+symptom: "When a leaderboard or sortable list re-orders, rows teleport to their new positions, and users lose track of which item moved where."
+cause: "React moves the existing DOM nodes in one commit. Nothing about any row's styles changes, so a CSS transition has nothing to animate."
+fix: "Use FLIP: measure each row before and after the commit, apply an inverse transform before paint, and animate it to none. Or wrap the update in a View Transition."
+tags: [FLIP, useLayoutEffect, Web Animations API, ViewTransition, list animation]
+react: "18 and 19"
+order: 4
+source: skills/react-animation/examples/flip-and-view-transitions.md
+published: 2026-10-01
+related: [index-keys-mix-up-row-state, expanding-panel-stutters, tooltip-flickers-into-place]
+featured: false
+---
+
+import FlipDemo from '@/components/demos/FlipDemo';
+
+A live leaderboard receives new scores every few seconds and re-sorts. Each time, rows snap into their new ranks with no motion at all. Someone climbs from fifth to second, and nobody notices, because nothing on screen showed the climb.
+
+Adding `transition: transform 300ms` to the rows does nothing. This page explains why, and how to animate the move anyway.
+
+## Reproduce it
+
+<FlipDemo client:visible />
+
+With the issue, press **Shuffle scores** a few times and try to follow one player: each re-sort is an instant jump. Switch to the fix and do it again: every row that changed rank glides to its new slot. Both versions key rows by player ID. The only difference is a small FLIP hook.
+
+## Why it happens
+
+```tsx title="Leaderboard.tsx" bad mark="2"
+function Leaderboard({ players }: { players: Player[] }) {
+  const ranked = players.toSorted((a, b) => b.score - a.score);
+  return (
+    <ol className="leaderboard">
+      {ranked.map((p) => (
+        <li key={p.id}>
+          <PlayerRow player={p} />
+        </li>
+      ))}
+    </ol>
+  );
+}
+```
+
+With stable keys, React does the efficient thing: it reorders the existing `<li>` nodes instead of re-creating them. To the browser, though, a node moving to a new slot isn't a style change. Each row's `transform`, `top` and every other property keep the same value. The row lays out in a different place because its position in the flow changed, and transitions only animate a property going from one value to another. With no property change, there's nothing to interpolate, so the browser paints the new order in a single frame.
+
+## The fix
+
+FLIP turns the move into a transform: **F**irst, **L**ast, **I**nvert, **P**lay.
+
+1. **First:** know each row's position before the change.
+2. **Last:** after React commits the change, read each row's new position.
+3. **Invert:** apply a transform that puts each moved row back where it was.
+4. **Play:** animate that transform to `none`.
+
+Steps 2 and 3 have to happen before the browser paints the new order, which is exactly when `useLayoutEffect` runs:
+
+```tsx title="useFlip.ts" good
+type Point = { x: number; y: number };
+
+export function useFlip(containerRef: React.RefObject<HTMLElement | null>, durationMs = 300) {
+  const previous = useRef(new Map<string, Point>());
+
+  // No dependency array: compare positions after every commit of the list's owner.
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const items = [...container.querySelectorAll<HTMLElement>('[data-flip-key]')];
+
+    // Stop our own running animations, so we measure the real layout, not a transformed one.
+    for (const el of items) {
+      for (const animation of el.getAnimations()) if (animation.id === 'flip') animation.cancel();
+    }
+
+    // Read pass: positions relative to the container, so scrolling the page doesn't count as a move.
+    const origin = container.getBoundingClientRect();
+    const next = new Map<string, Point>();
+    for (const el of items) {
+      const rect = el.getBoundingClientRect();
+      next.set(el.dataset.flipKey!, { x: rect.left - origin.left, y: rect.top - origin.top });
+    }
+
+    // Write pass: invert each moved item, then play it back to its new place.
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!reduceMotion) {
+      for (const el of items) {
+        const key = el.dataset.flipKey!;
+        const before = previous.current.get(key);
+        const after = next.get(key)!;
+        if (!before) continue; // a new row: leave its entrance to CSS
+        const dx = before.x - after.x;
+        const dy = before.y - after.y;
+        if (dx === 0 && dy === 0) continue;
+        el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], {
+          duration: durationMs,
+          easing: 'cubic-bezier(0.2, 0, 0, 1)',
+          id: 'flip',
+        });
+      }
+    }
+
+    previous.current = next;
+  });
+}
+```
+
+```tsx title="Leaderboard.tsx" good add="2-3,6,8"
+function Leaderboard({ players }: { players: Player[] }) {
+  const listRef = useRef<HTMLOListElement>(null);
+  useFlip(listRef);
+  const ranked = players.toSorted((a, b) => b.score - a.score);
+  return (
+    <ol ref={listRef} className="leaderboard">
+      {ranked.map((p) => (
+        <li key={p.id} data-flip-key={p.id}>
+          <PlayerRow player={p} />
+        </li>
+      ))}
+    </ol>
+  );
+}
+```
+
+The hook stores each commit's positions, which become "first" for the next one. When rows move, it animates each one from its old spot to its new one with the Web Animations API. The `id: 'flip'` option lets it cancel only its own animations, and reduced-motion users get the instant reorder.
+
+## Why the fix works
+
+- **`useLayoutEffect` runs after React moves the DOM nodes and before the browser paints.** The inverse transform is in place before the user sees the new order, so no frame shows rows in their final slots before the animation starts.
+- **The motion is a `transform`,** which the compositor animates without layout or paint, so it stays smooth even when the list re-renders often.
+- **Reads come before writes.** The hook measures every row, then starts every animation, so each commit forces one layout rather than one per row.
+- **`key={p.id}` is essential.** It makes React move the existing nodes. With index keys, React keeps each node in place and rewrites its content, so there's nothing to animate, and the wrong rows would appear to move (<FixLink slug="index-keys-mix-up-row-state" />).
+- **The Web Animations API** plays from the inverted position to `none` without the old "set a transform, force a style flush, then add a transition" routine.
+
+## View Transitions: the browser does the measuring
+
+View Transitions take a snapshot of the UI, apply your update, take another, and animate between them. On **React 19.3+**, wrap each row in `<ViewTransition>` with a unique name and make the update a transition:
+
+```tsx title="Leaderboard.tsx" good
+import { startTransition, ViewTransition } from 'react';
+
+// Only updates inside startTransition, useDeferredValue, Actions or a Suspense reveal animate.
+startTransition(() => setPlayers(nextPlayers));
+
+{ranked.map((p) => (
+  <ViewTransition key={p.id} name={`player-${p.id}`}>
+    <li>
+      <PlayerRow player={p} />
+    </li>
+  </ViewTransition>
+))}
+```
+
+On older React, or outside React, call the browser API and commit synchronously, so the "after" snapshot shows the new order:
+
+```tsx title="withViewTransition.ts" good
+import { flushSync } from 'react-dom';
+
+export function withViewTransition(update: () => void) {
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (typeof document.startViewTransition !== 'function' || reduceMotion) {
+    update();
+    return;
+  }
+  document.startViewTransition(() => flushSync(update));
+}
+```
+
+Give each row a `viewTransitionName` built from its ID, such as `player-42`. Names must be unique among captured elements, because a duplicate skips the whole animation, so build them from IDs. Same-document view transitions are Baseline since October 2025, and the feature check keeps the update working everywhere else.
+
+## How to confirm the fix
+
+1. Re-sort the list and watch a single row: it should travel to its new slot, not appear there.
+2. Open the DevTools **Animations** panel and slow playback to 10%. Each moved row shows one transform animation, starting at its old offset.
+3. Turn on reduced motion (in Chrome, through **Rendering** → **Emulate CSS media feature prefers-reduced-motion**). Rows should reorder instantly.
+4. In the Performance panel, each re-sort should show one layout for the read pass, then frames with no layout work while the rows move.
+
+## Watch out for
+
+- **Interruptions.** If an update lands mid-animation, this small hook restarts rows from their last settled position, which causes a small jump. It also doesn't animate size changes.
+- **Long lists.** Measuring every row after every commit is fine for dozens of rows. For hundreds, measure only the rows in the viewport, or don't animate.
+- **Libraries.** Motion's `layout` prop, auto-animate and GSAP Flip handle interruptions, scaling with counter-scaled children, and nested scroll containers. Use one if the project allows it.
+- **Slow updates inside a view transition.** Rendering pauses between the two snapshots, so fetch data before starting the transition, not inside it.

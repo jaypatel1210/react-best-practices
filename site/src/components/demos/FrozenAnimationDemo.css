@@ -1,0 +1,46 @@
+/* FrozenAnimationDemo: a loading card with a spinner. */
+
+.fa-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.fa-spinner {
+  flex: none;
+  display: block;
+  width: 34px;
+  height: 34px;
+  border: 4px solid var(--surface-3);
+  border-top-color: var(--demo-accent);
+  border-radius: 50%;
+}
+
+.fa-spinner--css {
+  animation: fa-spin 800ms linear infinite;
+}
+
+@keyframes fa-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+.fa-card-title {
+  font-weight: 650;
+  color: var(--text);
+}
+
+.fa-card-text {
+  color: var(--text-3);
+  font-size: 0.85rem;
+}
+
+.fa-note {
+  color: var(--text-3);
+  font-size: 0.85rem;
+}

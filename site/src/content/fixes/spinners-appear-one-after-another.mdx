@@ -1,0 +1,172 @@
+---
+title: "Spinners appear one after another as the page loads"
+description: "Components that fetch on mount and render their children only after the data arrives create a request waterfall. Start independent requests together, at the top."
+skill: react-data-fetching
+kind: performance
+symptom: "The page shows a spinner, then some content and another spinner, then another, and the total load time is the sum of every request."
+cause: "Each component fetches in its own effect and renders its child only once its data arrives, so the child's request can't start until the parent's has finished."
+fix: "Start independent requests together, as high in the tree as the data is known to be needed: in one component, with Promise.all, in providers or in a route loader."
+tags: [data fetching, request waterfall, useEffect, Promise.all, Suspense, TanStack Query]
+react: "18 and 19"
+order: 2
+source: skills/react-data-fetching/examples/waterfalls.md
+published: 2026-10-01
+related: [search-shows-stale-results, tab-switch-blanks-screen, every-route-ships-upfront]
+featured: true
+---
+
+import WaterfallDemo from '@/components/demos/WaterfallDemo';
+
+A team dashboard shows a user header, the user's projects and a recent activity feed. Each section is a tidy component that fetches its own data and shows a spinner until it arrives. The code reviews well: everything is colocated, and each piece can be tested alone.
+
+In production the page loads in stages. A spinner turns into the header and a second spinner. That spinner turns into the projects and a third one. The API team checks their dashboards: each endpoint answers in about a second. The page takes three.
+
+## Reproduce it
+
+<WaterfallDemo client:visible />
+
+With the issue, watch the timeline lanes: `/api/projects` doesn't start until `/api/user` has finished, and `/api/activity` waits for both. The total is the sum of all three. Press **Reset** to load again, then switch to the fix. The three bars start together, and the page is complete when the slowest one ends.
+
+## Why it happens
+
+Here's the dashboard. `useJson` is a small effect-based hook, shown below:
+
+```tsx title="TeamDashboard.tsx" bad error="3,14" mark="7,18"
+function TeamDashboard({ userId }: { userId: string }) {
+  const user = useJson<User>(`/api/users/${userId}`);
+  if (!user) return <PageSkeleton />;
+  return (
+    <>
+      <UserHeader user={user} />
+      <ProjectsSection userId={userId} />
+    </>
+  );
+}
+
+function ProjectsSection({ userId }: { userId: string }) {
+  const projects = useJson<Project[]>(`/api/users/${userId}/projects`);
+  if (!projects) return <ProjectsSkeleton />;
+  return (
+    <>
+      <ProjectList projects={projects} />
+      <ActivitySection userId={userId} />
+    </>
+  );
+}
+```
+
+```tsx title="useJson.ts"
+function useJson<T>(path: string): T | undefined {
+  const [data, setData] = useState<T>();
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(path, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`${res.status} ${path}`);
+        return res.json() as Promise<T>;
+      })
+      .then(setData)
+      .catch((err) => {
+        if (!controller.signal.aborted) console.error(err); // a real app: error state or boundary
+      });
+    return () => controller.abort();
+  }, [path]);
+  return data;
+}
+```
+
+The hook is fine. The waterfall comes from three lifecycle facts:
+
+1. **An effect runs only after its component mounts.** The request in `useJson` starts after the first commit of the component that calls it.
+2. **A child mounts only when its parent renders it.** While `TeamDashboard` returns the skeleton, `ProjectsSection` isn't in the tree, so its effect doesn't exist yet.
+3. **Creating an element doesn't render it.** Moving `const projects = <ProjectsSection userId={userId} />` above the early return changes nothing. The element is a description; the component runs only when it's returned.
+
+So each level waits a full round trip for the level above. With user at 0.8 s, projects at 1.2 s and activity at 1.0 s, the timeline is 0 to 0.8 s, then 0.8 to 2.0 s, then 2.0 to 3.0 s. The page is complete after 3 seconds, although none of these requests needs another's result, and the slowest takes 1.2 seconds on its own.
+
+The same thing happens inside a single effect: `await getUser(); await getProjects();` runs two independent requests in sequence.
+
+## The fix
+
+Start every request in the component that renders all of the sections, and let each section appear when its own data lands:
+
+```tsx title="TeamDashboard.tsx" good add="3-4,10-11"
+function TeamDashboard({ userId }: { userId: string }) {
+  const user = useJson<User>(`/api/users/${userId}`);
+  const projects = useJson<Project[]>(`/api/users/${userId}/projects`);
+  const activity = useJson<ActivityItem[]>(`/api/users/${userId}/activity`);
+
+  if (!user) return <PageSkeleton />;
+  return (
+    <>
+      <UserHeader user={user} />
+      {projects ? <ProjectList projects={projects} /> : <ProjectsSkeleton />}
+      {activity ? <ActivityList items={activity} /> : <ActivitySkeleton />}
+    </>
+  );
+}
+```
+
+All three hooks run in the same component, so all three effects run in the same commit, and all three requests leave together. The header appears at 0.8 s, the activity at 1.0 s and the projects at 1.2 s. The page is complete at 1.2 s instead of 3.0 s.
+
+There's one trade-off: each arrival re-renders `TeamDashboard`, three renders in all. Keep that component light, or move each piece into a small provider (below).
+
+When the page should appear all at once instead of in stages, combine the requests with `Promise.all`:
+
+```tsx title="useTeamDashboard.ts"
+const [data, setData] = useState<{ user: User; projects: Project[]; activity: ActivityItem[] }>();
+const [error, setError] = useState<Error | null>(null);
+
+useEffect(() => {
+  const controller = new AbortController();
+  const get = <T,>(path: string) =>
+    fetch(path, { signal: controller.signal }).then((res) => {
+      if (!res.ok) throw new Error(`${res.status} ${path}`);
+      return res.json() as Promise<T>;
+    });
+
+  Promise.all([
+    get<User>(`/api/users/${userId}`),
+    get<Project[]>(`/api/users/${userId}/projects`),
+    get<ActivityItem[]>(`/api/users/${userId}/activity`),
+  ])
+    .then(([user, projects, activity]) => setData({ user, projects, activity }))
+    .catch((err) => {
+      if (!controller.signal.aborted) setError(err);
+    });
+
+  return () => controller.abort();
+}, [userId]);
+```
+
+Everything appears at 1.2 s, and nothing before it, even though the header was ready at 0.8 s. Pick the version that matches the loading sequence you want.
+
+## Why the fix works
+
+The fix moves where requests **start**, not where data **renders**. A request can begin as soon as you know the page needs it, and for all three that's the moment the dashboard mounts. No data library can undo a waterfall that the component structure creates, so this is a design decision first.
+
+Keep a chain only for a real dependency: when request B needs a value from A's response, such as a team ID that only the user record contains. In TanStack Query, that's `enabled: !!user?.teamId` on the second query. Everything else runs side by side.
+
+When the consumers sit deep in the tree, you don't have to drill props down from the top:
+
+- **Data providers.** A small provider per resource calls `useJson` near the top and puts the result in context. The requests start when the providers mount, and any descendant reads the result with a hook.
+- **A data library.** With TanStack Query, components keep their colocated `useQuery` calls, and you start the requests earlier: several queries in one component, `useQueries`, or a prefetch in the route loader with `queryClient.prefetchQuery` (recent v5 releases move this to `queryClient.query`; use what your installed version supports). Components then find the request already in flight, or cached.
+- **Framework loaders.** Route loaders in React Router, Remix and TanStack Router run before the route renders, and nested routes' loaders run in parallel.
+
+<Callout type="note" title="Suspense doesn't parallelize anything">
+Suspense moves loading states into boundaries, but a component that suspends still mounts its children only after it resumes. A child that starts its own fetch while rendering is still a step in a waterfall. React 19 commits the fallback right away and pre-renders suspended siblings afterwards, so requests started inside suspending children begin later than they did in React 18. Start requests before rendering: in loaders, by prefetching, or by passing promises down from Server Components.
+</Callout>
+
+## How to confirm the fix
+
+1. Open the **Network** panel, filter to Fetch/XHR and reload. Look at the Waterfall column.
+2. Before the fix, the bars form a staircase: each starts where the previous one ended. After it, they start at the same moment and overlap.
+3. Compare the time to the last response: about the sum of the requests before, about the slowest one after.
+4. Throttle to "Slow 4G" and repeat. Slower networks make each step of a waterfall longer, so the gap grows.
+
+## Watch out for
+
+- **Popcorn loading.** Parallel requests that each pop in a spinner and resolve in random order feel chaotic. Decide what users must see first, reveal in reading order, group parts that belong together under one loading state, and give skeletons the final size so nothing shifts.
+- **Connection limits.** Over HTTP/1.1, browsers open about six connections per origin, so a page that fires twenty requests at once still queues. HTTP/2 and HTTP/3 multiplex, but bandwidth and server capacity still apply. Don't put analytics or rarely used prefetches ahead of the page's critical data; `fetch(url, { priority: 'low' })` is a hint in browsers that support it.
+- **Module-level fetches.** `const p = fetch(...)` at import time starts before React renders, but it runs whether or not the component ever shows, can't use props and can't be cancelled. Keep it to route-critical data or lazily loaded modules.
+
+Parallel requests also need race protection when the ID can change while they're in flight: see <FixLink slug="search-shows-stale-results" />.

@@ -84,6 +84,13 @@ describe('statistics', () => {
     expect(verdict(pairedDiff(a, a.map((value) => value + 30)))).toBe('worse');
   });
 
+  it('claims nothing when there are too few pairs for a 95% interval', () => {
+    const two = pairedDiff([100, 104], [160, 170]);
+    expect(two.exact).toBe(false);
+    expect(verdict(two)).toBe('same');
+    expect(impactOf({ mainThread: two })).toEqual({ level: 'none', direction: 'same', reasons: [], judged: false });
+  });
+
   it('plans more pairs for noisier machines, within limits', () => {
     expect(plannedPairs([0, 0, 0, 0], 16)).toBe(8);
     expect(plannedPairs([-30, 25, -20, 35, -28, 22], 16, { max: 20 })).toBe(20);
@@ -157,6 +164,24 @@ describe('benchmark analysis', () => {
     expect(aa.ok).toBe(true);
     expect(aaSummary(pairs.slice(0, 3))).toMatchObject({ judged: false, ok: true });
   });
+
+  it('fails the A/A check only on a difference big enough to matter', () => {
+    // A small but systematic blocking-time difference (1-37 ms on ~700 ms) is harmless...
+    const small = Array.from({ length: 6 }, (_, i) => {
+      const extra = [1, 18, 37, 8, 10, 2][i];
+      const x = run([{ mainThread: 1800 + i, tbt: 690 }]);
+      const y = run([{ mainThread: 1800 + i, tbt: 690 + extra }]);
+      return i % 2 === 0 ? [x, y] : [y, x];
+    });
+    expect(aaSummary(small)).toMatchObject({ judged: true, ok: true, material: [] });
+    // ...while identical runs differing by 60 ms or more of main-thread time are not.
+    const large = Array.from({ length: 6 }, (_, i) => {
+      const x = run([{ mainThread: 1800 + i }]);
+      const y = run([{ mainThread: 1860 + i * 5 }]);
+      return i % 2 === 0 ? [x, y] : [y, x];
+    });
+    expect(aaSummary(large)).toMatchObject({ judged: true, ok: false, material: ['mainThread'] });
+  });
 });
 
 describe('device profiles', () => {
@@ -227,7 +252,7 @@ describe('network replay', () => {
     replay.freeze();
 
     const player = page();
-    const counters = await replay.attach(player, { appOrigin: 'http://localhost:3000' });
+    const counters = await replay.attach(player, { appOrigin: 'http://localhost:3000', appOrigins: ['http://localhost:3101', 'http://localhost:3000'] });
     expect(player.sent[0][1].patterns.map((pattern) => pattern.urlPattern)).toEqual(['https://api.test/*', 'https://api.test/*']);
     player.fire({ requestId: 'a', request: { ...api, url: 'https://api.test/items?page=1&_=999' } });
     player.fire({ requestId: 'b', request: api });
@@ -237,6 +262,43 @@ describe('network replay', () => {
     const fulfilled = player.sent.filter(([method]) => method === 'Fetch.fulfillRequest').map(([, params]) => Buffer.from(params.body, 'base64').toString());
     expect(fulfilled).toEqual(['{"n":1}', '{"n":2}', '{"n":2}']);
     expect(counters).toMatchObject({ mode: 'replay', served: 3, passed: 1, misses: ['GET https://api.test/other'] });
+  });
+
+  it('lets analytics beacons through without recording them', async () => {
+    const sent = [];
+    let handler;
+    const page = {
+      on: (method, fn) => ((handler = fn), () => {}),
+      send: async (method, params) => (sent.push([method, params]), {}),
+    };
+    const replay = new NetworkReplay();
+    const counters = await replay.attach(page, { appOrigin: 'http://localhost:4000' });
+    handler({ requestId: 'g', request: { method: 'POST', url: 'https://www.google-analytics.com/g/collect?cid=1&_p=2', headers: {} }, responseStatusCode: 204, responseHeaders: [] });
+    handler({ requestId: 'c', request: { method: 'POST', url: 'https://b.clarity.ms/collect', headers: {} }, responseStatusCode: 204, responseHeaders: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(counters.recorded).toBe(0);
+    expect(replay.summary().requests).toBe(0);
+    expect(sent.filter(([method]) => method === 'Fetch.continueRequest')).toHaveLength(2);
+  });
+
+  it('never records requests to either side\'s own server', async () => {
+    const sent = [];
+    let handler;
+    const recorder = {
+      on: (method, fn) => ((handler = fn), () => {}),
+      send: async (method, params) => {
+        sent.push([method, params]);
+        return method === 'Fetch.getResponseBody' ? { body: '{}', base64Encoded: false } : {};
+      },
+    };
+    const replay = new NetworkReplay();
+    // The baseline (port 4100) calls the candidate's server (port 4000) because of a shared env file.
+    const counters = await replay.attach(recorder, { appOrigin: 'http://localhost:4100', appOrigins: ['http://localhost:4100', 'http://localhost:4000'] });
+    handler({ requestId: '1', request: { method: 'GET', url: 'http://localhost:4000/api/session', headers: {} }, responseStatusCode: 200, responseHeaders: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(counters.recorded).toBe(0);
+    expect(sent.filter(([method]) => method === 'Fetch.getResponseBody')).toHaveLength(0);
+    expect(sent.at(-1)).toEqual(['Fetch.continueRequest', { requestId: '1' }]);
   });
 });
 

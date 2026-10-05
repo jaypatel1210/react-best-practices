@@ -1,0 +1,162 @@
+---
+title: "A higher-order component breaks the wrapped component's handlers"
+description: "An analytics HOC that replaces onClick without calling it, or drops props and refs, breaks every component it wraps. Call through, pass everything on, apply it once."
+skill: react-composition
+kind: bug
+symptom: "After a button is wrapped in a click-tracking HOC, clicks get tracked but the button's own onClick never runs, and its ref comes back null."
+cause: "The HOC renders the wrapped component with its own onClick after spreading the props, which replaces the caller's handler, and it doesn't pass the ref through."
+fix: "Strip only the HOC's own props, spread the rest, call the original handler with the same arguments, forward the ref, and apply the HOC once at module scope."
+tags: [higher-order components, HOC, onClick, forwardRef, displayName]
+react: "18 and 19"
+order: 3
+source: skills/react-composition/examples/higher-order-components.md
+published: 2026-10-01
+related: [input-loses-focus-every-keystroke, portal-clicks-reach-parent, clone-element-overrides-props]
+featured: false
+---
+
+Product wants click analytics on every important action in the billing area: **Export**, **Share** and **Cancel plan**. Rather than edit twenty components, someone writes `withClickTracking`, wraps `Button` and `MenuItem` with it, and swaps the imports. The analytics dashboard fills with click events that same afternoon.
+
+Then the tickets arrive. **Export** doesn't download anything. **Share** doesn't open the share sheet. A dialog that returns focus to the button that opened it now throws, because the button's ref is `null`. Every wrapped component reports its clicks perfectly, and has stopped doing its actual job.
+
+## Why it happens
+
+Here's the HOC:
+
+```tsx title="withClickTracking.tsx" bad error="6-7"
+export function withClickTracking<P extends { onClick?: (...args: any[]) => void }>(
+  Component: React.ComponentType<P>,
+) {
+  return function (props: P & { trackingName: string }) {
+    const analytics = useAnalytics();
+    const track = () => analytics.track('click', { name: props.trackingName });
+    return <Component {...props} onClick={track} />;
+  };
+}
+```
+
+A higher-order component (HOC) is a function that takes a component and returns a new one. The new component is ordinary: it can call hooks, and it renders the wrapped component with a props object that it builds. **Whatever it builds is all the wrapped component ever sees.** This one builds the wrong object in four ways:
+
+1. **It replaces the caller's `onClick`.** JSX props apply in order, so an `onClick` written after `{...props}` overwrites the one inside `props`, so the **Export** handler never runs. TypeScript doesn't object, because both values are valid click handlers.
+2. **It drops the event.** `track` takes no arguments, so nothing downstream would receive the event anyway.
+3. **It leaks its own prop.** `trackingName` travels on to `Button`, which spreads its props onto a `<button>`. React logs: "React does not recognize the `trackingName` prop on a DOM element."
+4. **It loses the ref on React 18.** Function components there don't receive `ref` as a prop, so `<TrackedButton ref={buttonRef}>` logs "Function components cannot be given refs. Attempts to access this ref will fail. Did you mean to use React.forwardRef()?" and `buttonRef.current` stays `null`. On React 19, `ref` is a regular prop and `{...props}` carries it.
+
+There's a smaller problem too. The returned function has no name, so React DevTools and error stacks show `Anonymous` instead of the component that was wrapped.
+
+Where you *call* a HOC matters as much as how you write it:
+
+```tsx title="BillingToolbar.tsx" bad error="2"
+function BillingToolbar({ onExport }: { onExport: () => void }) {
+  const TrackedButton = withClickTracking(Button); // a new component type on every render
+  return <TrackedButton trackingName="export-csv" onClick={onExport}>Export</TrackedButton>;
+}
+```
+
+React decides whether to update or replace a component by comparing its type by reference. A HOC called during render returns a brand-new type each time, so every render of `BillingToolbar` unmounts the old button and mounts a new one. Focus is lost, state resets, and mount effects run again. A HOC that logs impressions on mount would log one on every render. <FixLink slug="input-loses-focus-every-keystroke" /> covers this remounting in depth.
+
+## The fix
+
+```tsx title="withClickTracking.tsx" good add="6,10,14,19-20"
+type WithClickTrackingProps = { trackingName: string };
+
+export function withClickTracking<P extends { onClick?: (...args: any[]) => void }>(
+  Component: React.ComponentType<P>,
+) {
+  function Tracked({ trackingName, ...props }: P & WithClickTrackingProps) {
+    const analytics = useAnalytics(); // hooks are fine: this is a regular component
+    const handleClick = (...args: any[]) => {
+      analytics.track('click', { name: trackingName });
+      props.onClick?.(...args); // always call the original handler, with the same arguments
+    };
+    return <Component {...(props as unknown as P)} onClick={handleClick} />;
+  }
+  Tracked.displayName = `withClickTracking(${Component.displayName || Component.name || 'Component'})`;
+  return Tracked;
+}
+
+// Module scope: each wrapped type is created once
+export const TrackedButton = withClickTracking(Button);
+export const TrackedMenuItem = withClickTracking(MenuItem);
+```
+
+What changed:
+
+- **It strips its own prop.** `trackingName` is destructured out, and only the rest reaches `Button`, so nothing unknown lands on the DOM.
+- **It calls the original handler** with every argument it received. Some components call `onClick(item, event)`, so forward `...args` instead of assuming a single event.
+- **It has a name.** DevTools shows `withClickTracking(Button)`.
+- **It's applied once.** Calls at module scope create each wrapped type a single time, so React sees the same type on every render.
+
+The double cast in `props as unknown as P` is there because TypeScript can't prove that removing `trackingName` leaves a valid `P`. It would be wrong if `P` had a `trackingName` of its own, which is the prop-name collision to avoid anyway.
+
+On React 19, that's the whole fix: `ref` arrives as a regular prop, and `{...props}` passes it on. On React 18, wrap the inner component in `forwardRef` and pass the ref explicitly:
+
+```tsx title="withClickTracking.tsx" good mark="5,11"
+// React 18: function components don't receive ref, so forward it explicitly
+export function withClickTracking<P extends { onClick?: (...args: any[]) => void }, R = unknown>(
+  Component: React.ComponentType<P & React.RefAttributes<R>>,
+) {
+  const Tracked = forwardRef<R, P & WithClickTrackingProps>(function Tracked({ trackingName, ...props }, ref) {
+    const analytics = useAnalytics();
+    const handleClick = (...args: any[]) => {
+      analytics.track('click', { name: trackingName });
+      props.onClick?.(...args);
+    };
+    return <Component {...(props as unknown as P)} ref={ref} onClick={handleClick} />;
+  });
+  Tracked.displayName = `withClickTracking(${Component.displayName || Component.name || 'Component'})`;
+  return Tracked;
+}
+```
+
+## Why the fix works
+
+A HOC is safe when it's transparent. Everything the caller passes reaches the wrapped component, except the props the HOC owns. Anything the HOC intercepts, it calls through. And its type is created once, so React can keep the wrapped component's state and DOM between renders.
+
+Before writing one, check that a HOC is the right tool. Hooks replaced most HOC use cases. To inject data or context, such as a `withCurrentUser` that adds a `user` prop, call `useCurrentUser()` in the component instead, so the data source is visible where it's used. HOCs still fit cross-cutting behavior that you add to many existing components without editing them: click analytics, impression tracking on mount, or a wrapper that stops keyboard events from reaching global shortcuts.
+
+A wrapper component often does the same job and reads better at the call site: `<ShortcutShield><CommentEditor /></ShortcutShield>`. Prefer the wrapper when you control the call sites, and the HOC when a shared module exports pre-wrapped components.
+
+## How to confirm the fix
+
+Write a test that checks every promise the HOC makes:
+
+```tsx title="withClickTracking.test.tsx"
+// useAnalytics() is mocked to return `analytics`, whose track is a vi.fn()
+it('tracks the click and still calls the original handler', async () => {
+  const onClick = vi.fn();
+  const buttonRef = createRef<HTMLButtonElement>();
+  render(
+    <TrackedButton ref={buttonRef} trackingName="export-csv" onClick={onClick}>
+      Export
+    </TrackedButton>,
+  );
+
+  await userEvent.click(screen.getByRole('button', { name: 'Export' }));
+
+  expect(analytics.track).toHaveBeenCalledWith('click', { name: 'export-csv' });
+  expect(onClick).toHaveBeenCalledTimes(1);
+  expect(onClick.mock.calls[0][0]).toHaveProperty('type', 'click'); // the event came through
+  expect(buttonRef.current).toBeInstanceOf(HTMLButtonElement);
+});
+```
+
+Then check the app itself:
+
+1. **The console is quiet.** There's no "React does not recognize the `trackingName` prop" warning, and on React 18, no "Function components cannot be given refs" warning.
+2. **DevTools names it.** The Components tab shows `withClickTracking(Button)`, not `Anonymous`.
+3. **The button survives re-renders.** Focus a wrapped button, make its parent re-render (type in a nearby field, for example), and check that focus stays on the button. If it jumps away, the HOC is being called during render.
+
+## How to spot this in review
+
+- An `on*` prop written after `{...props}` inside a HOC, with no call to the original.
+- A HOC call such as `withSomething(Card)` inside a component body or a `useMemo`.
+- `Anonymous` components in DevTools, or a HOC that returns an unnamed function.
+- A HOC's own props, like `trackingName` or `permission`, reaching DOM elements.
+- Three or more HOCs stacked on one export. A hook or a wrapper component is usually clearer.
+
+## Watch out for
+
+- **StrictMode runs mount effects twice in development.** A HOC that tracks impressions in `useEffect` logs two impressions on mount in development. That's expected. Deduplicate in the analytics client instead of fighting React.
+- **Prop-name collisions.** If the wrapped component already has a prop with the HOC's prop name, the HOC swallows it. Choose distinctive names for HOC props.
+- **Overrides through `cloneElement`.** Code that injects props into children can replace a caller's handler the same way. See <FixLink slug="clone-element-overrides-props" />.

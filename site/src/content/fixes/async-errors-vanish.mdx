@@ -1,0 +1,191 @@
+---
+title: "Errors in event handlers and promises vanish silently"
+description: "Error boundaries don't see errors thrown in event handlers or promise callbacks. Handle expected failures locally, and re-throw unexpected ones into the boundary."
+skill: react-error-handling
+kind: bug
+symptom: "A button does nothing when its request fails, or a widget shows its skeleton forever, and the only trace is an Uncaught (in promise) line in the console."
+cause: "Error boundaries only catch errors thrown while React renders, runs lifecycle methods or runs effects. Handlers, promise callbacks and timers run later, outside that window."
+fix: "Catch expected failures where they happen and show local UI. Send unexpected ones to the nearest boundary, with a hook such as useThrowToBoundary."
+tags: [error boundaries, event handlers, promises, unhandledrejection, useThrowToBoundary]
+react: "18 and 19"
+order: 2
+source: skills/react-error-handling/examples/async-and-event-errors.md
+published: 2026-10-01
+related: [one-error-blanks-the-app, retry-button-does-nothing, search-shows-stale-results]
+featured: false
+---
+
+An invoicing app has error boundaries in all the right places: one at the root, one per route, one around each panel. The team tested them by throwing in a component, and the fallbacks worked.
+
+Then two reports arrive. Clicking **Void invoice** on an invoice that was paid a minute ago does nothing at all: no message, no change, so users click it five more times. And the tax summary panel sometimes shows its skeleton forever. In both cases the console holds one line, `Uncaught (in promise) Error: …`, and the error tracker shows nothing.
+
+## Why it happens
+
+Here's a simplified version of the panel:
+
+```tsx title="InvoiceActions.tsx" bad error="5,9"
+function InvoiceActions({ invoiceId }: { invoiceId: string }) {
+  const [totals, setTotals] = useState<Totals | null>(null);
+
+  useEffect(() => {
+    fetchTotals(invoiceId).then(setTotals); // a rejection goes nowhere
+  }, [invoiceId]);
+
+  const onVoid = async () => {
+    await voidInvoice(invoiceId); // throws on failure, outside any boundary
+    toast.success('Invoice voided');
+  };
+
+  return (
+    <>
+      {totals ? <TotalsTable totals={totals} /> : <TotalsSkeleton />}
+      <button onClick={onVoid}>Void invoice</button>
+    </>
+  );
+}
+```
+
+An error boundary works by catching what's thrown while React is doing its own work on the tree: rendering components, running lifecycle methods and running effects. When something throws in that window, React knows which component failed, and can swap the nearest boundary's subtree for its fallback.
+
+Event handlers and promise callbacks run outside that window:
+
+- **A click handler** runs when the browser dispatches the event. React calls it, but it isn't rendering, so there's no subtree to replace. An exception goes straight to the browser.
+- **A `.then` callback** runs in a microtask after the effect has returned. The effect's setup finished without throwing, so as far as React knows, it succeeded.
+
+Neither failure sets any state, so nothing on screen changes. The button looks unresponsive, and the skeleton waits for data that's never coming.
+
+| Where the error is thrown | Does a boundary catch it? |
+|---|---|
+| A component's render, or an effect's setup | Yes |
+| An event handler such as `onClick` or `onSubmit` | No |
+| A promise callback, `await` after the effect returned, `setTimeout`, a subscription | No |
+| A promise read with `use(promise)` on React 19 | Yes |
+| An action passed to `startTransition` from `useTransition` on React 19 | Yes |
+
+There's a quieter version, too: `fetch` doesn't reject on a 404 or a 500. It resolves with `res.ok` set to `false`, and code that doesn't check it renders the error page's JSON as if it were data.
+
+## The fix
+
+First, decide what kind of failure it is.
+
+- **Expected and recoverable**: validation errors, a 409 conflict, "payment declined", a flaky network on a user action. Handle these **locally**, next to the action, with a specific message or a retry.
+- **Unexpected, and the region can't work without it**: malformed data, missing configuration, a bug. Send these **to the region's boundary**, so the fallback replaces the broken UI and the error is reported in one place.
+
+The void action is the first kind:
+
+```tsx title="VoidInvoiceButton.tsx" good add="6,8,12,15-17,24"
+function VoidInvoiceButton({ invoiceId }: { invoiceId: string }) {
+  const [status, setStatus] = useState<'idle' | 'working' | 'error'>('idle');
+
+  const onVoid = async () => {
+    setStatus('working');
+    try {
+      const res = await fetch(`/api/invoices/${invoiceId}/void`, { method: 'POST' });
+      if (res.status === 409) {
+        setStatus('error'); // expected: the invoice was paid in the meantime
+        return;
+      }
+      if (!res.ok) throw new Error(`Void failed: ${res.status}`);
+      setStatus('idle');
+      toast.success('Invoice voided');
+    } catch (err) {
+      report(err);
+      setStatus('error');
+    }
+  };
+
+  return (
+    <>
+      <button onClick={onVoid} disabled={status === 'working'}>Void invoice</button>
+      {status === 'error' && <p role="alert">Couldn't void this invoice. Try again or contact support.</p>}
+    </>
+  );
+}
+```
+
+The tax summary is the second kind: without it, the panel is useless. Re-throw the error into React's render cycle, and the nearest boundary handles it like any render error:
+
+```tsx title="TaxSummary.tsx" good add="1,5,11-13,16"
+import { useThrowToBoundary } from '@/components/error-boundary';
+
+function TaxSummary({ invoiceId }: { invoiceId: string }) {
+  const [summary, setSummary] = useState<TaxSummaryData | null>(null);
+  const throwToBoundary = useThrowToBoundary();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchTaxSummary(invoiceId, controller.signal)
+      .then(setSummary)
+      .catch((err) => {
+        if (controller.signal.aborted) return; // superseded by a newer request, not a failure
+        throwToBoundary(err); // the panel can't render without this data
+      });
+    return () => controller.abort();
+  }, [invoiceId, throwToBoundary]);
+
+  return summary ? <TaxTable summary={summary} /> : <TaxSkeleton />;
+}
+```
+
+`useThrowToBoundary` ships with the skill's `ErrorBoundary`, and you can copy both from the <SiteLink to="/utilities/">tested utilities</SiteLink>. If you use the `react-error-boundary` package, its `useErrorBoundary().showBoundary(error)` does the same job.
+
+## Why the fix works
+
+`useThrowToBoundary` returns a function that calls a state setter with an **updater function that throws**. React runs updater functions while it renders the component, so the throw happens inside the render window, where boundaries work. The same boundary then reports the error and offers the retry, for render errors and async errors alike.
+
+The local handler works for the opposite reason. The failure is something users can act on, so it gets a message they can act on: "already paid" is not a crash.
+
+Every `catch` should do at least one of three things: recover, show something, or report. Usually two. A `catch {}`, or a `catch` that only calls `console.log`, is how errors vanish on purpose.
+
+A few tools route errors to boundaries for you:
+
+- **TanStack Query**: `throwOnError: true`, or `useSuspenseQuery`, which always sends errors to the boundary.
+- **SWR**: `suspense: true`.
+- **React 19 Actions**: errors thrown inside an action passed to the `startTransition` from `useTransition` reach the nearest boundary. Catch the expected ones inside the action. The standalone `startTransition` imported from `react` doesn't do this; React reports its errors with `window.reportError`.
+
+## How to confirm the fix
+
+1. In DevTools, block the void endpoint (**Network** → right-click the request → **Block request URL**), or return a 409 and a 500 from a mock server.
+2. Click **Void invoice**. You should see the inline message, the button should re-enable, and your error tracker should receive the 500 but not the 409.
+3. Make the tax summary request fail. The panel's boundary fallback should replace the skeleton, and the rest of the page should keep working.
+4. The console should show no `Uncaught (in promise)` lines. A global `unhandledrejection` listener that reports to your tracker makes any you missed visible.
+
+A test pins the second case:
+
+```tsx title="TaxSummary.test.tsx"
+it('shows the panel fallback when the request fails', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {}); // React logs caught errors
+  vi.mocked(fetchTaxSummary).mockRejectedValue(new Error('500'));
+  render(
+    <ErrorBoundary fallback={<p>Couldn't load the tax summary.</p>}>
+      <TaxSummary invoiceId="inv_041" />
+    </ErrorBoundary>,
+  );
+  expect(await screen.findByText("Couldn't load the tax summary.")).toBeTruthy();
+});
+```
+
+## Watch out for
+
+`try`/`catch` only works around code that runs inside it. These look reasonable, and don't work:
+
+```tsx title="Widget.tsx" bad error="2,6,13"
+try {
+  useEffect(() => { risky(); }, []); // the effect runs later, outside this try
+} catch {}
+
+try {
+  return <Chart data={data} />; // creates an element; Chart renders after this returns
+} catch {
+  return <Fallback />;
+}
+
+const [failed, setFailed] = useState(false);
+try { compute(); } catch {
+  setFailed(true); // setState during render: an infinite loop
+}
+```
+
+Put `try`/`catch` *inside* handlers and effects, and use boundaries for render errors.
+
+A global `window.addEventListener('unhandledrejection', …)` listener, or your monitoring SDK's default, is a safety net for reporting. It isn't a UI strategy: by the time it fires, no component knows it failed. Once a panel can fail, give its fallback a retry that works: <FixLink slug="retry-button-does-nothing" />.

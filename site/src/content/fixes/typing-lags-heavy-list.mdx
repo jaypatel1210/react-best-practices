@@ -1,0 +1,150 @@
+---
+title: "Typing lags because each keystroke re-renders a huge list"
+description: "Filtering thousands of rows on every keystroke blocks the input. Pass useDeferredValue(query) to a memo list so typing stays instant while results catch up."
+skill: react-responsiveness
+kind: performance
+symptom: "Letters appear late as you type in a filter box above a long list, and the lag grows with the number of rows."
+cause: "Each keystroke is an urgent update, so React re-filters and re-renders the whole list before the field can show the new character."
+fix: "Keep the input's state urgent, and render the list from useDeferredValue(query) through a memo component so React updates it in the background."
+tags: [useDeferredValue, useTransition, memo, INP, typing lag]
+react: "18 and 19"
+order: 1
+source: skills/react-rerenders/examples/unavoidable-heavy-renders.md
+published: 2026-10-01
+related: [typing-lags-state-too-high, memo-component-still-rerenders, huge-table-slow-to-scroll]
+featured: true
+---
+
+import DeferredListDemo from '@/components/demos/DeferredListDemo';
+
+An account team works from a customer directory of about 5,000 rows. A filter box sits above the table, and typing "lisbon" should narrow it to the customers in Lisbon. Instead, each letter lands a beat after you press it. On a phone, the field falls further behind the faster you type.
+
+This looks like <FixLink slug="typing-lags-state-too-high" />, with one difference: here the expensive component genuinely depends on the text. The table has to re-filter on every keystroke, so moving state down can't help. What you can change is *when* the table renders.
+
+## Reproduce it
+
+<DeferredListDemo client:visible />
+
+With **Live query**, type a city such as "lisbon", then press <kbd>Backspace</kbd> a few times. The meter shows the main-thread work behind each keystroke, around 100 ms on a laptop, and the letters trail your typing. Switch to **Deferred query** and type the same thing. The field keeps up, the list dims for a moment while it catches up, and its render counter grows once per pause instead of once per keystroke.
+
+## Why it happens
+
+The filter and the input share one state, in one component:
+
+```tsx title="CustomerDirectory.tsx" bad error="3,8"
+function CustomerDirectory({ customers }: { customers: Customer[] }) {
+  const [query, setQuery] = useState('');
+  const visible = customers.filter((customer) => matches(customer, query));
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter customers" />
+      <CustomerTable rows={visible} />
+    </>
+  );
+}
+```
+
+Three facts explain the lag:
+
+1. **Typing is an urgent update.** React renders updates from discrete input, such as key presses and clicks, synchronously, before the browser paints the next frame.
+2. **A render can't show half its result.** The new character and the filtered table come from the same render of `CustomerDirectory`, so the field can't change until every row has rendered.
+3. **The cost lands on every keystroke.** If the table takes 120 ms to render, every character waits 120 ms, and keystrokes that arrive meanwhile queue up behind it.
+
+That delay is what Interaction to Next Paint (INP) measures: the time from a key press to the frame that shows its result. It should stay at or below 200 ms at the 75th percentile, and a render that takes 120 ms on your laptop can take four times as long on a mid-range phone.
+
+Wrapping `CustomerTable` in `memo` doesn't help on its own. Its `rows` prop is a new array on every keystroke, so it renders anyway. The demo's list is memo-wrapped in both modes for exactly this reason.
+
+## The fix
+
+Give the two parts of the screen different priorities. The field renders urgently with the latest text, and the table renders from a copy of the query that's allowed to lag behind:
+
+```tsx title="CustomerDirectory.tsx" good add="3-4,6-9,14,16,21,31"
+function CustomerDirectory({ customers }: { customers: Customer[] }) {
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery;
+
+  const visible = useMemo(
+    () => customers.filter((customer) => matches(customer, deferredQuery)),
+    [customers, deferredQuery],
+  );
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter customers" />
+      <div className={isStale ? 'directory directory--stale' : 'directory'}>
+        <CustomerTable rows={visible} />
+      </div>
+    </>
+  );
+}
+
+const CustomerTable = memo(function CustomerTable({ rows }: { rows: Customer[] }) {
+  return (
+    <table className="customers">
+      <tbody>
+        {rows.map((customer) => (
+          <CustomerRow key={customer.id} customer={customer} />
+        ))}
+      </tbody>
+    </table>
+  );
+});
+```
+
+Here's what happens on each keystroke now:
+
+- **The keystroke renders first, with the old `deferredQuery`.** `query` changed, so `CustomerDirectory` renders, and the field shows the new character.
+- **That render skips the table.** `deferredQuery` hasn't changed yet, so `useMemo` returns the cached `visible` array, and `memo` sees the same `rows` and skips `CustomerTable`. The urgent render takes a millisecond or two, and the character paints in the next frame.
+- **React then renders again in the background** with the new `deferredQuery`. That render is interruptible: React yields to the browser every few milliseconds, and if another keystroke arrives, it drops the unfinished render and starts over with the latest value.
+- **`isStale` tells you the results are catching up.** While `query` and `deferredQuery` differ, the old table is still on screen, so dim it or show a small "Updating…" label rather than a spinner.
+
+## Why the fix works
+
+`useDeferredValue` (React 18+) doesn't make the table any faster. It changes the order of the work: the urgent part first, and the expensive part when the main thread has time. On a fast laptop, the background render finishes almost at once, so the table barely lags. On a slow phone, it waits until the user pauses, instead of making every key press wait.
+
+Two rules make it work:
+
+- **The heavy component must be skippable.** `memo` on `CustomerTable` and `useMemo` around the filter are both required. Without `memo`, the urgent render still renders every row. Without `useMemo`, `visible` is a new array on each render, and `memo` never skips. With the React Compiler enabled, it adds the equivalent memoization for you. This is one of the places where memoization earns its keep.
+- **The input's own value stays urgent.** Never update a controlled input's value inside a transition. The field would lag and can drop characters. Only the expensive consumer should wait.
+
+When you own the setter for the expensive part, `startTransition` does the same job. Keep one state for the field and one for the filter, and mark only the second as a transition:
+
+```tsx title="CustomerDirectory.tsx" good mark="7"
+const [query, setQuery] = useState(''); // urgent: what the field shows
+const [filterQuery, setFilterQuery] = useState(''); // transition: what the table filters by
+const [isPending, startTransition] = useTransition();
+
+const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
+  setQuery(event.target.value);
+  startTransition(() => setFilterQuery(event.target.value));
+};
+```
+
+The table still has to be skippable, and `isPending` replaces `isStale`. Reach for `useDeferredValue` when the value arrives through props or a store you don't control, or when you'd rather keep a single state.
+
+This isn't a debounce. A debounce waits a fixed time even on a fast device, then renders the whole table in one blocking task. A deferred render adapts to the device and can be interrupted. It also doesn't reduce network traffic: if each keystroke starts a request, debounce the request as well (<FixLink slug="debounce-fires-every-keystroke" />).
+
+## How to confirm the fix
+
+1. Build for production, because development builds are several times slower. Open the Performance panel and set CPU throttling to 4×.
+2. Record while you type five characters into the filter.
+3. Before the fix, each keystroke is one long task, flagged in red, that contains the whole table render. After it, each keystroke is a short task, and the table renders in a series of small slices that end soon after you stop typing.
+4. In the React DevTools Profiler, the commits for your keystrokes show `CustomerTable` as not rendered, and one later commit renders it with the final query.
+
+The Performance panel's **Interactions** track shows each key press with its duration, so you can compare INP before and after.
+
+## When this isn't enough
+
+Deferring only reorders work. Three situations need more:
+
+- **One slow step inside one component.** React can only pause *between* components. If `matches()` runs a fuzzy scorer over 50,000 rows and takes 200 ms, that `useMemo` call blocks the background render as a single step. Build a search index when the data arrives, or run the filter in a Web Worker, as in <FixLink slug="file-import-freezes-page" />.
+- **A table that's slow to render even once.** If one render of 5,000 rows takes half a second, render only the rows on screen. Virtualization and a deferred filter combine well: <FixLink slug="huge-table-slow-to-scroll" />.
+- **A huge commit.** React renders the deferred update in slices, but it applies the result to the DOM in one step. Inserting or removing thousands of rows at once is still a long task, and virtualization solves that too.
+
+## How to spot this in review
+
+- A controlled input and an expensive list, chart or table that read the same state in the same component.
+- `filter`, `sort` or grouping over thousands of items in the render body, feeding a component that isn't memoized.
+- `startTransition` wrapped around the input's own state setter, which makes the field itself lag.

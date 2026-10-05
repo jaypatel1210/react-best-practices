@@ -1,0 +1,121 @@
+---
+title: "A value stored in a ref doesn't update on screen"
+description: "Writing to ref.current never triggers a render, so a ref shown on screen lags until something else re-renders. Rendered values belong in state; refs hold the rest."
+skill: react-refs-closures
+kind: bug
+symptom: "A character counter shows a stale number while you type, then jumps to the right value when some unrelated state changes."
+cause: "The value lives in ref.current. Writing to a ref doesn't schedule a render, so the screen catches up only when something else re-renders the component."
+fix: "Keep anything that's rendered, or passed to another component as a prop, in state. Use refs for values read only in handlers and effects, such as timer IDs and DOM nodes."
+tags: [useRef, useState, refs, re-renders, forms]
+react: "All versions"
+order: 3
+source: skills/react-refs-closures/examples/refs-and-imperative-apis.md
+published: 2026-10-01
+related: [drag-stutters-on-pointermove, tooltip-flickers-into-place, handler-sees-old-state]
+featured: false
+---
+
+A note editor caps notes at 280 characters and shows a live counter under the text area. To keep typing fast, someone stored the text in a ref instead of state, reasoning that a ref "doesn't cause re-renders".
+
+That reasoning is correct, and it's the bug. The counter reads **0 / 280** while you type a paragraph, then jumps to **143 / 280** the moment you press **Preview**. Type more and it freezes again, until the next unrelated click.
+
+## Why it happens
+
+```tsx title="NoteEditor.tsx" bad error="7-8"
+function NoteEditor() {
+  const textRef = useRef('');
+  const [isPreview, setIsPreview] = useState(false);
+
+  return (
+    <>
+      <textarea onChange={(e) => (textRef.current = e.target.value)} />
+      <p>{textRef.current.length} / 280 characters</p>
+      <button onClick={() => setIsPreview((p) => !p)}>{isPreview ? 'Edit' : 'Preview'}</button>
+    </>
+  );
+}
+```
+
+Refs and state differ in exactly one way that matters here:
+
+- **Writing to a ref is synchronous and silent.** `textRef.current = …` changes the value immediately and tells React nothing.
+- **Setting state schedules a render.** React runs the component again and updates the screen with the new output.
+
+The JSX is computed during render. `{textRef.current.length}` is read once, while React renders `NoteEditor`, and the number becomes part of the output. Changing the ref afterwards can't change output that's already on screen. The counter is right only by accident, when something else, such as the **Preview** toggle, makes React render again and read the ref anew.
+
+Passing the ref's value to a child doesn't help either. `<Counter length={textRef.current.length} />` gives the child whatever the value was during the parent's last render.
+
+There's a second problem: the component reads `ref.current` during render. Render should be pure, because React may render without committing, renders twice in development under StrictMode, and React Compiler relies on purity. The `react-hooks/refs` lint rule, included in the recommended config of `eslint-plugin-react-hooks` 7 and later, flags this read.
+
+## The fix
+
+The counter is rendered, so the text is state:
+
+```tsx title="NoteEditor.tsx" good add="2,7-8"
+function NoteEditor() {
+  const [note, setNote] = useState('');
+  const [isPreview, setIsPreview] = useState(false);
+
+  return (
+    <>
+      <textarea value={note} onChange={(e) => setNote(e.target.value)} />
+      <p>{note.length} / 280 characters</p>
+      <button onClick={() => setIsPreview((p) => !p)}>{isPreview ? 'Edit' : 'Preview'}</button>
+    </>
+  );
+}
+```
+
+Every keystroke now re-renders `NoteEditor`, and the counter is always current.
+
+What about the original worry, that typing re-renders too much? If the editor sits inside a heavy page, the answer isn't a ref. It's moving the text state into a small component, together with the counter that reads it, so each keystroke re-renders only that component. <FixLink slug="typing-lags-state-too-high" /> walks through that fix.
+
+## Why the fix works
+
+To decide between a ref and state, ask two questions about the value:
+
+1. Is it rendered, now or in the future?
+2. Is it passed to another component as a prop, now or in the future?
+
+If either answer is yes, use state. If both are no, a ref is the right tool: it holds a value across renders without causing any. Some common calls:
+
+| Value | Choice | Why |
+|---|---|---|
+| Text shown in a character counter | State | It's rendered |
+| The selected row ID | State | It's rendered and passed to children |
+| A timeout ID for a delayed tooltip | Ref | It's never rendered, and changing it shouldn't render |
+| "Is the pointer down?" during a drag | Ref | It's read only in event handlers |
+| The previous value of a prop, for comparison | Ref, updated in an effect | It's read only in effects |
+| A map or editor instance from a third-party library | Ref, initialized lazily | It's an imperative object with its own lifecycle |
+
+The lazy initialization in the last row is the one place where touching a ref during render is fine: `if (ref.current === null) ref.current = createEditor();`.
+
+## How to confirm the fix
+
+1. Type into the text area without touching anything else. The counter should change on every keystroke.
+2. Run the linter with the React hooks rules from version 7 or later. Any remaining `ref.current` read during render shows up as a `react-hooks/refs` error.
+3. Lock the behavior in with a test like this one:
+
+```tsx title="NoteEditor.test.tsx"
+it('counts characters as you type', async () => {
+  render(<NoteEditor />);
+  await userEvent.type(screen.getByRole('textbox'), 'hello');
+  expect(screen.getByText('5 / 280 characters')).toBeTruthy(); // the ref version still says 0
+});
+```
+
+## Watch out for
+
+- **Mutating state has the same symptom.** `items.push(item); setItems(items)` passes the same array back to React. The new state is identical to the current one (`Object.is`), so React skips the render and the list doesn't update. Create a new array instead: `setItems([...items, item])`.
+- **High-frequency visuals are the honest exception.** While dragging an element, writing its `transform` straight to the DOM through a ref is legitimate, because nothing needs React to render. The position isn't shown through JSX, so it can't go stale. <FixLink slug="drag-stutters-on-pointermove" /> covers that technique.
+- **Uncontrolled inputs are fine when nothing renders the value.** If you need the text only on submit, read it then, with a ref or `new FormData(form)`. The moment a counter or a preview shows it while you type, it becomes state.
+
+## Common questions
+
+### Why is my DOM ref `null` when I read it during render?
+
+`ref.current` is `null` during the first render, and stays `null` until React commits the element to the DOM. Read DOM refs in effects and event handlers, never to decide what to render. If you need a measurement to render, measure in a layout effect and store the result in state, as <FixLink slug="tooltip-flickers-into-place" /> shows.
+
+### Can I keep a ref and force a render when it changes?
+
+You can, with a state counter you bump after each write, but then you have state anyway, plus a ref that can disagree with it. Use the state directly.

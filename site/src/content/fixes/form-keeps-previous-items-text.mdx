@@ -1,0 +1,137 @@
+---
+title: "A form keeps the previous item's text after you switch items"
+description: "React keeps a component's state when the same type renders in the same place, so one item's draft leaks into the next. Give each item its own key."
+skill: react-reconciliation
+kind: bug
+symptom: "After switching tabs or picking another record, the form still shows the text typed for the previous one."
+cause: "Both items render the same component type in the same position, so React treats them as one instance and keeps its state, changing only the props."
+fix: "Give each item its own key, such as key={tab} or key={customer.id}, or render them in separate slots. Lift the drafts up if each should be remembered."
+tags: [keys, component state, forms, reconciliation, state reset]
+react: "All versions"
+order: 3
+source: skills/react-reconciliation/examples/state-leaks-between-items.md
+published: 2026-10-01
+related: [toggling-wrapper-resets-state, effect-chain-out-of-sync, index-keys-mix-up-row-state]
+featured: false
+---
+
+import StateLeakDemo from '@/components/demos/StateLeakDemo';
+
+A checkout has an address step with **Shipping** and **Billing** tabs. A customer types their street into the shipping form, switches to **Billing** to enter a different address, and finds the shipping street already filled in. If they don't notice and press **Save**, the shipping street is saved as the billing address.
+
+The same bug shows up in a CRM: you pick another customer in the sidebar, and the notes editor keeps showing the previous customer's notes.
+
+## Reproduce it
+
+<StateLeakDemo client:visible />
+
+With the issue, type an address into the **Shipping** tab, then switch to **Billing**. The text you typed is still there, as if both tabs shared one form. Switch to the fix and repeat: the billing form starts empty.
+
+## Why it happens
+
+The two tabs look like two different forms in the code:
+
+```tsx title="AddressStep.tsx" bad error="7,9"
+function AddressStep() {
+  const [tab, setTab] = useState<'shipping' | 'billing'>('shipping');
+  return (
+    <>
+      <Tabs value={tab} onChange={setTab} />
+      {tab === 'shipping' ? (
+        <AddressForm title="Shipping address" onSave={saveShipping} />
+      ) : (
+        <AddressForm title="Billing address" onSave={saveBilling} />
+      )}
+    </>
+  );
+}
+
+function AddressForm({ title, onSave }: AddressFormProps) {
+  const [street, setStreet] = useState('');
+  const [city, setCity] = useState('');
+  // ...inputs for street and city, and a Save button
+}
+```
+
+React doesn't see your ternary. It sees what the ternary returns. Before the switch, the second slot of the fragment holds an `AddressForm` with no key. After the switch, the same slot holds an `AddressForm` with no key.
+
+Same type, same position, same key: to React that's the **same component**, so it keeps the instance, with its `street` and `city` state, and re-renders it with the new props. The title changes to "Billing address", `onSave` now points at `saveBilling`, and the typed shipping street stays. That's how it gets saved as the billing address.
+
+Props never decide identity. Two elements that represent different things are still one instance if their type, position and key match.
+
+## The fix
+
+Tell React the two forms are different by giving each its own key:
+
+```tsx title="AddressStep.tsx" good add="7,9"
+function AddressStep() {
+  const [tab, setTab] = useState<'shipping' | 'billing'>('shipping');
+  return (
+    <>
+      <Tabs value={tab} onChange={setTab} />
+      {tab === 'shipping' ? (
+        <AddressForm key="shipping" title="Shipping address" onSave={saveShipping} />
+      ) : (
+        <AddressForm key="billing" title="Billing address" onSave={saveBilling} />
+      )}
+    </>
+  );
+}
+```
+
+Now the key changes on every switch, so React unmounts one form and mounts the other with fresh state. With a single element, `<AddressForm key={tab} … />` does the same.
+
+You can also put the forms in **different slots**, so each conditional owns its own position:
+
+```tsx title="AddressStep.tsx"
+{tab === 'shipping' && <AddressForm title="Shipping address" onSave={saveShipping} />}
+{tab === 'billing' && <AddressForm title="Billing address" onSave={saveBilling} />}
+```
+
+The inactive slot renders `false`, so each form mounts and unmounts on its own.
+
+### When each tab should remember its draft
+
+Both fixes above throw away the inactive form's state. If customers expect to switch back and find what they typed, choose one of these instead:
+
+- **Lift the drafts up.** Keep `drafts.shipping` and `drafts.billing` in `AddressStep` and render a controlled `<AddressForm key={tab} value={drafts[tab]} onChange={…} />`.
+- **Keep both forms mounted** and hide the inactive one with CSS or the `hidden` attribute. On React 19.2+, `<Activity mode="hidden">` also keeps the hidden form's state and DOM.
+
+## Why the fix works
+
+A key is part of a component's identity, next to its type and position. Changing it tells React "this is a different thing", so React unmounts the old instance, discarding its state, and mounts a new one that initializes from the new props.
+
+That gives you one question to ask whenever a component starts showing a different item: **is this the same thing with new data, or a different thing?** Same thing: leave it alone, and React updates it cheaply. Different thing: give it a key.
+
+### The same bug when you switch records
+
+```tsx title="CustomerPanel.tsx" bad error="2"
+function CustomerPanel({ customer }: { customer: Customer }) {
+  return <NotesEditor initialNotes={customer.notes} />;
+}
+
+function NotesEditor({ initialNotes }: { initialNotes: string }) {
+  const [notes, setNotes] = useState(initialNotes); // only read on mount
+  // ...
+}
+```
+
+`useState(initialNotes)` uses its argument only when the component mounts. Picking another customer re-renders the same `NotesEditor` instance with new props, so the old notes stay. Key it by the record it edits:
+
+```tsx title="CustomerPanel.tsx" good
+return <NotesEditor key={customer.id} initialNotes={customer.notes} />;
+```
+
+The tempting alternative, `useEffect(() => setNotes(initialNotes), [initialNotes])`, renders the old notes first and corrects them a moment later. It also overwrites unsaved edits whenever a refetch returns a new object for the same customer, and every piece of local state added later needs its own reset line. For more on effects that copy props into state, see <FixLink slug="effect-chain-out-of-sync" />.
+
+## How to confirm the fix
+
+1. Type into the shipping form, switch to **Billing**, and check that the billing form is empty.
+2. In React DevTools, select the form in the **Components** tab. Its key now reads `shipping` or `billing`, and its state hooks reset when you switch tabs.
+3. To lock it in, write a test that types a street, clicks the **Billing** tab, and expects the street input to be empty.
+
+## Watch out for
+
+A key change is a full remount. The DOM is recreated, effects run again (including data fetches), and focus and scroll position inside the subtree are lost. For a small form that's negligible. For a large editor, put the key on the smallest part that should reset, not on the whole page.
+
+In review, look for a ternary or `switch` that returns the same component type in each branch for different things, for `useState(props.something)` where the parent can change which record the props describe, and for an effect whose only job is to reset state when an ID changes.

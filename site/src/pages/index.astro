@@ -1,0 +1,626 @@
+---
+import FixCard from '@/components/FixCard.astro';
+import Icon from '@/components/Icon.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import SkillCard from '@/components/SkillCard.astro';
+import StateTooHighDemo from '@/components/demos/StateTooHighDemo';
+import { SITE } from '@/config';
+import { UTILITIES } from '@/data/utilities';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getFixes, getSkills } from '@/lib/content';
+import { itemList, sourceCode } from '@/lib/seo';
+import { inlineMarkdown, loadSymptomMap } from '@/lib/skill-tables';
+import { fixUrl, skillUrl, url, utilityUrl } from '@/lib/urls';
+
+const [fixes, skills] = await Promise.all([getFixes(), getSkills()]);
+const skillTitles = Object.fromEntries(skills.map((s) => [s.id, s.data.title]));
+const fixCount = (id: string) => fixes.filter((f) => f.data.skill === id).length;
+const demoCount = fixes.filter((f) => f.body?.includes('client:visible')).length;
+
+const symptoms = loadSymptomMap().map((row) => ({
+  ...row,
+  fixes: fixes.filter((f) => f.data.skill === row.skill).slice(0, 2),
+}));
+const featured = fixes.filter((f) => f.data.featured).slice(0, 9);
+const coreSkill = skills.find((s) => s.id === 'react-best-practices');
+const focusedSkills = skills.filter((s) => s.id !== 'react-best-practices');
+
+// One CSS rule per symptom: show its panel when its radio is checked. No JavaScript needed.
+const diagnoseCss = symptoms
+  .map((_, i) => `.diagnose:has(#symptom-${i}:checked) [data-panel="${i}"]{display:grid}`)
+  .join('');
+
+const title = `${SITE.name}: real React issues, root causes and fixes`;
+const description = SITE.description;
+const schema = [
+  itemList(
+    'Featured React fixes',
+    featured.map((f) => ({ name: f.data.title, path: `/fixes/${f.id}/` })),
+    Astro.site,
+  ),
+  sourceCode(
+    {
+      path: '/',
+      name: 'react-best-practices (Claude Code plugin)',
+      description: 'Fifteen Agent Skills that teach Claude to write, review and debug React.',
+      repoPath: '',
+    },
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={title} description={description} suffix={false} schema={schema}>
+  <section class="hero">
+    <div class="container hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow"><Icon name="spark" /> Open-source skills for Claude Code</span>
+        <h1>Real React issues, <span class="accent">why they happen</span>, and how to fix them.</h1>
+        <p class="lede">
+          {fixes.length} worked issues, from re-renders and stale closures to request waterfalls and Core Web Vitals.
+          Each one shows the symptom, the root cause and the fix, often with a live demo you can break and repair. The
+          same knowledge ships as fifteen skills, so Claude applies it in your code.
+        </p>
+        <div class="cluster hero-cta">
+          <a class="button button-primary" href={url('/fixes/')}>Browse the fixes <Icon name="arrowRight" /></a>
+          <a class="button button-secondary" href="#install">Install the skills</a>
+        </div>
+        <dl class="stats">
+          <div><dt>Skills</dt><dd>{skills.length}</dd></div>
+          <div><dt>Fixes</dt><dd>{fixes.length}</dd></div>
+          <div><dt>Live demos</dt><dd>{demoCount}</dd></div>
+          <div><dt>Tested utilities</dt><dd>{UTILITIES.length}</dd></div>
+        </dl>
+      </div>
+
+      <div class="diagnose" aria-labelledby="diagnose-title">
+        <style is:inline set:html={diagnoseCss}></style>
+        <div class="diagnose-head">
+          <span class="eyebrow"><Icon name="symptom" /> Diagnose</span>
+          <p id="diagnose-title">What are you seeing?</p>
+        </div>
+        <fieldset class="diagnose-options">
+          <legend class="visually-hidden">Pick the symptom closest to yours</legend>
+          {
+            symptoms.map((s, i) => (
+              <label class="diag-option" for={`symptom-${i}`}>
+                <input type="radio" name="symptom" id={`symptom-${i}`} checked={i === 0} />
+                <span set:html={inlineMarkdown(s.symptom)} />
+              </label>
+            ))
+          }
+        </fieldset>
+        <div class="diagnose-result">
+          {
+            symptoms.map((s, i) => (
+              <div class="diag-panel" data-panel={i}>
+                <div>
+                  <p class="diag-label">Likely cause</p>
+                  <p class="diag-cause" set:html={inlineMarkdown(s.cause)} />
+                </div>
+                <div>
+                  <p class="diag-label">Claude loads</p>
+                  <a class="badge badge-skill" href={skillUrl(s.skill)}>
+                    {s.skill}
+                  </a>
+                </div>
+                {s.fixes.length > 0 && (
+                  <div>
+                    <p class="diag-label">Read the fix</p>
+                    <ul class="diag-fixes">
+                      {s.fixes.map((f) => (
+                        <li>
+                          <a href={fixUrl(f.id)}>{f.data.title}</a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="container try">
+      <div class="section-head">
+        <span class="eyebrow">Try it</span>
+        <h2>See the problem before you read about it</h2>
+        <p>
+          The demos run real React. Each flash is an actual re-render, so you can watch a fix change what React does.
+          This one is from <a href={fixUrl('typing-lags-state-too-high')}>typing lags because the input’s state lives in
+          the page</a>.
+        </p>
+      </div>
+      <StateTooHighDemo client:visible />
+    </div>
+  </section>
+
+  <section class="section featured">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Start here</span>
+        <h2>Fixes developers search for most</h2>
+        <p>Symptom first, then the cause, then code you can copy. Every page also says how to confirm the fix worked.</p>
+      </div>
+      <div class="grid grid-3">
+        {featured.map((fix) => <FixCard fix={fix} skillTitle={skillTitles[fix.data.skill]} />)}
+      </div>
+      <p class="more"><a class="button button-secondary" href={url('/fixes/')}>See all {fixes.length} fixes <Icon name="arrowRight" /></a></p>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">The skills</span>
+        <h2>Fifteen skills, one mental model</h2>
+        <p>
+          One entry skill holds the mental model and a symptom map. Fourteen focused skills go deep on one area each,
+          with worked examples and tested code.
+        </p>
+      </div>
+      {
+        coreSkill && (
+          <a class="core-skill" href={skillUrl(coreSkill.id)}>
+            <span class="skill-id">{coreSkill.id}</span>
+            <strong>{coreSkill.data.title}</strong>
+            <span>{coreSkill.data.headline}</span>
+            <Icon name="arrowRight" />
+          </a>
+        )
+      }
+      <div class="grid grid-3">
+        {focusedSkills.map((skill) => <SkillCard skill={skill} fixCount={fixCount(skill.id)} />)}
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container how">
+      <div class="section-head">
+        <span class="eyebrow">How it works</span>
+        <h2>Claude reads only what your task needs</h2>
+      </div>
+      <ol class="how-steps">
+        <li>
+          <Icon name="terminal" />
+          <h3>You describe the problem</h3>
+          <p>“Typing in the coupon field is laggy.” No skill names, no special syntax.</p>
+        </li>
+        <li>
+          <Icon name="layers" />
+          <h3>The right skill loads</h3>
+          <p>Claude matches your words against fifteen short descriptions and opens one skill’s rules.</p>
+        </li>
+        <li>
+          <Icon name="book" />
+          <h3>One example, on demand</h3>
+          <p>It reads the worked example that fits your case, not the whole library.</p>
+        </li>
+        <li>
+          <Icon name="fix" />
+          <h3>A structural fix</h3>
+          <p>State moves, keys get fixed, memo comes last. It tells you how to confirm the result.</p>
+        </li>
+      </ol>
+      <p class="more"><a class="button button-secondary" href={url('/how-it-works/')}>Watch a session step by step <Icon name="arrowRight" /></a></p>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Tested utilities</span>
+        <h2>Small code that’s easy to get wrong</h2>
+        <p>Typed, dependency-free and tested against React 18 and 19. Copy them, or let Claude reach for them.</p>
+      </div>
+      <ul class="utils">
+        {
+          UTILITIES.map((u) => (
+            <li>
+              <a href={utilityUrl(u.slug)}>
+                <code>{u.name}</code>
+                <span>{u.summary.split('. ')[0]}.</span>
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="install">
+    <div class="container install">
+      <div>
+        <span class="eyebrow">Install</span>
+        <h2>Two commands in Claude Code</h2>
+        <p>
+          The repository is a Claude Code plugin and its own marketplace. After installing, keep working as usual: Claude
+          loads the matching skill from your request. MIT licensed.
+        </p>
+        <p class="install-links">
+          <a href={url('/how-it-works/')}>Other ways to install</a>
+          <a href={SITE.repo.url} rel="noopener"><Icon name="github" /> Star on GitHub</a>
+        </p>
+      </div>
+      <InstallBlock />
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hero {
+    position: relative;
+    padding-block: clamp(40px, 7vw, 88px) clamp(32px, 5vw, 64px);
+    background:
+      radial-gradient(60% 80% at 85% 0%, var(--brand-soft), transparent 70%),
+      radial-gradient(50% 60% at 0% 100%, var(--fix-soft), transparent 70%);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    gap: clamp(28px, 5vw, 64px);
+    align-items: center;
+  }
+
+  .hero-copy {
+    display: grid;
+    gap: 20px;
+  }
+
+  .hero h1 {
+    font-size: clamp(2.3rem, 5.4vw, 3.75rem);
+    letter-spacing: -0.035em;
+    line-height: 1.04;
+  }
+
+  .accent {
+    color: var(--brand);
+  }
+
+  .hero .lede {
+    font-size: clamp(1.05rem, 1.6vw, 1.2rem);
+    color: var(--text-2);
+    max-width: 58ch;
+  }
+
+  .hero-cta {
+    gap: 12px;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin: 8px 0 0;
+    max-width: 560px;
+  }
+
+  .stats div {
+    padding-left: 12px;
+    border-left: 2px solid var(--border-strong);
+  }
+
+  .stats dt {
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+
+  .stats dd {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 1.85rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .diagnose {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+  }
+
+  .diagnose-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+
+  .diagnose-head .eyebrow {
+    color: var(--issue);
+  }
+
+  .diagnose-head :global(svg) {
+    width: 16px;
+    height: 16px;
+  }
+
+  .diagnose-head p {
+    font-weight: 650;
+  }
+
+  .diagnose-options {
+    margin: 0;
+    padding: 8px;
+    border: 0;
+    max-height: 290px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    display: grid;
+    gap: 2px;
+  }
+
+  .diag-option {
+    display: grid;
+    grid-template-columns: 16px 1fr;
+    gap: 10px;
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: var(--text-2);
+    font-size: 0.92rem;
+    line-height: 1.45;
+    cursor: pointer;
+  }
+
+  .diag-option:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .diag-option:has(input:checked) {
+    background: var(--issue-soft);
+    color: var(--text);
+  }
+
+  .diag-option input {
+    margin: 3px 0 0;
+    accent-color: var(--issue);
+  }
+
+  .diag-option :global(code),
+  .diag-cause :global(code) {
+    font-size: 0.86em;
+    padding: 0.05em 0.3em;
+    border-radius: 4px;
+    background: var(--code-inline);
+  }
+
+  .diagnose-result {
+    border-top: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--fix-soft), transparent 70%);
+  }
+
+  .diag-panel {
+    display: none;
+    gap: 12px;
+    padding: 16px 18px 18px;
+  }
+
+  .diag-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin-bottom: 4px;
+  }
+
+  .diag-cause {
+    color: var(--text);
+  }
+
+  .diag-fixes {
+    margin: 0;
+    padding-left: 1.1em;
+    display: grid;
+    gap: 4px;
+    font-size: 0.94rem;
+  }
+
+  .try .section-head {
+    margin-bottom: 8px;
+  }
+
+  .more {
+    margin-top: 24px;
+  }
+
+  .featured {
+    padding-top: clamp(24px, 4vw, 48px);
+  }
+
+  .band {
+    background: var(--surface);
+    border-block: 1px solid var(--border);
+  }
+
+  .core-skill {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas: 'id title icon' 'id text icon';
+    align-items: center;
+    gap: 2px 16px;
+    margin-bottom: 16px;
+    padding: 18px 20px;
+    border: 1px solid color-mix(in srgb, var(--brand) 40%, var(--border));
+    border-radius: var(--radius);
+    background: var(--brand-soft);
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .core-skill:hover {
+    color: var(--text);
+    border-color: var(--brand);
+  }
+
+  .core-skill .skill-id {
+    grid-area: id;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--brand);
+  }
+
+  .core-skill strong {
+    grid-area: title;
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+  }
+
+  .core-skill span:not(.skill-id) {
+    grid-area: text;
+    color: var(--text-2);
+  }
+
+  .core-skill :global(svg) {
+    grid-area: icon;
+    color: var(--brand);
+  }
+
+  .how-steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    counter-reset: step;
+  }
+
+  .how-steps li {
+    display: grid;
+    gap: 8px;
+    align-content: start;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .how-steps :global(svg) {
+    width: 26px;
+    height: 26px;
+    color: var(--brand);
+  }
+
+  .how-steps h3 {
+    font-size: 1.05rem;
+  }
+
+  .how-steps p {
+    color: var(--text-2);
+    font-size: 0.93rem;
+  }
+
+  .utils {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+    gap: 10px;
+  }
+
+  .utils a {
+    display: grid;
+    gap: 4px;
+    height: 100%;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text-2);
+    text-decoration: none;
+    font-size: 0.92rem;
+  }
+
+  .utils a:hover {
+    border-color: var(--border-strong);
+  }
+
+  .utils code {
+    color: var(--brand);
+    font-weight: 600;
+    font-size: 0.98rem;
+  }
+
+  .install {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    gap: 32px;
+    align-items: center;
+    padding: clamp(24px, 4vw, 40px);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    background:
+      radial-gradient(90% 120% at 100% 0%, var(--brand-soft), transparent 60%),
+      var(--surface);
+  }
+
+  .install h2 {
+    font-size: clamp(1.6rem, 3vw, 2.1rem);
+    margin: 8px 0 12px;
+  }
+
+  .install p {
+    color: var(--text-2);
+  }
+
+  .install-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    margin-top: 16px;
+  }
+
+  .install-links a {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+  }
+
+  .install-links :global(svg) {
+    width: 18px;
+    height: 18px;
+  }
+
+  @media (max-width: 1000px) {
+    .hero-grid,
+    .install {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .how-steps {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 560px) {
+    .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .how-steps {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .core-skill {
+      grid-template-columns: 1fr auto;
+      grid-template-areas: 'id icon' 'title icon' 'text icon';
+    }
+  }
+</style>

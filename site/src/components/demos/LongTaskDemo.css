@@ -1,0 +1,54 @@
+/* LongTaskDemo: a JavaScript-driven heartbeat next to a CSV import. Classes are prefixed with lt-. */
+
+.lt-heartbeat {
+  display: grid;
+  gap: 6px;
+}
+
+.lt-track {
+  position: relative;
+  height: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+/* A layer narrower than the track by the dot's width, so translateX(100%) lands the dot at the far end. */
+.lt-layer {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(100% - 16px);
+}
+
+.lt-dot {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--demo-accent);
+}
+
+.lt-frames {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.lt-frames b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.lt-progress {
+  width: 100%;
+  height: 10px;
+  accent-color: var(--brand);
+}
+
+.lt-status {
+  color: var(--text-2);
+  font-size: 0.88rem;
+}

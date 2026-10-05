@@ -1,0 +1,153 @@
+---
+title: "List items swap state after an insert, sort or delete"
+description: "With key={index}, React ties each row's state and typed text to its position, so they land on other items after an insert, sort or delete. Key rows by a stable ID."
+skill: react-reconciliation
+kind: bug
+symptom: "After you add a task at the top or sort the list, notes and expanded panels show up on the wrong tasks."
+cause: "The rows use the array index as their key, so React matches rows by position and keeps each position's state and DOM, even when a different item moves into it."
+fix: "Use a stable ID from the data as the key, and assign IDs when data enters the app if it has none."
+tags: [keys, lists, key prop, component state, reconciliation]
+react: "All versions"
+order: 2
+source: skills/react-reconciliation/examples/list-keys.md
+published: 2026-10-01
+related: [list-rows-all-rerender, reordered-list-jumps, form-keeps-previous-items-text]
+featured: true
+---
+
+import IndexKeysDemo from '@/components/demos/IndexKeysDemo';
+
+A team checklist lets you expand a task to see its details and jot a quick note next to it. You type "2% only" next to **Buy milk** and expand **Book flights**. Then a teammate adds **Call dentist** at the top of the list.
+
+Now **Call dentist** shows "2% only", and the expanded panel has moved to **Buy milk**. If notes save on blur, your note is about to be saved on the wrong task. Sorting the list or deleting a task scrambles things the same way.
+
+## Reproduce it
+
+<IndexKeysDemo client:visible />
+
+With the issue, type a note into one task and expand another. Then press **Add task at top** or **Sort A–Z**. The notes and the expanded panel stay where they were on screen, so they end up on different tasks. Switch to the fix and try again: each note and panel moves with its task.
+
+## Why it happens
+
+The rows are keyed by their position in the array:
+
+```tsx title="Checklist.tsx" bad error="5"
+function Checklist({ tasks }: { tasks: Task[] }) {
+  return (
+    <ul>
+      {tasks.map((task, index) => (
+        <ChecklistItem key={index} task={task} />
+      ))}
+    </ul>
+  );
+}
+
+function ChecklistItem({ task }: { task: Task }) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <li>
+      <button aria-expanded={expanded} onClick={() => setExpanded((open) => !open)}>
+        {task.title}
+      </button>
+      <input aria-label={`Note for ${task.title}`} />
+      {expanded && <TaskDetails task={task} />}
+    </li>
+  );
+}
+```
+
+Often `key={index}` was added to silence React's warning: `Each child in a list should have a unique "key" prop`. The warning goes away, but the problem it points at stays. Leaving the key out doesn't help either, because React then falls back to the index.
+
+A key answers one question for React: **which item from the previous render is this?** Inside a mapped array, React matches children by key, not by position, and everything attached to a component instance follows its key:
+
+- its state, such as `expanded`;
+- its DOM nodes, including the text typed into an uncontrolled input;
+- focus and running effects.
+
+With index keys, key `0` means "the first row", whichever task is in it. Here's what React sees when **Call dentist** is inserted at the top:
+
+| Key | Before | After the insert |
+|---|---|---|
+| `0` | Buy milk, note "2% only" | Call dentist, still showing "2% only" |
+| `1` | Book flights, expanded | Buy milk, still expanded |
+| `2` | — | Book flights, a new instance with fresh state |
+
+React reuses instance `0` and hands it new props, so its title changes to **Call dentist**. Its state and its input's DOM value stay, because they belong to the instance, not to the task. Every row shifts by one, and a new instance mounts at the end. Every row also receives new props, so every row re-renders.
+
+Sorting, filtering and deleting break the same way. Index keys attach state to **positions**, not to items.
+
+## The fix
+
+Key each row by an ID that belongs to the task:
+
+```tsx title="Checklist.tsx" good add="4-5"
+function Checklist({ tasks }: { tasks: Task[] }) {
+  return (
+    <ul>
+      {tasks.map((task) => (
+        <ChecklistItem key={task.id} task={task} />
+      ))}
+    </ul>
+  );
+}
+```
+
+`ChecklistItem` doesn't change. When **Call dentist** arrives, React finds the existing keys for **Buy milk** and **Book flights**, keeps those instances with their state and DOM, moves them down, and mounts one new row at the top. After a sort, it moves the existing instances into the new order instead of rewriting their contents.
+
+### When the data has no IDs
+
+Assign IDs once, when data enters the app: on fetch, on parse, or when the user creates an item. Never generate them during render.
+
+```ts title="importTasks.ts" good
+let nextId = 0;
+
+export function parseTasks(csv: string): Task[] {
+  return parseCsv(csv).map((cells) => ({ id: `task-${nextId++}`, title: cells[0] }));
+}
+```
+
+A module-level counter works everywhere. `crypto.randomUUID()` works too, but only in secure contexts (HTTPS and `localhost`): on a plain-HTTP origin, such as a dev server opened by LAN IP, it's undefined and the call throws. Don't use `useId` for list keys. It generates IDs for accessibility attributes, tied to a component's place in the tree, not to your data.
+
+If a server response has no IDs, derive a key from content that's unique and doesn't change while the row is on screen, such as `` `${row.date}:${row.account}` ``.
+
+## Why the fix works
+
+Identity in React is type plus position plus key, and inside a list the key decides. A stable ID ties each instance, with its state, DOM and effects, to the item it renders, so the instance travels with its item through inserts, sorts and deletes.
+
+Keys only have to be unique among siblings. If you flatten grouped data whose IDs repeat across groups, compose the key: `` key={`${group.id}:${item.id}`} ``.
+
+Index keys are acceptable only when all three of these hold:
+
+- the list never reorders, filters, inserts or removes items while it's mounted;
+- items have no state, uncontrolled inputs or focusable elements;
+- items aren't memoized components that would re-render as their props shift.
+
+Loading skeletons and a fixed list of footer links qualify. A task list doesn't.
+
+## How to confirm the fix
+
+1. Type a note in one task, expand another, then add a task at the top and sort. Every note and panel should stay with its task.
+2. In React DevTools, the **Components** tab shows each element's key. The rows should show IDs, not `0`, `1` and `2`.
+
+Then add a test that prepends a task:
+
+```tsx title="Checklist.test.tsx"
+test('a note stays with its task after an insert', async () => {
+  const user = userEvent.setup();
+  const { rerender } = render(<Checklist tasks={[milk, flights]} />);
+  await user.type(screen.getByLabelText('Note for Buy milk'), '2% only');
+
+  rerender(<Checklist tasks={[dentist, milk, flights]} />);
+
+  expect(screen.getByLabelText('Note for Buy milk')).toHaveValue('2% only');
+  expect(screen.getByLabelText('Note for Call dentist')).toHaveValue('');
+});
+```
+
+With index keys, the typed note stays in the first input, which now belongs to **Call dentist**, and the test fails.
+
+## Watch out for
+
+- **Keys generated during render.** `key={Math.random()}`, `key={crypto.randomUUID()}` or `key={Date.now()}` inside the `map` gives every row a new key on every render, so every row remounts every time: inputs lose focus and all row state resets. That's worse than index keys.
+- **Keys don't stop re-renders.** A key tells React which instance to reuse, and `memo` decides whether that instance re-renders. Stable keys are what let `memo` rows skip after an insert: see <FixLink slug="list-rows-all-rerender" />.

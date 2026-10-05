@@ -33,7 +33,7 @@ The collector agrees with Google's `web-vitals` library on the same interactions
 5. **Warm-up.** One run per side, because dev servers compile routes on first request.
 6. **A/A check.** Six pairs of A against A, labeled the same way real pairs are.
    - It estimates the noise and sets how many pairs to run (8 to 20). That's enough to detect one frame (16.7 ms) of response time, or the larger of 16.7 ms and 5% of main-thread time, with 80% power.
-   - With 6 or more pairs it must also report "no difference". If it doesn't, the machine was noisy and the report says so.
+   - With 6 or more pairs it must also report no difference big enough to matter (see Impact levels). If it doesn't, the machine was noisy and the report says so.
 7. **Pairs.** Runs alternate AB, BA, AB and so on, so drift and warm caches affect both sides equally.
    - Each run uses a fresh browser profile and real (trusted) input.
    - A step ends once React and the network have been quiet for 500 ms after its action.
@@ -64,6 +64,8 @@ Judged on the cautious end of the interval, which is the change we're 95% sure o
 | Medium | 16.7 ms or more of response or main-thread time, 20% or more of main-thread time, all long frames removed (or new ones), or 2 or more dropped frames |
 | Low | A real change smaller than that, which users won't notice |
 | None | Not distinguishable from noise |
+
+The whole flow's impact is its most important step's (or "mixed" when steps at that level go opposite ways); its totals are reported as numbers with their own intervals. The A/A check fails only on a difference that would otherwise show up as a medium or high impact: one frame of response or main-thread time, or 100 ms of blocking time.
 
 `--fail-on slower` fails (exit 4) on any slowdown of medium impact or more. `--fail-on no-gain` fails (exit 5) when no scenario's whole flow got faster.
 

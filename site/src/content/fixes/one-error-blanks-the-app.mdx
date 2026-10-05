@@ -1,0 +1,173 @@
+---
+title: "One widget's crash takes down the whole page"
+description: "An uncaught render error unmounts the whole React root and leaves a white screen. Add a root boundary, plus a boundary around each independent widget, with a retry."
+skill: react-error-handling
+kind: bug
+symptom: "One widget gets unexpected data, and the entire app turns into a white screen, navigation included, until the user reloads."
+cause: "An error thrown during rendering that no error boundary catches unmounts the entire React root, not only the component that threw."
+fix: "Add a root boundary as the last line of defense, a boundary per route, and one around each independent widget, with a fallback that fits and a retry."
+tags: [error boundaries, ErrorBoundary, white screen, componentDidCatch, onCaughtError]
+react: "18 and 19"
+order: 1
+source: skills/react-error-handling/examples/boundary-placement.md
+published: 2026-10-01
+related: [retry-button-does-nothing, async-errors-vanish, screen-blanks-between-items]
+featured: true
+---
+
+import ErrorBoundaryDemo from '@/components/demos/ErrorBoundaryDemo';
+
+An analytics app has an overview page with a revenue chart, an activity feed and a third-party partner widget. One afternoon, the backend team renames a field in the revenue response from `series` to `points`. The chart reads `data.series.map(...)`, and the console shows:
+
+```text
+TypeError: Cannot read properties of undefined (reading 'map')
+```
+
+Every user who opens the app gets a white screen. Not a broken chart: no header, no navigation, no way to reach the settings page, which has nothing to do with revenue. Support reports "the app is down", while every other feature works.
+
+## Reproduce it
+
+<ErrorBoundaryDemo client:visible />
+
+With the issue, tick a task, then press **Break the chart**. The only boundary sits at the root, so the whole mini app is replaced by "Something went wrong", and reloading it loses your ticked task. Switch to the fix and repeat: the chart's card shows a fallback, the other widgets keep working, and **Retry** brings the chart back.
+
+## Why it happens
+
+Here's the page. Nothing between the chart and the root catches errors:
+
+```tsx title="OverviewPage.tsx" bad error="15"
+createRoot(document.getElementById('root')!).render(<App />);
+
+function OverviewPage() {
+  return (
+    <Grid>
+      <RevenueChart />
+      <ActivityFeed />
+      <PartnerWidget />
+    </Grid>
+  );
+}
+
+function RevenueChart() {
+  const { data } = useRevenue();
+  return <LineChart points={data.series.map(toChartPoint)} />;
+}
+```
+
+When a component throws while rendering, React walks up the tree looking for the nearest **error boundary**. If it finds one, it renders that boundary's fallback in place of the boundary's subtree, and everything outside the boundary stays as it was. If it finds none, React unmounts the **entire root**. That's deliberate: React can't know which parts of a half-rendered tree are still trustworthy, and a blank page is safer than a page that shows the wrong numbers next to a working **Pay** button.
+
+So the size of the crash isn't decided by where the error happens. It's decided by where the nearest boundary is. With no boundaries, one bad field anywhere costs the whole app.
+
+On React 19, an uncaught render error isn't re-thrown. React reports it through `window.reportError`, and errors that a boundary catches are logged with `console.error`. Either way, the user's experience depends only on your boundaries.
+
+Error boundaries catch errors thrown **during rendering, in lifecycle methods and in effects**. They don't see errors from event handlers or from promise callbacks that run later. Those need their own handling: see <FixLink slug="async-errors-vanish" />.
+
+## The fix
+
+Put a boundary around each region a user would describe as "this part is broken, the rest works". On a dashboard, that's each card:
+
+```tsx title="OverviewPage.tsx" good add="1,6,8-9,11-12,14,19-33"
+import { ErrorBoundary } from '@/components/error-boundary';
+
+function OverviewPage() {
+  return (
+    <Grid>
+      <WidgetBoundary title="Revenue">
+        <RevenueChart />
+      </WidgetBoundary>
+      <WidgetBoundary title="Activity">
+        <ActivityFeed />
+      </WidgetBoundary>
+      <WidgetBoundary title="Partner insights">
+        <PartnerWidget />
+      </WidgetBoundary>
+    </Grid>
+  );
+}
+
+function WidgetBoundary({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <ErrorBoundary
+      onError={report}
+      fallbackRender={({ resetErrorBoundary }) => (
+        <Card title={title}>
+          <p>We couldn't load this section.</p>
+          <button onClick={resetErrorBoundary}>Retry</button>
+        </Card>
+      )}
+    >
+      {children}
+    </ErrorBoundary>
+  );
+}
+```
+
+`ErrorBoundary` here is the dependency-free boundary that ships with the skill, with `fallback`, `fallbackRender`, `onError`, `onReset` and `resetKeys`. You can copy it from the <SiteLink to="/utilities/">tested utilities</SiteLink>, or use the `react-error-boundary` package, which has the same shape. Boundaries have to be class components, because React has no hook for catching render errors, so most apps use one of these instead of writing their own.
+
+Then add the outer layers, so nothing can blank the app:
+
+```tsx title="main.tsx" good
+createRoot(document.getElementById('root')!).render(
+  <ErrorBoundary fallback={<FullPageError />} onError={report}>
+    <App />
+  </ErrorBoundary>,
+);
+
+function AppShell() {
+  const { pathname } = useLocation();
+  return (
+    <Layout nav={<SideNav />}>
+      <ErrorBoundary
+        resetKeys={[pathname]} // leaving a broken page resets it
+        onError={report}
+        fallbackRender={({ resetErrorBoundary }) => <PageError onRetry={resetErrorBoundary} />}
+      >
+        <Routes />
+      </ErrorBoundary>
+    </Layout>
+  );
+}
+
+function report(error: unknown, info: React.ErrorInfo) {
+  monitoring.captureException(error, { extra: { componentStack: info.componentStack } });
+}
+```
+
+Each layer limits a different failure:
+
+| Failure | With no boundaries | With the three layers |
+|---|---|---|
+| `PartnerWidget` throws on an odd payload | White screen | One card says it couldn't load. The rest works. |
+| A bug on the settings page | White screen | The page area shows `PageError`. Navigation works, and leaving resets it. |
+| A bug in the app shell itself | White screen | `FullPageError` with a reload button, and the error is reported. |
+
+## Why the fix works
+
+A boundary is a `try`/`catch` for a subtree's rendering. Its position sets the blast radius: an error replaces the nearest boundary's children with the fallback, and nothing outside that boundary unmounts. Siblings keep their DOM, their state and their in-flight work.
+
+A good boundary does four things. It renders a fallback that fits the region, in user terms rather than a stack trace. It reports the error with `info.componentStack`, which shows *where* in the tree it happened. It offers recovery, with a retry button or `resetKeys`. And it doesn't retry blindly: resetting into the same bad data fails again, which is the subject of <FixLink slug="retry-button-does-nothing" />.
+
+Don't wrap every component. Dozens of tiny boundaries fragment the page into half-broken pieces and duplicate fallback code. Root, routes and independent regions cover almost every app. Frameworks give you the route layer for free: Next.js `error.tsx` per route segment plus `global-error.tsx`, and React Router's route `ErrorBoundary` or `errorElement`. Widgets inside those pages still need their own.
+
+## How to confirm the fix
+
+1. Make one widget throw on purpose in development, for example behind a `?crash=revenue` query parameter. React DevTools can also force a component's nearest boundary into its error state from the **Components** tab.
+2. Load the page. Only that card should show its fallback. The navigation, the header and the other cards should keep working.
+3. Check your error reporting. The event should arrive once, with a component stack that names `RevenueChart`.
+4. Add a test, so a refactor can't remove the boundary:
+
+```tsx title="OverviewPage.test.tsx"
+it('contains a widget crash to its own card', () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {}); // React logs caught errors
+  vi.mocked(useRevenue).mockReturnValue({ data: { points: [] } } as never); // the renamed field
+  render(<OverviewPage />);
+  expect(screen.getByText("We couldn't load this section.")).toBeTruthy();
+  expect(screen.getByRole('heading', { name: 'Activity' })).toBeTruthy();
+});
+```
+
+## Watch out for
+
+- **A boundary doesn't catch its own fallback's errors.** If the fallback throws, the error goes to the next boundary up. Keep fallbacks simple.
+- **Don't show raw `error.message` to users.** Server messages and stack traces leak internals. Show a friendly message, and send the details to your reporting.
+- **Report from one place.** On React 19, `createRoot(container, { onCaughtError, onUncaughtError, onRecoverableError })` gives you a single hook for caught, uncaught and recovered errors, so reporting doesn't depend on console output. Deduplicate on the reporting side: an error inside a list can fire once per row.

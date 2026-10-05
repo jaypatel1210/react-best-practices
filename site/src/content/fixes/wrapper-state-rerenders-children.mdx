@@ -1,0 +1,149 @@
+---
+title: "A scroll or resize wrapper re-renders everything inside it"
+description: "A wrapper that tracks drag or scroll state re-renders the heavy content it creates itself. Accept that content as children or element props, and React skips it."
+skill: react-rerenders
+kind: performance
+symptom: "Dragging a divider or scrolling a container stutters, and the heavy panels inside it re-render on every pointer move or scroll event."
+cause: "The wrapper owns the fast-changing state and also creates the heavy elements, so every update re-renders them, even though they never read that state."
+fix: "Have the wrapper accept the heavy content as children or element props created by its parent, so React skips that subtree when only the wrapper's state changes."
+tags: [children, element props, composition, re-renders, resize, scroll]
+react: "All versions"
+order: 2
+source: skills/react-rerenders/examples/children-as-props.md
+published: 2026-10-01
+related: [drag-stutters-on-pointermove, memo-component-still-rerenders, typing-lags-state-too-high]
+featured: false
+---
+
+import ChildrenAsPropsDemo from '@/components/demos/ChildrenAsPropsDemo';
+
+A code playground shows an editor on the left and a live preview on the right, with a divider you drag to resize them. The editor and the preview are the two most expensive components on the page, together about 35 ms per render. Dragging the divider stutters: it trails behind the cursor and jumps to catch up.
+
+The width has to live in the component that wraps both panels, so there's no small leaf component to move it into. That's the case this fix is for.
+
+## Reproduce it
+
+<ChildrenAsPropsDemo client:visible />
+
+With the issue, drag the handle, or focus it and press the arrow keys. Both panels flash on every move, because the pane renders them itself and re-renders them each time its width changes. Switch to the fix and drag again: only the pane and its handle re-render, and the panels stay still.
+
+## Why it happens
+
+```tsx title="Playground.tsx" bad error="2,14,18"
+function Playground({ files }: { files: SourceFile[] }) {
+  const [leftWidth, setLeftWidth] = useState(480);
+  const dragging = useRef(false);
+
+  return (
+    <div
+      className="playground"
+      onPointerMove={(e) => {
+        if (dragging.current) setLeftWidth(e.clientX);
+      }}
+      onPointerUp={() => (dragging.current = false)}
+    >
+      <div style={{ width: leftWidth }}>
+        <CodeEditor files={files} />
+      </div>
+      <div className="divider" onPointerDown={() => (dragging.current = true)} />
+      <div className="right">
+        <LivePreview files={files} />
+      </div>
+    </div>
+  );
+}
+```
+
+Two facts about rendering explain the stutter:
+
+1. **A state change re-renders the component that owns the state.** Every pointer move during a drag calls `setLeftWidth`, so `Playground` renders again, dozens of times per second.
+2. **Re-rendering a component re-renders the elements it creates.** `<CodeEditor />` and `<LivePreview />` are written inside `Playground`'s JSX, so each render creates them anew, and React renders both components again. Neither reads `leftWidth`. React doesn't check: it renders them because their parent rendered.
+
+At 35 ms per move, each pointer event costs about two frames at 60 Hz, so the browser can't keep the divider under the cursor.
+
+## The fix
+
+Give the drag state its own component, and pass the panels in as element props:
+
+```tsx title="Playground.tsx" good add="1-5,7,19,21,28-31"
+type SplitPaneProps = {
+  left: React.ReactNode;
+  right: React.ReactNode;
+  initialLeftWidth?: number;
+};
+
+function SplitPane({ left, right, initialLeftWidth = 480 }: SplitPaneProps) {
+  const [leftWidth, setLeftWidth] = useState(initialLeftWidth);
+  const dragging = useRef(false);
+
+  return (
+    <div
+      className="split-pane"
+      onPointerMove={(e) => {
+        if (dragging.current) setLeftWidth(e.clientX);
+      }}
+      onPointerUp={() => (dragging.current = false)}
+    >
+      <div style={{ width: leftWidth }}>{left}</div>
+      <div className="divider" onPointerDown={() => (dragging.current = true)} />
+      <div className="right">{right}</div>
+    </div>
+  );
+}
+
+function Playground({ files }: { files: SourceFile[] }) {
+  return (
+    <SplitPane
+      left={<CodeEditor files={files} />}
+      right={<LivePreview files={files} />}
+    />
+  );
+}
+```
+
+During a drag, only `SplitPane` re-renders. The browser still lays out the panels at their new widths, but that's CSS work, not React rendering.
+
+The `dragging` flag stays in a ref because it's never rendered, and flipping it shouldn't cause a render.
+
+## Why the fix works
+
+`<CodeEditor files={files} />` is an element: a plain object that describes what to render. It belongs to whichever component's JSX creates it. After the fix, that's `Playground`, which doesn't re-render during a drag.
+
+When `SplitPane` re-renders from its own state, its `left` and `right` props are the same objects as last time. React finds the same element in the same position and skips that subtree, without calling `CodeEditor` or `LivePreview` at all. The `<div style={{ width: leftWidth }}>` and the divider are created inside `SplitPane`, so they're new on every render and do update, which is exactly what should change.
+
+This works for any prop that carries elements: `children`, `left`, `footer`, `sidebar`. It needs no `memo`, no `useCallback`, and nothing a later edit can quietly break. The panels still re-render whenever `Playground` re-renders, and that's correct, because `files` may have changed.
+
+In frameworks with Server Components, the idea scales up: a client wrapper such as a scroll container, tabs or a modal can receive server-rendered content as `children` without turning it into client code or re-rendering it.
+
+### The scroll version
+
+A docs page shrinks its header after the reader scrolls 80 px, and the article inside is long and heavy. The layout tracks the scroll position, and the article arrives as `children`:
+
+```tsx title="CollapsingLayout.tsx" good mark="5,7"
+function CollapsingLayout({ children }: { children: React.ReactNode }) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  return (
+    <div className="doc-scroll" onScroll={(e) => setCollapsed(e.currentTarget.scrollTop > 80)}>
+      <header className={collapsed ? 'header header--compact' : 'header'}>Docs</header>
+      {children}
+    </div>
+  );
+}
+```
+
+Two details keep it cheap. The article is `children`, so it doesn't re-render on scroll. And the state is a **boolean**, not the raw `scrollTop`. Most scroll events set the same value again, and React bails out when the new state is `Object.is`-equal to the current one. Storing the scroll position itself would re-render the layout on every scroll event.
+
+If the header's content needs `collapsed`, pass it as a render prop, `header={(collapsed) => <DocTitle compact={collapsed} />}`, so only the header re-renders along with the layout. <FixLink slug="render-prop-or-hook" /> covers when a render prop is the right tool.
+
+## How to confirm the fix
+
+1. In React DevTools, enable **Highlight updates when components render** and drag the divider. Before the fix, the whole playground flashes. After it, only the pane's frame and the divider do.
+2. Record a short drag in the **Profiler**. Before, every commit includes `CodeEditor` and `LivePreview`. After, they're gray in every commit.
+3. In the Chrome Performance panel with 4× CPU throttling, the long tasks during the drag should be gone.
+
+## When this isn't enough
+
+- **The content really reads the changing state**, like a chart that redraws at the new width. Restructuring can't skip work the content needs. Make that work cheaper instead: defer it with `useDeferredValue`, memoize precisely, or move the visual change to CSS or a canvas.
+- **The parent re-renders often.** Element props are recreated whenever the parent renders, so fix the parent's re-renders first.
+- **Even the wrapper's own render is too slow** for every pointer event, for example in a large grid. Write the width straight to the DOM through a ref once per frame, and commit the final value to state when the drag ends: see <FixLink slug="drag-stutters-on-pointermove" />.

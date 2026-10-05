@@ -1,0 +1,80 @@
+/* VirtualListDemo: a 10,000-entry audit log. Classes are prefixed with vl-. */
+
+.vl-log {
+  --vl-cols: 5.2em minmax(0, 1.3fr) minmax(0, 1.2fr) minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.vl-row {
+  display: grid;
+  grid-template-columns: var(--vl-cols);
+  gap: 10px;
+  align-items: center;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.vl-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vl-head {
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 0.74rem;
+  font-weight: 650;
+}
+
+.vl-body {
+  position: relative;
+  overflow-y: auto;
+}
+
+.vl-body:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+.vl-time {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+}
+
+.vl-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--info);
+}
+
+.vl-dot[data-tone='add'] {
+  background: var(--fix);
+}
+
+.vl-dot[data-tone='remove'] {
+  background: var(--issue);
+}
+
+.vl-empty {
+  padding: 16px;
+  color: var(--text-3);
+  font-size: 0.9rem;
+}
+
+@media (max-width: 520px) {
+  .vl-log {
+    --vl-cols: 4.6em minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .vl-row > :nth-child(4) {
+    display: none;
+  }
+}

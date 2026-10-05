@@ -106,7 +106,7 @@ Skip this step if the user chose *Skip*. Read `references/benchmark-protocol.md`
    - It needs an unsandboxed shell.
    - Untracked `.env` files are linked by name and never read.
    - In *fix but uncommitted* mode the baseline is `HEAD`.
-2. **Dev command.** Write it with `{port}` where the port goes (`next dev -p {port}`, `vite --port {port}`, `<root script> -- --port {port}`), run from the folder `detect` reported. Stop the dev server from step 2 so both sides start fresh.
+2. **Dev command.** Write it with `{port}` where the port goes (`next dev -p {port}`, `vite --port {port}`, `<root script> -- --port {port}`), run from the folder `detect` reported. For Next.js, prefix the baseline's command with `rm -rf .next &&`; the copy is disposable, and a leftover `.next` can stop it from starting. Stop the dev server from step 2 so both sides start fresh.
 3. **Phone layout.** Run `ra inspect --url <page> --root <app> --profile mobile`. Every target must exist at 412 px. If one doesn't, write a mobile variant of the scenario, or use `--profiles desktop`.
 4. **Run it** in the background and wait. It calibrates the CPU, then runs the A/A check, the alternating pairs and the traces:
    ```

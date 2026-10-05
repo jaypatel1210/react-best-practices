@@ -1,0 +1,20 @@
+---
+import type { Skill } from '../lib/content';
+import { skillUrl } from '../lib/urls';
+
+interface Props {
+  skill: Skill;
+  fixCount: number;
+  headingLevel?: 'h2' | 'h3';
+}
+
+const { skill, fixCount, headingLevel = 'h3' } = Astro.props;
+const Heading = headingLevel;
+---
+
+<article class="card card-link skill-card">
+  <span class="skill-id">{skill.id}</span>
+  <Heading><a href={skillUrl(skill.id)}>{skill.data.title}</a></Heading>
+  <p>{skill.data.headline}</p>
+  <p class="meta skill-count">{fixCount} {fixCount === 1 ? 'fix' : 'fixes'}</p>
+</article>

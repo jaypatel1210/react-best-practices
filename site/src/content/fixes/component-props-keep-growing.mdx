@@ -1,0 +1,186 @@
+---
+title: "A component keeps growing props like iconName and iconColor"
+description: "A Button or Dialog that gains a prop for every variation turns into a maze of conditionals. Accept elements as props (slots) and let callers own the content."
+skill: react-composition
+kind: maintainability
+symptom: "Every design request adds another prop, such as iconName, iconColor or showCancel, and the component's body fills up with conditionals."
+cause: "The component builds its inner elements itself and exposes props that only forward settings to them, so every new variation needs a new prop."
+fix: "Accept the elements themselves: children for the main content, and named element props (slots) for regions such as icons and actions."
+tags: [slots, children, component API, props, design systems]
+react: "All versions"
+order: 1
+source: skills/react-composition/examples/slots-and-defaults.md
+published: 2026-10-01
+related: [clone-element-overrides-props, wrapper-state-rerenders-children, render-prop-or-hook]
+featured: false
+---
+
+Your design system's `ConfirmDialog` started small: a title, a message and an **OK** button. Then a screen needed a red **Delete** button, so it gained `confirmVariant`. Another needed a **Keep project** button (`showCancel`, `cancelLabel`). A third needed a checkbox to delete backups too (`showCheckbox`, `checkboxLabel`, `checkboxChecked`, `onCheckboxChange`). The `Button` it renders went the same way, with `iconName`, `iconPosition`, `iconColor` and `iconSize`.
+
+Now a designer wants a help link in the dialog's footer. That's another prop, another conditional, and another review of a shared component, for a change only one screen needs.
+
+Nothing is broken. The component gets harder to change with every request, and that's what this page fixes.
+
+## Why it happens
+
+Here's the dialog after a year of requests:
+
+```tsx title="ConfirmDialog.tsx" bad error="4-11,22,30"
+type ConfirmDialogProps = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  confirmVariant?: 'primary' | 'danger';
+  showCancel?: boolean;
+  cancelLabel?: string;
+  showCheckbox?: boolean;
+  checkboxLabel?: string;
+  checkboxChecked?: boolean;
+  onCheckboxChange?: (checked: boolean) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+};
+
+export function ConfirmDialog(props: ConfirmDialogProps) {
+  const { confirmLabel = 'OK', confirmVariant = 'primary', cancelLabel = 'Cancel' } = props;
+  return (
+    <DialogShell onClose={props.onCancel}>
+      <h2 className="dialog__title">{props.title}</h2>
+      <p className="dialog__body">{props.message}</p>
+      {props.showCheckbox && (
+        <Checkbox
+          label={props.checkboxLabel ?? ''}
+          checked={props.checkboxChecked ?? false}
+          onChange={props.onCheckboxChange ?? (() => {})}
+        />
+      )}
+      <div className="dialog__actions">
+        {props.showCancel && <Button variant="ghost" onClick={props.onCancel}>{cancelLabel}</Button>}
+        <Button variant={confirmVariant} onClick={props.onConfirm}>{confirmLabel}</Button>
+      </div>
+    </DialogShell>
+  );
+}
+```
+
+Look at what the highlighted props do. None of them changes how the dialog behaves. They configure elements the dialog creates on the caller's behalf: the confirm button's label and color, whether a cancel button exists and what it says, the checkbox's label and state. The dialog has become a remote control for elements it doesn't care about.
+
+That design costs more with every request:
+
+- **The API grows with the number of variations.** An icon that can sit on either side, in any color and size, already needs four props. A second icon doubles them.
+- **Every variation is a change to the shared component**, and every change puts the screens that already use it at risk.
+- **The body turns into a decision tree.** Each `show*` flag is a branch, and each branch needs its own tests.
+- **Callers lose control of their own content.** A screen that wants a tooltip on the checkbox or an `aria-describedby` on the confirm button can't add one, because the dialog owns those elements.
+
+For each prop, ask one question: does the component *use* this value, or does it only *forward* it to an element it renders? Forwarded props are the ones to replace.
+
+## The fix
+
+Let the dialog own what it's responsible for (layout, spacing, focus management and closing), and let callers hand over the content as elements:
+
+```tsx title="Dialog.tsx" good add="3-5,12,14-15"
+type DialogProps = {
+  title: React.ReactNode;
+  children: React.ReactNode; // the body: the primary content
+  actions?: React.ReactNode; // a footer slot
+  illustration?: React.ReactNode; // an optional media slot
+  onClose: () => void;
+};
+
+export function Dialog({ title, children, actions, illustration, onClose }: DialogProps) {
+  return (
+    <DialogShell onClose={onClose}>
+      {illustration && <div className="dialog__media">{illustration}</div>}
+      <h2 className="dialog__title">{title}</h2>
+      <div className="dialog__body">{children}</div>
+      {actions && <div className="dialog__actions">{actions}</div>}
+    </DialogShell>
+  );
+}
+```
+
+The call site now shows exactly what it renders:
+
+```tsx title="DeleteProjectDialog.tsx" good
+function DeleteProjectDialog({ onDelete, onClose }: {
+  onDelete: (options: { alsoBackups: boolean }) => void;
+  onClose: () => void;
+}) {
+  const [alsoBackups, setAlsoBackups] = useState(false);
+
+  return (
+    <Dialog
+      title="Delete project?"
+      onClose={onClose}
+      actions={
+        <>
+          <Button variant="ghost" onClick={onClose}>Keep project</Button>
+          <Button variant="danger" onClick={() => onDelete({ alsoBackups })}>Delete</Button>
+        </>
+      }
+    >
+      <p>This cannot be undone.</p>
+      <Checkbox label="Also delete backups" checked={alsoBackups} onChange={setAlsoBackups} />
+    </Dialog>
+  );
+}
+```
+
+Eight configuration props are gone. The checkbox's state lives in the screen that cares about it, the button styles are ordinary `Button` props, and the designer's help link is one more element in `actions`, with no change to `Dialog`.
+
+The same shape fixes the button. Instead of four `icon*` props, accept the icon itself:
+
+```tsx title="Button.tsx" good add="3-4,10,12"
+type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: 'primary' | 'ghost' | 'danger';
+  startIcon?: React.ReactNode;
+  endIcon?: React.ReactNode;
+};
+
+export function Button({ variant = 'primary', startIcon, endIcon, children, ...rest }: ButtonProps) {
+  return (
+    <button {...rest} className={`button button--${variant}`}>
+      {startIcon && <span className="button__icon" aria-hidden="true">{startIcon}</span>}
+      <span>{children}</span>
+      {endIcon && <span className="button__icon" aria-hidden="true">{endIcon}</span>}
+    </button>
+  );
+}
+
+// The caller picks the icon and configures it through the icon's own props
+<Button startIcon={<UploadIcon />}>Upload</Button>;
+```
+
+## Why the fix works
+
+A slot moves each decision to the code that has the information. The dialog knows where the footer goes and how it's spaced. The screen knows what the footer contains. Each owns its part, so a new footer is a change to one screen, and the shared component stays put.
+
+Three facts make slots safe to use everywhere:
+
+- **Creating an element is cheap, and it doesn't render anything.** `actions={<Button>…</Button>}` creates a small object. If the dialog is closed (`{isOpen && <Dialog … />}`), the buttons never render.
+- **Slot elements keep their identity when the receiving component re-renders on its own.** If `Dialog` re-renders because of its own state, such as an animation flag, React sees the same `actions` objects and skips them. It's the same mechanism that makes `children` a performance fix in <FixLink slug="wrapper-state-rerenders-children" />.
+- **`children` is a slot too.** Nested JSX is the `children` prop. Use it for the primary content, and named props for secondary regions: `header`, `actions`, `icon`, `emptyState`.
+
+You don't need a configuration object such as `footer={{ buttons: [...] }}`, which is the same explosion in a different shape. A `renderFooter` function earns its place only when the footer needs state the dialog owns, such as which step is active. That's a render prop, covered in <FixLink slug="render-prop-or-hook" />.
+
+## How to confirm the fix
+
+This is a design fix, so test it against the changes it's meant to absorb:
+
+1. **Replay recent requests.** Take the last three changes that touched the old component and check that each one is now a change at a call site only.
+2. **Let TypeScript find the callers.** Remove the old props from the type, run `tsc --noEmit`, and work through the errors. Each one is a call site to migrate.
+3. **Test the component once, and content where it lives.** The dialog's tests cover layout and behavior: <kbd>Escape</kbd> calls `onClose`, and focus moves into the dialog and back out. A test like "the delete dialog offers to delete backups" moves to the screen that renders the checkbox.
+
+To migrate gradually, rebuild `ConfirmDialog` on top of `Dialog` so old call sites keep working. Then move screens over one at a time, and delete the wrapper when nothing uses it.
+
+## How to spot this in review
+
+- Props named after an inner element: `iconName`, `iconColor`, `titleClassName`, `footerAlign`.
+- Pairs like `showCancel` and `cancelLabel`, where one flag turns on a region and other props configure it.
+- A pull request that adds a prop to a shared component so that one screen can render something slightly different.
+
+## Watch out for
+
+Slots trade control for flexibility, so choose on purpose. If the design system must guarantee that buttons only show approved icons, a slot can't enforce it. TypeScript types every JSX expression as `JSX.Element`, so `icon?: React.ReactElement<IconProps>` documents the intent but still accepts a `<div>`. When that guarantee matters, a small enum prop (`icon="upload"`) is a deliberate, reasonable choice.
+
+When slot content needs defaults from the component, such as a 20px icon inside a large button, don't reach for `cloneElement` first. Style it with CSS, or pass the values through a render prop. <FixLink slug="clone-element-overrides-props" /> shows what goes wrong otherwise.

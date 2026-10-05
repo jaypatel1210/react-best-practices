@@ -1,0 +1,154 @@
+---
+title: "A setInterval counter gets stuck at 1"
+description: "An interval set up in an effect with empty dependencies keeps reading the first render's count. Use a functional update, setCount(c => c + 1), and it counts up."
+skill: react-refs-closures
+kind: bug
+symptom: "A timer started in useEffect with an empty dependency list shows 1 after the first tick and never moves, while the interval keeps firing."
+cause: "The interval callback was created during the first render and keeps that render's count, so every tick computes 0 + 1."
+fix: "Stop reading state in the callback: call setCount(c => c + 1) so React passes in the current value, and keep the empty dependency list."
+tags: [setInterval, useEffect, stale closures, functional updates, useState]
+react: "All versions"
+order: 1
+source: skills/react-refs-closures/examples/stale-closures.md
+published: 2026-10-01
+related: [handler-sees-old-state, effect-refetches-forever, listeners-pile-up-after-navigation]
+featured: false
+---
+
+import StaleIntervalDemo from '@/components/demos/StaleIntervalDemo';
+
+A support console shows how long an agent has been on the current call. The timer component sets up a `setInterval` when it mounts, adds one every second, and cleans up when it unmounts. It looks right, and the code review passed.
+
+On screen, it shows **1s** after the first second and stays there. A `console.log` inside the interval proves the callback keeps running every second. The timer is alive, but it never gets past 1.
+
+## Reproduce it
+
+<StaleIntervalDemo client:visible />
+
+With `setCount(count + 1)` selected, press **Start the timer**. The count goes from 0 to 1 and stays there, while the log keeps adding a line for every tick, each one computing with `count = 0`. Switch to `setCount(c => c + 1)` and start the timer again: the count goes up with every tick.
+
+## Why it happens
+
+```tsx title="CallTimer.tsx" bad error="5,7"
+function CallTimer() {
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => setSeconds(seconds + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return <span className="call-timer">{seconds}s</span>;
+}
+```
+
+Every render is a separate call of `CallTimer`, with its own `seconds` constant. A function created during a render sees that render's values, and keeps seeing them for as long as it exists. A closure is a snapshot.
+
+The effect runs once, after the first render, because its dependency list is empty. The arrow function it passes to `setInterval` was created in that first render, so the `seconds` it reads is 0, forever. Each tick calls `setSeconds(0 + 1)`. The first tick changes the state from 0 to 1. Every later tick sets 1 again, and because the new state is identical to the current one, React skips the re-render entirely. The interval keeps firing and nothing on screen changes.
+
+The linter sees this coming. `react-hooks/exhaustive-deps` reports:
+
+> React Hook useEffect has a missing dependency: 'seconds'. Either include it or remove the dependency array. You can also do a functional update 'setSeconds(s => ...)' if you only need 'seconds' in the 'setSeconds' call.
+
+The last sentence of that warning is the fix.
+
+The tempting alternative, adding `seconds` to the dependency list, does work, but it tears the interval down and creates a new one every second. Each tick then waits for a render and an effect before the next timer even starts, so the cadence drifts, and the effect does far more work than the problem needs.
+
+## The fix
+
+Stop reading state inside the callback, and let React hand you the current value:
+
+```tsx title="CallTimer.tsx" good add="5"
+function CallTimer() {
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return <span className="call-timer">{seconds}s</span>;
+}
+```
+
+The empty dependency list is now honest: the callback doesn't use any value from render, so nothing in it can go stale. The interval is created once and cleared on unmount.
+
+## Why the fix works
+
+An updater function, `(s) => s + 1`, isn't evaluated when you call `setSeconds`. React queues it and calls it while processing updates, passing in the latest state at that moment. The callback no longer carries a value from the render that created it. It carries an instruction, "add one to whatever the count is now", and that instruction can't go out of date.
+
+Reach for the fixes for stale closures in this order:
+
+1. **A complete dependency list.** Trust the linter. A suppression comment usually hides a stale closure.
+2. **A functional update**, as here, when the callback only needs the previous state.
+3. **Moving the logic into an event handler**, when it belongs to an interaction rather than to "whenever this changes".
+4. **An Effect Event or a latest-value ref**, when the callback needs the latest props without re-running the effect. See below.
+
+## How to confirm the fix
+
+1. Watch the timer for five seconds. It should read **5s**.
+2. Check that the linter is quiet for this effect without a suppression comment.
+3. Pin it with a test that uses fake timers:
+
+```tsx title="CallTimer.test.tsx"
+it('counts once per second', () => {
+  vi.useFakeTimers();
+  render(<CallTimer />);
+  act(() => vi.advanceTimersByTime(3000));
+  expect(screen.getByText('3s')).toBeTruthy(); // the stale version shows 1s
+  vi.useRealTimers();
+});
+```
+
+In development, StrictMode mounts the component, runs the cleanup and mounts it again. With the cleanup in place, exactly one interval survives. If your timer counts twice as fast in development, the cleanup is missing, and <FixLink slug="listeners-pile-up-after-navigation" /> explains what else leaks the same way.
+
+## How to spot this in review
+
+- `setX(x + 1)`, `setX(x - 1)` or `setList([...list, item])` inside `setInterval`, `setTimeout`, an event listener or a subscription that's registered once.
+- `// eslint-disable-next-line react-hooks/exhaustive-deps` next to an effect that reads state or props.
+- Bug reports that say "it stops after the first tick", "it only works once" or "it always uses the first value".
+
+The same bug with an array is easy to miss. `setEvents([...events, event])` inside a subscription registered once keeps only the newest event, because `events` is always the first render's empty array. `setEvents((prev) => [...prev, event])` fixes it the same way.
+
+## When this isn't enough
+
+Sometimes the callback needs more than the previous state. Say the timer should pause while the call is on hold, controlled by an `isOnHold` prop. A functional update can't read a prop.
+
+Often the simplest answer is to add `isOnHold` to the dependency list. The interval then restarts only when the hold state changes, which is rare and harmless here. When restarting is a problem, for example when the effect also opens a connection, read the latest value without re-running the effect.
+
+On React 19.2 and later, use an Effect Event:
+
+```tsx title="CallTimer.tsx" good add="3-5,8"
+function CallTimer({ isOnHold }: { isOnHold: boolean }) {
+  const [seconds, setSeconds] = useState(0);
+  const onTick = useEffectEvent(() => {
+    if (!isOnHold) setSeconds((s) => s + 1); // always reads the latest isOnHold
+  });
+
+  useEffect(() => {
+    const id = setInterval(() => onTick(), 1000);
+    return () => clearInterval(id);
+  }, []); // Effect Events stay out of the dependency list
+
+  return <span className="call-timer">{seconds}s</span>;
+}
+```
+
+Call an Effect Event only from inside effects, including callbacks they register. Don't pass it to child components or call it during render.
+
+On earlier versions, use the latest-ref pattern. `useLatestCallback`, one of the repository's <SiteLink to="/utilities/">tested utilities</SiteLink>, returns a function whose identity never changes but which always calls the newest version of your callback:
+
+```tsx title="CallTimer.tsx" good
+const onTick = useLatestCallback(() => {
+  if (!isOnHold) setSeconds((s) => s + 1);
+});
+
+useEffect(() => {
+  const id = setInterval(onTick, 1000);
+  return () => clearInterval(id);
+}, [onTick]); // a stable identity, so the interval is created once
+```
+
+<FixLink slug="handler-sees-old-state" /> covers both techniques for sockets and memoized callbacks.
+
+One more caution for clocks. Browsers slow timers down in background tabs, and intervals drift, so a counter that adds one per tick falls behind real time. For an elapsed-time display, keep the start time and compute the seconds from `Date.now()` on each tick, instead of counting ticks.

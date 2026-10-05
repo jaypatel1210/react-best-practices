@@ -49,6 +49,7 @@ Lines that already differed between baseline runs are ignored automatically. If 
 - **"The server stopped before answering" or "didn't answer".** Read `bench/<label>/server-a.log` (or `-b`). The usual causes:
   - The dev command ignored `{port}`. Check how its script passes the port (`next dev -p`, `vite --port`, `-- --port`).
   - The baseline copy lacks something the working tree has. Only untracked `.env*` files in the repository root and the app folder are linked. Generated files need `baseline --setup "<command>"`, such as code generation.
+- **Next.js: `ENOENT` under `.next/` at startup** (`scandir .next/server/pages`, `.next/static/chunks/app` or `.next/types/...`). Some Next.js setups can't start from a `.next` folder left by a dev server that was stopped. Start each side with a clean one: `--a-cmd "rm -rf .next && <dev command>"` is safe for the baseline, which is a disposable copy. For the user's own checkout, tell them and let them clear it.
 - **The baseline install failed.** Read `baseline-install.log` in the audit folder. Pass `--install "<command>"` for an unusual setup, or `--install none` if the copy already has dependencies.
 - **The baseline can't reach the API (CORS).** Some APIs only allow the usual dev origin, like `http://localhost:3000`. Add `--disable-cors` to `bench`: Chrome then skips CORS checks for both sides alike.
 - **A step fails only on mobile.** The phone layout hides or moves the target. Check with `inspect --profile mobile`, then write a mobile variant of the scenario, or run `--profiles desktop`.

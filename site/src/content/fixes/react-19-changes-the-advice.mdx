@@ -1,0 +1,222 @@
+---
+title: "Code written for React 18 fights React 19 and the Compiler"
+description: "forwardRef, Context.Provider, latest-value refs and blanket useMemo still run on React 19, but newer APIs replace them. What 19, 19.2 and the Compiler change."
+skill: react-best-practices
+kind: maintainability
+symptom: "After the upgrade, new components still copy forwardRef wrappers, Context.Provider, hand-rolled latest-value refs and useMemo on everything, and the code gets harder to change."
+cause: "The idioms were written for React 18. React 19 makes ref a prop and the context its own provider, 19.2 adds useEffectEvent and Activity, and the Compiler memoizes for you."
+fix: "Check the installed React version and the Compiler setup first, write new code with the current idioms, and migrate old code deliberately, with tests."
+tags: [React 19, forwardRef, useEffectEvent, Activity, React Compiler]
+react: "18, 19 and 19.2+"
+order: 2
+source: skills/react-best-practices/references/modern-react.md
+published: 2026-10-01
+related: [manual-memo-fights-compiler, handler-sees-old-state, toggling-wrapper-resets-state]
+featured: false
+---
+
+A team upgrades a dashboard from React 18 to 19.2 and turns on the React Compiler. Every test passes, because React kept the old APIs working on purpose. Six months later, new components still wrap inputs in `forwardRef`, render `<ThemeContext.Provider>`, keep a `useRef` copy of every prop an effect reads, and wrap each callback in `useCallback`.
+
+None of it is broken. It's ceremony that the newer versions made unnecessary, and some of it works against the Compiler. Reviews turn into debates about which of two styles to use, and every component carries layers that someone has to read past.
+
+## Why it happens
+
+Here's a chat room written the React 18 way. It exposes its input through a ref, reads the latest `muted` setting inside a socket callback without reconnecting, and memoizes what it passes down:
+
+```tsx title="ChatRoom.tsx" bad warn="1,13-16,21,26-27,30,33"
+const MessageInput = forwardRef<HTMLInputElement, MessageInputProps>(function MessageInput({ onSend }, ref) {
+  return (
+    <input
+      ref={ref}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') onSend(e.currentTarget.value);
+      }}
+    />
+  );
+});
+
+export function ChatRoom({ roomId, muted }: { roomId: string; muted: boolean }) {
+  const mutedRef = useRef(muted);
+  useEffect(() => {
+    mutedRef.current = muted;
+  });
+
+  useEffect(() => {
+    const connection = connectToRoom(roomId);
+    connection.on('message', () => {
+      if (!mutedRef.current) playChime();
+    });
+    return () => connection.close();
+  }, [roomId]);
+
+  const room = useMemo(() => ({ roomId, muted }), [roomId, muted]);
+  const handleSend = useCallback((text: string) => sendMessage(roomId, text), [roomId]);
+
+  return (
+    <RoomContext.Provider value={room}>
+      <MessageList />
+      <MessageInput onSend={handleSend} />
+    </RoomContext.Provider>
+  );
+}
+```
+
+On React 18, every one of these was the right call. `forwardRef` was the only way for a function component to receive a ref. The ref-plus-effect pair is the latest-value pattern, which lets the socket callback read the current `muted` without reconnecting. The `useMemo` keeps the context value's identity stable, so consumers don't re-render whenever `ChatRoom` does.
+
+The mental model hasn't changed: a state change re-renders the subtree, closures capture their render's values, and a provider's value identity decides when consumers re-render. What changed is that React now ships direct tools for these jobs, and the Compiler does the memoization bookkeeping at build time. Keeping the old idioms in new code adds no safety. It adds a second way to do everything.
+
+Before you change anything, find out what the project runs: the `react` version in the lockfile, not only the range in `package.json`, and whether `babel-plugin-react-compiler` or `reactCompiler: true` in `next.config` is present. On React 18, the old idioms are still correct, and upgrading React as a side effect of a refactor is a bad trade.
+
+## The fix
+
+On React 19.2 with the Compiler on, the same component reads like this:
+
+```tsx title="ChatRoom.tsx" good add="1,13-15,19,24,26-27"
+function MessageInput({ onSend, ref }: MessageInputProps & { ref?: React.Ref<HTMLInputElement> }) {
+  return (
+    <input
+      ref={ref}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') onSend(e.currentTarget.value);
+      }}
+    />
+  );
+}
+
+export function ChatRoom({ roomId, muted }: { roomId: string; muted: boolean }) {
+  const onMessage = useEffectEvent(() => {
+    if (!muted) playChime();
+  });
+
+  useEffect(() => {
+    const connection = connectToRoom(roomId);
+    connection.on('message', () => onMessage());
+    return () => connection.close();
+  }, [roomId]);
+
+  return (
+    <RoomContext value={{ roomId, muted }}>
+      <MessageList />
+      <MessageInput onSend={(text) => sendMessage(roomId, text)} />
+    </RoomContext>
+  );
+}
+```
+
+Each change, by version:
+
+### `ref` is a regular prop (React 19)
+
+Function components receive `ref` like any other prop, so new code doesn't need `forwardRef`, which is expected to be deprecated eventually. A ref callback can also return a cleanup function, called when the element detaches, instead of being called again with `null`. On React 18, keep `forwardRef`.
+
+### The context is its own provider (React 19)
+
+`<RoomContext value={…}>` replaces `<RoomContext.Provider value={…}>`, which still works. The re-render rule is the same: every consumer re-renders when `value` changes identity. The inline object above is safe only because the Compiler caches it until `roomId` or `muted` changes. Without the Compiler, keep the `useMemo` (see <SkillLink name="react-context" />).
+
+### `use` reads context conditionally, and promises from outside render (React 19)
+
+```tsx title="HelpLink.tsx" good
+function HelpLink({ showHelp }: { showHelp: boolean }) {
+  if (!showHelp) return null;
+  const theme = use(ThemeContext); // allowed after an early return, unlike useContext
+  return <a className={theme.link} href="/help">Help</a>;
+}
+```
+
+`use(promise)` suspends until the promise resolves, but the promise must come from outside render: a loader, a cache or a Server Component. A promise created while a Client Component renders is new on every render. `use` can't sit inside `try/catch`; a rejected promise goes to the nearest error boundary.
+
+### Actions track pending and error state (React 19)
+
+The React 18 version of a form keeps `isPending` and `error` in two more `useState` calls and juggles them in `onSubmit`. `useActionState` returns the result, an action for the form and a pending flag:
+
+```tsx title="RenameForm.tsx" good
+function RenameForm({ projectId }: { projectId: string }) {
+  const [error, formAction, isPending] = useActionState(
+    async (_previous: string | null, formData: FormData) => {
+      try {
+        await renameProject(projectId, String(formData.get('name')));
+        return null;
+      } catch {
+        return 'Could not rename the project.';
+      }
+    },
+    null,
+  );
+
+  return (
+    <form action={formAction}>
+      <input name="name" />
+      <button disabled={isPending}>Save</button>
+      {error && <p role="alert">{error}</p>}
+    </form>
+  );
+}
+```
+
+Return expected failures as state, as above, because an error thrown from the action goes to the nearest error boundary. `useOptimistic` covers optimistic rows, and `useFormStatus` from `react-dom` lets a nested submit button read the pending state. Inside an async `startTransition`, state updates after an `await` need their own `startTransition` to stay part of the transition.
+
+### `useEffectEvent` replaces latest-value refs in effects (React 19.2)
+
+An Effect Event always sees the latest props and state and stays out of the dependency list, so the socket reconnects only when `roomId` changes and still reads the current `muted`. Three rules keep it correct:
+
+- Call it only from inside effects, including callbacks the effect registers, or from other Effect Events.
+- Don't pass it to child components or hooks, and don't call it during render. Its identity changes on every render by design, and the hooks lint rules flag misuse.
+- For a stable callback passed as a prop, keep the latest-ref pattern (see <FixLink slug="handler-sees-old-state" />).
+
+### `<Activity>` keeps hidden panels without running them (React 19.2)
+
+Unmounting an inactive tab throws away its state. Hiding it with CSS keeps the state but leaves its effects running, polling and subscribing in the background. `<Activity>` keeps the state and DOM, and cleans up the effects while the panel is hidden:
+
+<Compare>
+
+```tsx title="SettingsTabs.tsx" bad
+{tab === 'profile' && <ProfileForm />}
+{tab === 'billing' && <BillingPanel />}
+```
+
+```tsx title="SettingsTabs.tsx" good
+<Activity mode={tab === 'profile' ? 'visible' : 'hidden'}>
+  <ProfileForm />
+</Activity>
+<Activity mode={tab === 'billing' ? 'visible' : 'hidden'}>
+  <BillingPanel />
+</Activity>
+```
+
+</Compare>
+
+The effects are re-created when the panel becomes visible again, and React can pre-render hidden content at low priority.
+
+### The Compiler does the memoization bookkeeping
+
+With the Compiler on, new code doesn't need hand-written `memo`, `useMemo` or `useCallback`, which is why `room` and `handleSend` disappeared. Leave existing memoization in place unless removing it is the task: removing it can change the compiled output, so test when you do. The Compiler skips, silently, any component that breaks the Rules of React, such as one that reads `ref.current` during render, mutates props or state, or runs side effects in render.
+
+It also changes nothing about what re-renders when state changes, how context works, identity and keys, closures or effects. More in <FixLink slug="manual-memo-fights-compiler" />.
+
+## Why the fix works
+
+Each new API removes a workaround, not a rule. `ref` as a prop removes a wrapper layer. `useEffectEvent` gives the latest-value pattern a name that React and the linter understand. `<Activity>` gives "hidden but kept" a real lifecycle. The Compiler moves memoization out of source code and into the build, where it can't drift when someone adds a dependency.
+
+| Task | React 18 | React 19+ |
+|---|---|---|
+| Accept a ref in a function component | `forwardRef((props, ref) => …)` | `function C({ ref, ...props })` |
+| Provide context | `<Ctx.Provider value={v}>` | `<Ctx value={v}>` |
+| Read context conditionally | Not allowed with `useContext` | `use(Ctx)` |
+| Read the latest props in an effect without re-running it | Latest-ref pattern | `useEffectEvent` (19.2+) |
+| Keep hidden UI's state without it running | CSS hiding, or lifted state | `<Activity mode="hidden">` (19.2+) |
+| Memoization | Manual, where it helps | Manual, or the React Compiler |
+
+## How to confirm the fix
+
+1. Check `react` and `react-dom` in the lockfile, and the Compiler in the build config. React DevTools shows a "Memo ✨" badge next to compiled components.
+2. Enable `eslint-plugin-react-hooks` 7 or later with its `recommended` config. It reports ref access and mutation during render, components created during render, and Effect Events called from the wrong place.
+3. For the socket change, filter the Network panel to WS and toggle mute. The connection should stay open, and the chime should follow the new setting.
+4. Run the tests. In code that relied on unstable dependencies, an effect that used to run on every render may now run only when its inputs change, so test the flows that depended on the old timing.
+
+## Watch out for
+
+- **React 18 projects.** `ref` as a prop, `<Ctx value>`, `use`, Actions, `useEffectEvent` and `<Activity>` don't exist there. Keep the older idioms.
+- **TypeScript on React 19.** `useRef` requires an argument (`useRef<HTMLDivElement>(null)`), and a ref callback must not return a value by accident, because React treats a returned function as cleanup. Use a block body: `ref={(node) => { listRef.current = node; }}`.
+- **Bulk removal of old memoization.** Do it in follow-up changes with tests, not in the pull request that turns the Compiler on.
+
+Newer still, React 19.3 makes `<ViewTransition>` stable for animating between UI states. <FixLink slug="reordered-list-jumps" /> compares it with FLIP.

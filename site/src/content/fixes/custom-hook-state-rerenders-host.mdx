@@ -1,0 +1,157 @@
+---
+title: "A window-size hook re-renders the whole app on every resize"
+description: "A window-size hook in the app shell re-renders the whole app on every resize event. Store a coarse breakpoint, and call the hook where its value is used."
+skill: react-rerenders
+kind: performance
+symptom: "Resizing the window is janky, and the Profiler shows the entire app re-rendering on every resize event."
+cause: "A hook in the app shell stores the window size in state, and a hook's state belongs to the component that calls it, so every new size re-renders the whole tree."
+fix: "Store only what the UI needs, such as a breakpoint, subscribe with matchMedia, and call the hook in the component that uses the value."
+tags: [custom hooks, useSyncExternalStore, matchMedia, resize, re-renders]
+react: "18 and 19"
+order: 3
+source: skills/react-rerenders/examples/hooks-that-hide-state.md
+published: 2026-10-01
+related: [typing-lags-state-too-high, context-rerenders-every-consumer, toggling-wrapper-resets-state]
+featured: false
+---
+
+import HookStateDemo from '@/components/demos/HookStateDemo';
+
+An app shell decides whether to show a sidebar based on the window width. It reads the width from a `useWindowSize` hook, the kind many codebases carry from project to project. Resizing the window, or rotating a tablet, makes the whole app stutter.
+
+The Profiler shows why: every resize event re-renders the entire app, from the shell down to the current route, dozens of times per second. Yet the shell only needs to know one thing: is the window narrower than 768 px?
+
+## Reproduce it
+
+<HookStateDemo client:visible />
+
+The slider stands in for resizing the window. With the issue, the shell calls a `useViewportWidth` hook that stores the width in pixels, so dragging the slider re-renders the shell and its heavy children for every pixel. Switch to the fix and drag again. Now the shell calls `useBreakpoint`, which stores only `'compact'` or `'regular'`, so it re-renders once, when the slider crosses the breakpoint.
+
+## Why it happens
+
+```tsx title="AppShell.tsx" bad error="4,12"
+function useWindowSize() {
+  const [size, setSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+  useEffect(() => {
+    const onResize = () => setSize({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  return size;
+}
+
+function AppShell() {
+  const { width } = useWindowSize();
+  const isCompact = width < 768;
+  return (
+    <Layout sidebar={isCompact ? null : <Sidebar />}>
+      <Routes />
+    </Layout>
+  );
+}
+```
+
+A custom hook isn't a separate component. Calling it runs its `useState` and `useEffect` as if they were written in the calling component. So the `size` state belongs to `AppShell`, and every `setSize` re-renders `AppShell` and everything it renders: the layout, the sidebar and every route.
+
+Three things compound:
+
+- **Resize events are frequent.** Dragging a window edge fires them continuously, often once per frame.
+- **Every event stores a new object.** React skips a re-render when the new state is `Object.is`-equal to the old one, but a fresh `{ width, height }` object never is, so even an event that changes nothing re-renders.
+- **The hook sits at the top of the tree**, while the shell only cares whether the width crosses 768 px.
+
+The return value doesn't matter. If `AppShell` called `useWindowSize()` and ignored the result, it would still re-render on every event, because the state lives in it.
+
+## The fix
+
+Store the coarse answer the UI needs, not the raw measurement:
+
+```tsx title="useBreakpoint.ts" good mark="4,10"
+type Breakpoint = 'compact' | 'regular';
+
+function getBreakpoint(): Breakpoint {
+  return window.innerWidth < 768 ? 'compact' : 'regular';
+}
+
+export function useBreakpoint(): Breakpoint {
+  const [breakpoint, setBreakpoint] = useState(getBreakpoint);
+  useEffect(() => {
+    const onResize = () => setBreakpoint(getBreakpoint());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  return breakpoint;
+}
+```
+
+Resize events still fire, but almost every one sets the same string again, and React bails out. `AppShell` now re-renders only when the window crosses 768 px.
+
+This version reads `window` during its first render, so it only works on the client. For server rendering, and to drop the resize listener entirely, subscribe to a media query instead:
+
+```tsx title="useMediaQuery.ts" good mark="12-13"
+export function useMediaQuery(query: string, serverFallback = false): boolean {
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      const mql = window.matchMedia(query);
+      mql.addEventListener('change', onChange);
+      return () => mql.removeEventListener('change', onChange);
+    },
+    [query],
+  );
+  return useSyncExternalStore(
+    subscribe,
+    () => window.matchMedia(query).matches,
+    () => serverFallback,
+  );
+}
+```
+
+A `MediaQueryList` fires `change` only when the query's result flips, so there's nothing to filter. `useSyncExternalStore`, available since React 18, reads the value safely during concurrent rendering, and its third argument supplies the value used on the server and during hydration. Keep the snapshot a primitive: a `getSnapshot` that builds a new object on every call makes React re-render in a loop. The `useCallback` isn't decoration either, because `useSyncExternalStore` re-subscribes whenever `subscribe` changes identity.
+
+Then call the hook where the value is used:
+
+```tsx title="AppShell.tsx" good add="1-4,8"
+function SidebarSlot() {
+  const isCompact = useMediaQuery('(max-width: 767px)');
+  return isCompact ? null : <Sidebar />;
+}
+
+function AppShell() {
+  return (
+    <Layout sidebar={<SidebarSlot />}>
+      <Routes />
+    </Layout>
+  );
+}
+```
+
+Now a breakpoint change re-renders `SidebarSlot` and nothing else.
+
+## Why the fix works
+
+The fixes attack different parts of the problem. A coarse value and a narrow subscription reduce **how often** the host re-renders. Calling the hook in a leaf reduces **what** re-renders. Combine them.
+
+The rule behind both: a hook's state belongs to the component that calls it. Call the hook as low in the tree as its value is needed, and store only as much detail as its readers use.
+
+If the breakpoint only changes styles, a CSS media query does the job with no React state at all. Reach for a hook when the rendered tree changes, as it does with the sidebar here. If the change swaps one wrapper component for another, watch for the remount it causes: see <FixLink slug="toggling-wrapper-resets-state" />.
+
+## How to confirm the fix
+
+1. In React DevTools, enable **Highlight updates when components render** and slowly resize the window. Before the fix, the whole app flashes continuously. After it, nothing flashes until you cross 768 px, and then only the sidebar slot does.
+2. Record a resize in the **Profiler**. Before, you get dozens of commits, each containing the whole tree. After, you get one small commit at the breakpoint.
+
+## Watch out for
+
+Hooks can hide state two levels deep. In this chat page, the layout hook looks harmless:
+
+```tsx title="ChatPage.tsx" bad error="3-4"
+function useChatLayout() {
+  const isCompact = useMediaQuery('(max-width: 767px)');
+  const presence = usePresence(); // socket updates every few seconds
+  const composerHeight = useComposerHeight(); // changes while the user types
+  return { isCompact, columns: isCompact ? 1 : 2 };
+}
+```
+
+`ChatPage` calls `useChatLayout()`, so it re-renders on every presence update and while the user types, even though it reads only `isCompact` and `columns`. Remove the unrelated subscriptions from the layout hook, and call `usePresence` and `useComposerHeight` in the components that display presence and the composer.
+
+When you review a hook called near the top of the tree, check what it holds, including inside the hooks it calls: state, subscriptions and context reads. Ask how often each can change, and whether it stores more detail than its callers use. A hook that returns a new object on every render doesn't cause re-renders by itself, but it breaks `memo` and effect dependencies downstream: see <FixLink slug="memo-component-still-rerenders" />.

@@ -1,0 +1,175 @@
+---
+title: "Reading one field from context still re-renders on every change"
+description: "Destructuring or useMemo can't narrow a context subscription. Pass the slice to a memo child, or move busy shared state to a store you read with a selector."
+skill: react-context
+kind: performance
+symptom: "A cart badge that shows only the item count re-renders whenever anything in the cart context changes, such as the drawer opening or a coupon being typed."
+cause: "Context has no selectors. Every consumer re-renders when the value changes, and a useMemo inside the hook caches a value but can't cancel the render that already started."
+fix: "Split the context first. If that isn't enough, pass a stable slice to a memo child, or keep busy shared state in an external store read through useSyncExternalStore with a selector."
+tags: [useContext, useSyncExternalStore, selectors, Zustand, re-renders]
+react: "18 and 19"
+order: 3
+source: skills/react-context/examples/selecting-from-context.md
+published: 2026-10-01
+related: [action-only-consumers-rerender, memo-component-still-rerenders, custom-hook-state-rerenders-host]
+featured: false
+---
+
+A shop keeps its cart in a context: the items, whether the cart drawer is open, and the coupon code being typed into the drawer. The header's badge shows how many items there are. The product grid marks each of its 200 cards **In cart** or not.
+
+Opening the drawer feels slow, and so does typing a coupon. The Profiler shows the badge and every product card re-rendering each time, although neither the item count nor the cart's contents changed. Someone already tried to narrow it with a hook and `useMemo`. It didn't help.
+
+## Why it happens
+
+Here's that hook:
+
+```tsx title="cart-hooks.ts" bad error="2-3"
+export function useCartCount() {
+  const { items } = useCart(); // subscribes to the whole cart context
+  return useMemo(() => items.length, [items]); // caches the number; can't skip the render
+}
+```
+
+And the product grid, which needs to know which products are in the cart:
+
+```tsx title="ProductGrid.tsx" bad error="2"
+function ProductGrid({ products }: { products: Product[] }) {
+  const { items } = useCart(); // re-renders on every cart change, including the drawer opening
+  const cartIds = new Set(items.map((item) => item.productId));
+  return (
+    <ul className="product-grid">
+      {products.map((product) => (
+        <ProductCard key={product.id} product={product} inCart={cartIds.has(product.id)} />
+      ))}
+    </ul>
+  );
+}
+```
+
+The subscription happens inside `useContext`, which `useCart` calls, before any of your code runs. When the provider's value changes, React compares it with `Object.is`, sees a new object, and re-renders every component that read it. Only then does your hook run. `useMemo` returns the cached number, but the render it was meant to prevent has already happened.
+
+Context has no built-in way to subscribe to part of a value. Destructuring, `useMemo` and wrapper hooks all run after the subscription, so none of them can narrow it. The grid makes the cost visible: its 200 cards don't read the context at all, but they re-render because their parent does.
+
+## The fix
+
+There are three options. Prefer them in this order.
+
+### 1. Split the context
+
+Ask what changes together and who reads it. The items change when someone adds a product. The drawer state and the coupon draft change constantly while the drawer is in use, and only the drawer reads them. Put them in separate contexts, a `CartItemsContext` and a `CartDrawerContext`, and the badge and the grid stop hearing about the drawer. This is usually enough. <FixLink slug="action-only-consumers-rerender" /> shows the same split for state and actions.
+
+### 2. A memoized inner component
+
+When one expensive component needs one stable piece of a busy context, and splitting it isn't worth the churn, put a thin wrapper in front of a `memo` child:
+
+```tsx title="ProductGrid.tsx" good add="1,17-18"
+const ProductGridView = memo(function ProductGridView({ products, cartIds }: {
+  products: Product[];
+  cartIds: ReadonlySet<string>;
+}) {
+  return (
+    <ul className="product-grid">
+      {products.map((product) => (
+        <ProductCard key={product.id} product={product} inCart={cartIds.has(product.id)} />
+      ))}
+    </ul>
+  );
+});
+
+// A thin wrapper: it still re-renders on every cart change, but it's cheap
+function ProductGrid({ products }: { products: Product[] }) {
+  const { items } = useCart();
+  const cartIds = useMemo(() => new Set(items.map((item) => item.productId)), [items]);
+  return <ProductGridView products={products} cartIds={cartIds} />;
+}
+```
+
+The wrapper absorbs the re-render. Opening the drawer re-renders `ProductGrid`, but `items` is the same array, so `useMemo` returns the same `cartIds` set, `memo` sees equal props, and the 200 cards are skipped. This depends on two things: the provider must keep `items` as the same array when other fields change (spreading state, as in `{ ...state, isOpen: true }`, does), and every other prop of the `memo` child must be stable too.
+
+### 3. An external store with selectors
+
+When many components read different slices of state that changes often, keep that state outside React and subscribe with `useSyncExternalStore`. A component then re-renders only when *its selected value* changes:
+
+```tsx title="store.ts" good mark="10,28"
+type Listener = () => void;
+
+export function createStore<T>(initial: T) {
+  let state = initial;
+  const listeners = new Set<Listener>();
+  return {
+    getState: () => state,
+    setState: (update: (prev: T) => T) => {
+      const next = update(state);
+      if (Object.is(next, state)) return;
+      state = next;
+      listeners.forEach((listener) => listener());
+    },
+    subscribe: (listener: Listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+}
+
+export type Store<T> = ReturnType<typeof createStore<T>>;
+
+export function useStore<T, S>(store: Store<T>, selector: (state: T) => S): S {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => selector(store.getState()),
+    () => selector(store.getState()), // the server snapshot, for server rendering
+  );
+}
+```
+
+```tsx title="CartBadge.tsx" good
+export const cartStore = createStore({ items: [] as CartItem[], isOpen: false, coupon: '' });
+
+function CartBadge() {
+  const count = useStore(cartStore, (s) => s.items.length); // a number: re-renders only when it changes
+  return <span className="badge">{count}</span>;
+}
+
+export function addToCart(item: CartItem) {
+  cartStore.setState((s) => ({ ...s, items: [...s.items, item] }));
+}
+```
+
+Typing a coupon now updates the store, React runs each subscriber's selector, and the badge's selector returns the same number, so the badge doesn't re-render.
+
+Once you need middleware, devtools, persistence or many derived selectors, use a library instead of growing a homemade store. Zustand, Redux Toolkit and Jotai all subscribe through selectors:
+
+```tsx title="cart-store.ts" good
+import { create } from 'zustand';
+
+type CartState = { items: CartItem[]; add: (item: CartItem) => void };
+
+export const useCartStore = create<CartState>()((set) => ({
+  items: [],
+  add: (item) => set((s) => ({ items: [...s.items, item] })),
+}));
+
+const count = useCartStore((s) => s.items.length); // a selector subscription
+const add = useCartStore((s) => s.add); // a stable action
+```
+
+## Why the fix works
+
+Each option moves the comparison to a place where it can stop a render. A split context gives each consumer a value that changes only when its own data does. The memoized inner component lets a cheap wrapper take the context update and hands the expensive child props that `memo` can compare. A store goes further: `useSyncExternalStore` calls your selector whenever the store changes and compares the result with the previous one using `Object.is`, so a component re-renders only when the slice it selected is different.
+
+That comparison is also the store's one sharp edge. **A selector must return a primitive, or the same reference when nothing relevant changed.** A selector that builds a new object or array on every call, such as `(s) => ({ count: s.items.length })` or `(s) => s.items.filter(isOnSale)`, looks like a change on every check. That causes extra renders, and React warns in development: "The result of getSnapshot should be cached to avoid an infinite loop". Select the raw slice and derive in the component, or memoize the derivation by its input. With Zustand, `useShallow` keeps object selectors stable, and Redux has `shallowEqual` and `createSelector` for the same job.
+
+## How to confirm the fix
+
+1. In React DevTools, open **Profiler** and turn on **Highlight updates when components render**.
+2. Record while you open the drawer and type a coupon. Before the fix, every commit includes `CartBadge`, `ProductGrid` and all the `ProductCard`s. After it, the commits include only the drawer's components, plus the thin `ProductGrid` wrapper if you chose option 2.
+3. Add a product to the cart. Now the badge and the affected card should re-render, because their slice changed.
+4. Check the console for the `getSnapshot` warning. If it appears, a selector is returning a new object.
+
+## Watch out for
+
+- **One store per provider, when it matters.** A module-level store like `cartStore` is shared by everything that imports it. With server rendering, each request needs its own state, and tests often need a fresh store. Create the store inside a provider and pass it down through context. The context value, the store object itself, never changes, so components subscribe to the store rather than to the context.
+- **Server data doesn't belong here.** Product lists, order history and other server state belong in a data-fetching cache such as TanStack Query or SWR, which handles caching and refetching, not in context or a client store.
+- **Not every context needs this.** A few consumers of a value that rarely changes, like the theme or the signed-in user, are fine with a plain context and a memoized value.

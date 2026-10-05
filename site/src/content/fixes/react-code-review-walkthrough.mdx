@@ -1,0 +1,238 @@
+---
+title: "What a thorough React code review catches in one component"
+description: "A React code review walkthrough: a fetch race, remounting avatars, index keys, broken memo and hover re-renders in one component, ranked by severity with fixes."
+skill: react-best-practices
+kind: bug
+symptom: "A team directory passes a quick demo, but shows the wrong team after fast switching, reloads its avatars on every keystroke and re-renders every card on hover."
+cause: "Six small breaks from the mental model: a fetch without cleanup, a component created during render, index keys, unstable props into memo, pointer state at the top, and a useless useCallback."
+fix: "Review against a checklist, rank findings by user impact, and make small local fixes: abort stale requests, hoist the component, key by ID, stabilize props, move hover state down."
+tags: [code review, race conditions, keys, memo, re-renders]
+react: "18 and 19"
+order: 1
+source: skills/react-best-practices/examples/code-review-walkthrough.md
+published: 2026-10-01
+related: [search-shows-stale-results, input-loses-focus-every-keystroke, memo-component-still-rerenders]
+featured: false
+---
+
+A teammate opens a pull request for `TeamDirectory`: a searchable list of the people on a team, with an expandable card per person and a preview that follows the pointer. It type-checks, and it works when you click through it once. Every line looks reasonable on its own.
+
+This page reviews that component the way the `react-best-practices` skill teaches Claude to. Every finding gets a severity, a scenario someone can reproduce, the rule that explains it, and the smallest fix that removes it. There are six findings, and two of them are bugs a user would report.
+
+## The component under review
+
+```tsx title="TeamDirectory.tsx" bad error="21-23,26,35,39-40" warn="28-30"
+const MemberCard = memo(function MemberCard({ member, style, onMessage, children }: MemberCardProps) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <article style={style} data-id={member.id}>
+      {children}
+      <h3>
+        <button onClick={() => setExpanded((e) => !e)}>{member.name}</button>
+      </h3>
+      {expanded && <MemberDetails member={member} />}
+      <button onClick={() => onMessage()}>Message</button>
+    </article>
+  );
+});
+
+export function TeamDirectory({ teamId }: { teamId: string }) {
+  const [query, setQuery] = useState('');
+  const [members, setMembers] = useState<Member[]>([]);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/teams/${teamId}/members`)
+      .then((r) => r.json())
+      .then(setMembers);
+  }, [teamId]);
+
+  const Avatar = ({ src }: { src: string }) => <img src={src} className="avatar" alt="" />;
+
+  const handleSearch = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setQuery(e.target.value);
+  }, []);
+
+  const visible = members.filter((m) => m.name.toLowerCase().includes(query.toLowerCase()));
+
+  return (
+    <div onMouseMove={(e) => setHoveredId((e.target as HTMLElement).closest('article')?.dataset.id ?? null)}>
+      <input value={query} onChange={handleSearch} placeholder="Search people" />
+      <HoverPreview memberId={hoveredId} />
+      {visible.map((m, i) => (
+        <MemberCard key={i} member={m} style={{ padding: 12 }} onMessage={() => openChat(m.id)}>
+          <Avatar src={m.avatarUrl} />
+        </MemberCard>
+      ))}
+    </div>
+  );
+}
+```
+
+Imports and types are left out.
+
+## The findings
+
+Findings are ordered by severity, then by impact. Line numbers refer to the code above.
+
+### High: switching teams can show the wrong team
+
+**Severity:** High (bug) · **Where:** the effect, lines 20–24
+
+**What happens:** Open team A, then switch to team B before A's members arrive. If A's response lands last, B's page lists A's people. And because `fetch` resolves on HTTP errors, a 500 goes straight into `r.json()`: an error body is stored as if it were the member list, so `members.filter` crashes on it, and a body that isn't JSON becomes an unhandled rejection.
+
+**Why:** The component stays mounted when `teamId` changes, so every request in flight calls the same `setMembers`, and the last response to arrive wins. `fetch` rejects only when the network fails.
+
+**Fix:** abort the previous request in the cleanup, check the status, and surface errors:
+
+```tsx title="TeamDirectory.tsx" good add="2-7,9-12"
+useEffect(() => {
+  const controller = new AbortController();
+  fetch(`/api/teams/${teamId}/members`, { signal: controller.signal })
+    .then((r) => {
+      if (!r.ok) throw new Error(`Members request failed: ${r.status}`);
+      return r.json();
+    })
+    .then(setMembers)
+    .catch((err) => {
+      if (err.name !== 'AbortError') setError(err);
+    });
+  return () => controller.abort();
+}, [teamId]);
+```
+
+`setError` belongs to a new `useState<Error | null>(null)` that the component renders. A data library such as TanStack Query handles cancellation and errors for you. The pattern in depth: <FixLink slug="search-shows-stale-results" />.
+
+### High: avatars remount on every keystroke and hover
+
+**Severity:** High (remount on every render) · **Where:** line 26
+
+**What happens:** Every render of `TeamDirectory`, which means every keystroke in the search box and every hover change, destroys every avatar `<img>` and creates a new one. Images can flicker, and each render pays the cost of mounting every avatar again.
+
+**Why:** `Avatar` is declared inside `TeamDirectory`, so each render creates a new function, and React sees a new component type. Identity is type plus position plus key, so a new type means unmount and mount, along with any state and effects inside.
+
+**Fix:** declare it once, at module scope:
+
+```tsx title="Avatar.tsx" good
+export function Avatar({ src }: { src: string }) {
+  return <img src={src} className="avatar" alt="" />;
+}
+```
+
+The same applies to HOCs and `styled(...)` calls made during render. See <FixLink slug="input-loses-focus-every-keystroke" />.
+
+### Medium: index keys move expanded state to the wrong person
+
+**Severity:** Medium · **Where:** line 39
+
+**What happens:** Expand Priya's card, then type in the search box. The filtered list shifts, and a different person now appears expanded in the slot where Priya was.
+
+**Why:** `key={i}` identifies each card by its position. When filtering changes which member sits at an index, React keeps the instance at that index, including its `expanded` state, and hands it a new member.
+
+**Fix:** key by identity:
+
+```tsx title="TeamDirectory.tsx" good del="1" add="2"
+<MemberCard key={i} member={m} style={{ padding: 12 }} onMessage={() => openChat(m.id)}>
+<MemberCard key={m.id} member={m} style={{ padding: 12 }} onMessage={() => openChat(m.id)}>
+```
+
+This ranks below the two Highs only because the leaked state is a card being open or closed. If each card held a draft message, the same keys would attach typed text to the wrong person, and it would be High.
+
+### Medium: `memo(MemberCard)` never skips a render
+
+**Severity:** Medium (every card, on every keystroke and hover) · **Where:** lines 39–40
+
+**What happens:** Every card re-renders on every keystroke and every hover change, despite `memo`.
+
+**Why:** `memo` skips a render only when every prop is `Object.is`-equal to last time. Three props are new on every render: the `style` object literal, the inline `onMessage` arrow, and `children`, which is a new `<Avatar />` element each time.
+
+**Fix:** make every prop stable, and stop passing what doesn't need to be a prop:
+
+```tsx title="TeamDirectory.tsx" good add="1,3,6-7,9,15"
+const CARD_STYLE: React.CSSProperties = { padding: 12 };
+
+const MemberCard = memo(function MemberCard({ member, onMessage }: MemberCardProps) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <article style={CARD_STYLE} data-id={member.id}>
+      <Avatar src={member.avatarUrl} />
+      {/* name button and details, as before */}
+      <button onClick={() => onMessage(member.id)}>Message</button>
+    </article>
+  );
+});
+
+// In TeamDirectory:
+<MemberCard key={m.id} member={m} onMessage={openChat} />
+```
+
+`openChat` is a module-level function, so its identity never changes, and each `member` object keeps its identity until the list is fetched again. If the cards are cheap, deleting `memo` is an equally valid fix. Measure first.
+
+### Medium: moving the pointer re-renders the whole directory
+
+**Severity:** Medium (pointer frequency, amplified by the finding above) · **Where:** lines 18, 35 and 37
+
+**What happens:** Each time the pointer crosses onto another card, `hoveredId` changes in `TeamDirectory`, which re-renders the search input, the preview and every card. With `memo` broken and `Avatar` remounting, one hover change remounts every avatar on the page.
+
+**Why:** State that changes at pointer frequency lives in the component that renders the whole list, and a state change re-renders everything that component renders.
+
+**Fix:** move the hover state and the preview into a small wrapper that receives the list as `children`:
+
+```tsx title="HoverArea.tsx" good
+function HoverArea({ children }: { children: React.ReactNode }) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  return (
+    <div onMouseMove={(e) => setHoveredId((e.target as HTMLElement).closest('article')?.dataset.id ?? null)}>
+      <HoverPreview memberId={hoveredId} />
+      {children}
+    </div>
+  );
+}
+```
+
+`TeamDirectory` now renders `<HoverArea>{visible.map(…)}</HoverArea>`. A hover change re-renders `HoverArea` and the preview, but the card elements were created by `TeamDirectory` and haven't changed, so React skips them. If the hover effect is purely visual, CSS `:hover` needs no state at all.
+
+### Low: `useCallback` on `handleSearch` does nothing
+
+**Severity:** Low (noise) · **Where:** lines 28–30
+
+**Why:** The callback goes only to a DOM `<input>`, which never compares props, and nothing lists it as a dependency. It adds work to every render and implies a reason that doesn't exist.
+
+**Fix:** inline it:
+
+```tsx title="TeamDirectory.tsx" good
+<input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search people" />
+```
+
+## What the review got right
+
+A useful review does more than list problems. This one has five habits worth copying:
+
+- **It ranks by user impact.** Wrong data and remounts come before wasted renders, which come before noise. A reviewer with ten minutes reads the first two findings and still prevents the bug reports.
+- **Every finding is a scenario.** "Expand Priya, then type" is something a tester can reproduce. "Don't use index keys" is a rule people argue about.
+- **Fixes are small and local.** Nothing proposes rewriting the component, switching libraries or adding a state manager.
+- **Related findings are connected.** The broken `memo` makes the hover problem worse, and the review says so instead of counting the same cost twice.
+- **It says what to keep.** Filtering is derived during render rather than mirrored into state with an effect. `MemberCard` toggles `expanded` with a functional update, and each card owns its own `expanded` state, so expanding one re-renders only that card. Naming these tells the author which choices were right, so the next refactor doesn't undo them.
+
+## Run this review on your own code
+
+The same checks live on <SiteLink to="/checklist/">the review checklist</SiteLink>, grouped by area: re-renders, memoization, identity and keys, effects, context, component APIs, overlays, data fetching, errors, responsiveness, lists, loading and animation. Work through the areas the diff touches, and flag only the items the code actually violates.
+
+Severity comes from what the user experiences, not from which rule broke:
+
+- **High (bug):** users see wrong data, lose input or state, hit a crash or a blank screen, or data is written to the wrong place. Race conditions, state leaking between items, remounts on every render, a missing root error boundary, and effects that loop or leak listeners all belong here.
+- **Medium (performance on a hot path):** work that repeats on keystrokes, scrolling, pointer moves, resizing, animation frames or large lists; synchronous work that blocks an interaction; avoidable delays to the first screen, or layout shifts. Broken memoization counts only when the component is demonstrably expensive.
+- **Low (maintainability):** memoization that prevents nothing, props that keep multiplying, and legacy patterns with no current cost.
+
+"This re-renders" isn't a finding. "This re-renders the 2,000-row table on every keystroke" is.
+
+Write each finding in the same four parts:
+
+```md title="review.md"
+### [High] Switching teams can show the wrong team — `TeamDirectory.tsx:20`
+**What happens:** a scenario a tester could reproduce
+**Why:** the rule from the mental model, in one sentence
+**Fix:** the smallest change that removes it, ideally a diff
+```
+
+End with a short list of what's done well, when something is genuinely worth keeping. If the code is fine, say so: invented findings waste everyone's time. With the skills installed, asking Claude to review a component produces this format by default.

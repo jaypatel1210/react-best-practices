@@ -1,0 +1,177 @@
+---
+title: "Components that only dispatch actions re-render on every change"
+description: "A button or shortcut handler that only calls toggle() re-renders on every context change. Put actions in their own context and build them without reading state."
+skill: react-context
+kind: performance
+symptom: "A large keyboard-shortcut layer that only calls toggle() re-renders every time the sidebar opens or closes, although it never displays the sidebar's state."
+cause: "State and actions share one context value, so each state change gives the value a new identity and every consumer re-renders, including those that only call actions."
+fix: "Split the value into a state context and an actions context, and write the actions with functional updates or useReducer's dispatch so they never change."
+tags: [useContext, useReducer, dispatch, Context, re-renders]
+react: "18 and 19"
+order: 2
+source: skills/react-context/examples/provider-patterns.md
+published: 2026-10-01
+related: [context-rerenders-every-consumer, context-slice-still-rerenders, interval-counter-stuck-at-one]
+featured: false
+---
+
+A project-management app has a collapsible navigation rail. A `RailProvider` holds whether it's collapsed, the rail's button toggles it, and the board shows three columns instead of two when it's collapsed. The provider's value is memoized, as it should be.
+
+Pressing <kbd>[</kbd> also toggles the rail. That shortcut is registered in `ShortcutLayer`, a component that owns every keyboard shortcut in the app and renders the command palette, a long, slow-to-render list. The layer never shows whether the rail is open. Yet the Profiler shows it, and the whole palette, re-rendering on every toggle.
+
+## Why it happens
+
+```tsx title="RailProvider.tsx" bad error="3-4,9"
+function RailProvider({ children }: { children: React.ReactNode }) {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const toggle = useCallback(() => setIsCollapsed(!isCollapsed), [isCollapsed]);
+  const value = useMemo(() => ({ isCollapsed, toggle }), [isCollapsed, toggle]);
+  return <RailContext.Provider value={value}>{children}</RailContext.Provider>;
+}
+
+function ShortcutLayer() {
+  const { toggle } = useRail(); // needs only toggle
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === '[') toggle();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [toggle]);
+
+  return <CommandPalette commands={ALL_COMMANDS} />; // large and slow to render
+}
+```
+
+The memoized value fixes one problem: unrelated renders of the provider no longer create a new value (see <FixLink slug="context-rerenders-every-consumer" />). It can't fix this one, because the value *does* change on every toggle. It has to: `isCollapsed` is in it.
+
+A context subscription covers the whole value. React compares the old and new value with `Object.is` and re-renders every component that read the context, whatever part of it each one uses. Destructuring `{ toggle }` doesn't narrow anything, and wrapping `ShortcutLayer` in `memo` wouldn't help either, because context updates go around `memo`. **The unit of subscription is the context, not the field.**
+
+There's a second, smaller problem. `toggle` reads `isCollapsed`, so `useCallback` has to recreate it whenever the state changes. Every toggle gives `ShortcutLayer` a new `toggle`, so its effect removes the keydown listener and adds it again. Even if you moved `toggle` into a context of its own, that context would change on every toggle too.
+
+## The fix
+
+Give the state and the actions separate contexts, and write the actions so they don't read state:
+
+```tsx title="RailProvider.tsx" good add="3-4,10,14,18-19"
+type RailActions = { toggle: () => void; collapse: () => void; expand: () => void };
+
+const RailStateContext = createContext<boolean | null>(null);
+const RailActionsContext = createContext<RailActions | null>(null);
+
+export function RailProvider({ children }: { children: React.ReactNode }) {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const actions = useMemo<RailActions>(
+    () => ({
+      toggle: () => setIsCollapsed((c) => !c),
+      collapse: () => setIsCollapsed(true),
+      expand: () => setIsCollapsed(false),
+    }),
+    [], // setters are stable, and functional updates remove the dependency on state
+  );
+
+  return (
+    <RailActionsContext.Provider value={actions}>
+      <RailStateContext.Provider value={isCollapsed}>{children}</RailStateContext.Provider>
+    </RailActionsContext.Provider>
+  );
+}
+
+export function useRailCollapsed() {
+  const isCollapsed = useContext(RailStateContext);
+  if (isCollapsed === null) throw new Error('useRailCollapsed must be used inside RailProvider');
+  return isCollapsed;
+}
+
+export function useRailActions() {
+  const actions = useContext(RailActionsContext);
+  if (actions === null) throw new Error('useRailActions must be used inside RailProvider');
+  return actions;
+}
+```
+
+`ShortcutLayer` changes one line:
+
+```tsx title="ShortcutLayer.tsx" good add="2"
+function ShortcutLayer() {
+  const { toggle } = useRailActions(); // the same object for the provider's lifetime
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === '[') toggle();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [toggle]); // now runs once
+
+  return <CommandPalette commands={ALL_COMMANDS} />;
+}
+```
+
+The rail's own button and the board's column layout call `useRailCollapsed()`, so they re-render on a toggle, as they must. `ShortcutLayer` and the command palette don't re-render at all when the rail changes, and the keydown listener is registered once.
+
+## Why the fix works
+
+Two contexts make two subscriptions. A toggle changes `RailStateContext`, so React re-renders the components that read the state. `RailActionsContext` receives the same `actions` object on every render, so its consumers have nothing to react to.
+
+That only holds if the actions really never change, which is why they mustn't read state:
+
+- **Functional updates** let React pass in the current value: `setIsCollapsed((c) => !c)` needs nothing from the render it was created in, so the `useMemo` can have an empty dependency list. `collapse` and `expand` don't read state at all.
+- **State setters are stable.** React guarantees that `setIsCollapsed` keeps its identity, so capturing it once is safe.
+- **The state context holds a primitive.** A boolean needs no memoization, because `Object.is(true, true)` is already `true`.
+
+When the rail grows more state, such as its width and a hover-to-peek mode, a reducer keeps the transitions named and the actions equally stable:
+
+```tsx title="RailProvider.tsx" good mark="14,19,26"
+type RailState = { isCollapsed: boolean; width: number; peek: boolean };
+type RailAction =
+  | { type: 'toggle' }
+  | { type: 'resize'; width: number }
+  | { type: 'peek'; on: boolean };
+
+function railReducer(state: RailState, action: RailAction): RailState {
+  switch (action.type) {
+    case 'toggle':
+      return { ...state, isCollapsed: !state.isCollapsed, peek: false };
+    case 'resize':
+      return { ...state, width: Math.max(56, Math.min(400, action.width)) };
+    case 'peek':
+      return state.isCollapsed ? { ...state, peek: action.on } : state; // unchanged: React bails out
+  }
+}
+
+export function RailProvider({ children }: { children: React.ReactNode }) {
+  const [state, dispatch] = useReducer(railReducer, { isCollapsed: false, width: 240, peek: false });
+  const actions = useMemo(
+    () => ({
+      toggle: () => dispatch({ type: 'toggle' }),
+      resize: (width: number) => dispatch({ type: 'resize', width }),
+      peek: (on: boolean) => dispatch({ type: 'peek', on }),
+    }),
+    [], // dispatch never changes
+  );
+
+  return (
+    <RailActionsContext.Provider value={actions}>
+      <RailStateContext.Provider value={state}>{children}</RailStateContext.Provider>
+    </RailActionsContext.Provider>
+  );
+}
+```
+
+With this shape, the two contexts' types grow to match: the state context holds a `RailState`, and the actions context holds `toggle`, `resize` and `peek`.
+
+`dispatch` is stable, like a setter, so the actions object is created once. The reducer always receives the current state, so an action that depends on state, such as "peek only while collapsed", can't read a stale value. And when a reducer returns the same `state` object, React bails out, so a `peek` on an expanded rail re-renders nobody. A reducer pays off with several related fields and named transitions. For one boolean, functional updates are simpler.
+
+## How to confirm the fix
+
+1. In React DevTools, open **Profiler** and turn on **Highlight updates when components render**.
+2. Record while you press <kbd>[</kbd> a few times. Before the fix, every commit includes `ShortcutLayer` and `CommandPalette`. After it, the commits include only the components that call `useRailCollapsed()`.
+3. Temporarily log from the keydown effect's cleanup. Before the fix, it logs on every toggle, because `toggle` keeps changing. After it, it logs only on unmount. In development, StrictMode also runs one extra setup and cleanup on mount, which is expected.
+
+## Watch out for
+
+- **A convenience hook that merges the contexts.** A `useRail()` that returns `{ isCollapsed, ...actions }` subscribes every caller to the state again. Keep the two hooks separate, and let each component call only the one it needs.
+- **Values that change continuously.** If `width` updates on every frame while the user drags the rail's edge, every state consumer re-renders on every frame, including those that only care about `isCollapsed`. That's the signal to give `width` its own context or to move this state into a store with selectors, as <FixLink slug="context-slice-still-rerenders" /> describes.
+- **Actions that read state through closures.** `toggle = () => setIsCollapsed(!isCollapsed)` inside a `useMemo` with an empty dependency list would freeze `isCollapsed` at its first value. Functional updates avoid this class of stale-closure bug, the same one behind <FixLink slug="interval-counter-stuck-at-one" />.

@@ -1,0 +1,154 @@
+---
+title: "Infinite scroll fires duplicate requests or loops on errors"
+description: "A scroll listener that loads more without guards fetches the same page twice and hammers a failing API. Watch a sentinel, and guard on loading, end and error states."
+skill: react-large-lists
+kind: bug
+symptom: "Scrolling to the end of a feed loads the same page twice and shows duplicate items, the feed starts over after its last page, and a failing API gets a request on every scroll event."
+cause: "The load-more trigger fires whenever the user is near the end, without checking whether a page is already loading, whether more pages exist, or whether the last request failed."
+fix: "Observe a sentinel with IntersectionObserver, and request the next page only when nothing is loading, more pages exist and the last request didn't fail. Retry on click."
+tags: [infinite scroll, IntersectionObserver, useInfiniteQuery, useInView, pagination]
+react: "18 and 19"
+order: 2
+source: skills/react-large-lists/examples/infinite-feed.md
+published: 2026-10-01
+related: [effect-refetches-forever, search-shows-stale-results, huge-table-slow-to-scroll]
+featured: false
+---
+
+A team workspace has an activity feed of comments, status changes and uploads, loaded 30 at a time from a cursor-based API. The first version listens to scroll events and loads more near the bottom. It works in the demo. Then the bug reports come in:
+
+- After a fast scroll, some items appear twice, and React warns about duplicate keys.
+- At the end of the feed, the oldest items are followed by the newest ones again, and it keeps going.
+- During an API outage, the network panel shows hundreds of failed requests from a single user.
+
+All three come from one missing piece: the trigger has no idea what state the feed is in.
+
+## Why it happens
+
+Here's the feed:
+
+```tsx title="ActivityFeed.tsx" bad error="6,14,16"
+function ActivityFeed({ workspaceId }: { workspaceId: string }) {
+  const [items, setItems] = useState<Activity[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+
+  const loadMore = async () => {
+    const page = await fetchActivity(workspaceId, cursor); // a null cursor means "first page"
+    setItems((prev) => [...prev, ...page.items]);
+    setCursor(page.nextCursor);
+  };
+
+  useEffect(() => {
+    const onScroll = () => {
+      const distanceToEnd = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
+      if (distanceToEnd < 600) loadMore();
+    };
+    onScroll(); // load the first page, and more if the screen isn't full
+    window.addEventListener('scroll', onScroll);
+    return () => window.removeEventListener('scroll', onScroll);
+  }, [cursor]);
+
+  return (
+    <ul className="feed">
+      {items.map((item) => (
+        <li key={item.id}>
+          <ActivityItem item={item} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Each symptom has its own cause:
+
+1. **Duplicate requests.** Scroll events fire many times a second while you're within 600 px of the end. Each one calls `loadMore` with the same `cursor`, because nothing records that a request is already in flight. Two responses for the same page append the same items twice.
+2. **A feed that starts over.** The last page returns `nextCursor: null`. That changes `cursor`, so the effect runs again, and a `null` cursor means "first page". The feed fetches page one, then page two, and loops through the whole history.
+3. **A loop on errors.** A failed request leaves no trace in state. The next scroll event near the end sends the request again, and again, as fast as events arrive, with nothing on screen to explain it.
+
+The scroll listener is also wasteful. It runs for every scroll event and reads `scrollHeight`, which can force layout.
+
+## The fix
+
+Let a data library own the pages, observe a sentinel element instead of scroll events, and guard the trigger:
+
+```tsx title="ActivityFeed.tsx" good mark="9,15,34,36-44"
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { useInView } from './use-in-view'; // from the react-large-lists assets
+
+function ActivityFeed({ workspaceId }: { workspaceId: string }) {
+  const feed = useInfiniteQuery({
+    queryKey: ['activity', workspaceId],
+    queryFn: ({ pageParam, signal }) => fetchActivity(workspaceId, pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined, // undefined means no more pages
+  });
+  const { hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage } = feed;
+  const [sentinelRef, nearEnd] = useInView<HTMLDivElement>({ rootMargin: '600px 0px' });
+
+  useEffect(() => {
+    if (nearEnd && hasNextPage && !isFetchingNextPage && !isFetchNextPageError) {
+      fetchNextPage();
+    }
+  }, [nearEnd, hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage]);
+
+  if (feed.status === 'pending') return <FeedSkeleton />;
+  if (feed.status === 'error') return <FeedError onRetry={() => feed.refetch()} />;
+
+  const items = feed.data.pages.flatMap((page) => page.items);
+
+  return (
+    <section aria-label="Activity" aria-busy={isFetchingNextPage}>
+      <ul className="feed">
+        {items.map((item) => (
+          <li key={item.id}>
+            <ActivityItem item={item} />
+          </li>
+        ))}
+      </ul>
+      <div ref={sentinelRef} className="feed__sentinel" />
+      {isFetchingNextPage && <FeedRowsSkeleton count={3} />}
+      {isFetchNextPageError && (
+        <p>
+          Couldn't load more activity. <button onClick={() => fetchNextPage()}>Try again</button>
+        </p>
+      )}
+      {hasNextPage && !isFetchingNextPage && !isFetchNextPageError && (
+        <button onClick={() => fetchNextPage()}>Load more</button>
+      )}
+      {!hasNextPage && <p className="feed__end">You're all caught up.</p>}
+    </section>
+  );
+}
+```
+
+`useInView` comes from the skill's <SiteLink to="/utilities/">tested utilities</SiteLink>. It returns a callback ref and a boolean that changes only when the sentinel crosses the expanded viewport, so the feed re-renders on crossings, not on every scroll.
+
+Each guard closes one hole:
+
+- **`!isFetchingNextPage`: one request at a time.** The trigger can't fire again until the current page settles.
+- **`hasNextPage`: a real end.** `getNextPageParam` returns `undefined` after the last page, so `hasNextPage` turns `false`. The first page has its own explicit `initialPageParam`, so "no next page" can never be mistaken for "start again".
+- **`!isFetchNextPageError`: no loop on errors.** After a failure, automatic requests stop, and the user retries with a button.
+- **The effect re-checks after each page.** It depends on `isFetchingNextPage`, so when a page arrives and the sentinel is still near the viewport, on a tall screen or with short items, it requests the next one. It stops when the screen is full.
+
+## Why the fix works
+
+The trigger is now a function of the feed's state, not of scroll events. Visibility says "the user is close to the end", and the guards decide whether that means a request. Every combination has an answer: loading means wait, ended means show the end, failed means show a retry.
+
+The rest of the component covers what a scroll-only design forgets. **Load more** works for keyboard and screen reader users, and when the observer can't fire, such as in a print view or a test environment. **You're all caught up** tells users the list is complete. Passing `signal` lets TanStack Query cancel a page request when the feed unmounts or the workspace changes, and the workspace ID in the query key keeps two workspaces' pages from ever mixing.
+
+Without a data library, the same four guards apply: a ref-based in-flight flag that's set before the request starts, an explicit "has more" value, an error state that stops automatic loading, and state that resets when `workspaceId` changes.
+
+## How to confirm the fix
+
+1. In the Network panel, scroll to the end quickly a few times. Each cursor is requested once.
+2. Block the feed's URL with DevTools request blocking, then scroll to the end. You'll see one failed request, plus the library's retries, then the **Try again** button and no further requests until you press it. TanStack Query retries a failed query three times by default before reporting the error.
+3. Against an API with three pages, scroll to the bottom. You see the end message, and no request goes out for a fourth page or for page one.
+4. Zoom the page out to 30%. Pages load until the screen is full, then stop.
+
+## Watch out for
+
+- **A scroll container instead of the window.** When the feed scrolls inside an element, pass that element as `useInView`'s `root`. With the viewport as root, the container clips the sentinel, and the `rootMargin` meant to start loading early has no effect.
+- **Thousands of items after a long session.** Every new page re-renders the whole list. Memoize `ActivityItem`, then virtualize, and trigger the next page from the last virtual row's index instead of a DOM sentinel (<FixLink slug="huge-table-slow-to-scroll" />).
+- **New activity at the top.** Inserting it above what the user is reading pushes content down. Show a "3 new updates" button instead.
+- **Memory and the back button.** Cap cached pages with `maxPages` (TanStack Query v5) for feeds that can grow without limit, and restore the scroll position when users come back from an item.

@@ -1,0 +1,172 @@
+---
+title: "Clicks inside a portaled menu trigger the parent's handlers"
+description: "React events bubble through the component tree, not the DOM, so a click in a portaled menu reaches the row's onClick. Stop propagation at the overlay root."
+skill: react-layout-portals
+kind: bug
+symptom: "Clicking Archive in a table row's actions menu archives the order and also opens it, even though the menu's DOM sits at the end of the body."
+cause: "A portal moves DOM nodes but not the React tree, and React's synthetic events bubble through React ancestors, so the row's onClick receives clicks from inside the menu."
+fix: "Stop click and key propagation at the overlay's root element, or have the row ignore events whose target isn't inside its own DOM node."
+tags: [createPortal, event bubbling, stopPropagation, dropdown menus, click outside]
+react: "All versions"
+order: 3
+source: skills/react-layout-portals/examples/portals-and-overlays.md
+published: 2026-10-01
+related: [modal-hidden-under-header, listeners-pile-up-after-navigation, tooltip-flickers-into-place]
+featured: false
+---
+
+An orders table opens an order when you click anywhere on its row. The last cell holds an **Actions** button with a small menu: Archive, Duplicate, Print. The table scrolls horizontally, which clipped the menu, so someone rendered it through a portal into `document.body`.
+
+Now clicking **Archive** archives the order and then navigates to it. The developer checks the Elements panel, sees the menu at the end of `<body>`, nowhere near the row, and can't see how the row receives the click. Keyboard users get the same surprise: pressing <kbd>Enter</kbd> on a menu item also runs the row's key handler.
+
+## Why it happens
+
+```tsx title="OrderRow.tsx" bad error="3"
+function OrderRow({ order, onOpen }: { order: Order; onOpen: (id: string) => void }) {
+  return (
+    <tr onClick={() => onOpen(order.id)}>
+      <td>{order.number}</td>
+      <td>{order.customer}</td>
+      <td>
+        <RowActionsMenu order={order} />
+      </td>
+    </tr>
+  );
+}
+```
+
+```tsx title="RowActionsMenu.tsx" bad error="17"
+function RowActionsMenu({ order }: { order: Order }) {
+  const [isOpen, setIsOpen] = useState(false);
+  return (
+    <>
+      <button
+        aria-haspopup="menu"
+        aria-expanded={isOpen}
+        onClick={(e) => {
+          e.stopPropagation(); // the trigger is inside the row, so it stops its own click
+          setIsOpen((open) => !open);
+        }}
+      >
+        Actions
+      </button>
+      {isOpen &&
+        createPortal(
+          <div role="menu" className="menu">
+            <button role="menuitem" onClick={() => archiveOrder(order.id)}>Archive</button>
+            <button role="menuitem" onClick={() => duplicateOrder(order.id)}>Duplicate</button>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+```
+
+The trigger already stops its own click, because it's a DOM child of the row and the bubbling there is easy to see. The menu looks safe because, in the DOM, it isn't inside the row at all.
+
+But a portal moves DOM nodes, not the React tree. React listens for native events at the root and at each portal container, and when one arrives, it dispatches a synthetic event along the **component** path from the target up to the root. For a click on Archive, that path is the menu item, `RowActionsMenu`, the `<td>`, the `<tr>` and on upward. The `<tr>`'s `onClick` is on that path, so it runs.
+
+Two trees decide two different things:
+
+- **The React tree** decides context, state, re-renders and synthetic events (`onClick`, `onKeyDown`, `onFocus` and the rest).
+- **The DOM tree** decides CSS selectors and inheritance, native `addEventListener` listeners, `contains` and `closest`, form submission, and focus order.
+
+A portal is the one place where those trees disagree, so every behavior on the second list changes, and every behavior on the first list stays where it was.
+
+## The fix
+
+Stop propagation at the overlay's root, so nothing inside the menu reaches its React ancestors:
+
+```tsx title="RowActionsMenu.tsx" good add="6-7"
+{isOpen &&
+  createPortal(
+    <div
+      role="menu"
+      className="menu"
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+    >
+      <button role="menuitem" onClick={() => archiveOrder(order.id)}>Archive</button>
+      <button role="menuitem" onClick={() => duplicateOrder(order.id)}>Duplicate</button>
+    </div>,
+    document.body,
+  )}
+```
+
+The item handlers still run first, because they're deeper in the tree. The event then reaches the menu's root and stops there. Putting the guard in the overlay component protects every consumer at once: rows, cards, list items and anything else that opens this menu and has handlers of its own.
+
+When you can't change the overlay, such as a third-party menu, guard the parent instead. `event.currentTarget` is the row, and `contains` follows the DOM, so a target that lives in a portal fails the check:
+
+```tsx title="OrderRow.tsx" good add="3"
+<tr
+  onClick={(e) => {
+    if (!e.currentTarget.contains(e.target as Node)) return; // came from a portal
+    onOpen(order.id);
+  }}
+>
+```
+
+## Why the fix works
+
+The rule is that React behavior follows the React tree. A synthetic event's propagation is a walk up the component path, so stopping it at the overlay's root cuts that walk off before it reaches the row. The guard in the row works for the opposite reason: it asks a DOM question, and in the DOM the menu was never inside the row.
+
+What you don't need:
+
+- **Moving the menu out of the row in your JSX.** That breaks the component's encapsulation to work around an event rule.
+- **Checking `closest('.menu')` in every parent.** It couples each parent to the menu's markup and breaks when the class changes.
+- **Dropping the portal.** The portal fixed real clipping and stacking problems; see <FixLink slug="modal-hidden-under-header" />.
+
+## How to confirm the fix
+
+1. Open the menu and click **Archive**. The order is archived and the URL doesn't change.
+2. Open the menu with the keyboard, move to **Archive** and press <kbd>Enter</kbd>. The row's key handler doesn't run.
+3. Lock it in with a test. Testing Library's `screen` queries `document.body`, so it finds portaled content:
+
+```tsx title="OrderRow.test.tsx"
+test('menu clicks do not open the order', async () => {
+  const user = userEvent.setup();
+  const onOpen = vi.fn();
+  render(
+    <table>
+      <tbody>
+        <OrderRow order={order} onOpen={onOpen} />
+      </tbody>
+    </table>,
+  );
+  await user.click(screen.getByRole('button', { name: 'Actions' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
+  expect(onOpen).not.toHaveBeenCalled();
+});
+```
+
+## Watch out for
+
+### Click-outside checks that use the DOM
+
+Native listeners and DOM traversal don't see the React tree, so the usual click-outside check treats a click on a menu item as a click outside, and closes the menu before the click lands:
+
+```tsx title="useCloseOnOutsideClick.ts" bad error="3"
+useEffect(() => {
+  const onPointerDown = (e: PointerEvent) => {
+    if (!triggerRef.current?.contains(e.target as Node)) close();
+  };
+  document.addEventListener('pointerdown', onPointerDown);
+  return () => document.removeEventListener('pointerdown', onPointerDown);
+}, [close]);
+```
+
+Check both nodes:
+
+```tsx title="useCloseOnOutsideClick.ts" good
+const target = e.target as Node;
+if (!triggerRef.current?.contains(target) && !menuRef.current?.contains(target)) close();
+```
+
+### `stopPropagation` also stops native listeners on `document`
+
+Since React 17, React listens at the root and portal containers rather than on `document`, and its `stopPropagation()` also stops the native event. A `document` listener for `click`, such as an analytics script, no longer sees clicks inside the menu. A `pointerdown` listener isn't affected, because that's a different event.
+
+### Forms and styles follow the DOM
+
+A submit button inside a portaled dialog doesn't submit a `<form>` that wraps the trigger, so put the form inside the overlay. Selectors like `.orders-table .menu` and CSS variables set on the table don't reach the portal either, so style the overlay with its own classes and define tokens on `:root`.

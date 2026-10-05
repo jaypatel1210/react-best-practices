@@ -1,0 +1,92 @@
+---
+import { SITE } from '../config';
+import { url } from '../lib/urls';
+import BrandMark from './BrandMark.astro';
+import Icon from './Icon.astro';
+
+const NAV = [
+  { href: url('/fixes/'), label: 'Fixes' },
+  { href: url('/skills/'), label: 'Skills' },
+  { href: url('/utilities/'), label: 'Utilities' },
+  { href: url('/checklist/'), label: 'Review checklist' },
+  { href: url('/how-it-works/'), label: 'How it works' },
+];
+
+const path = Astro.url.pathname;
+---
+
+<header class="site-header" data-open="false">
+  <div class="container">
+    <a class="brand" href={url('/')} aria-label={`${SITE.name}, home`}>
+      <BrandMark class="brand-mark" />
+      <span>{SITE.name}</span>
+      <small>15 skills</small>
+    </a>
+
+    <nav class="nav" id="site-nav" aria-label="Main">
+      {
+        NAV.map((item) => (
+          <a href={item.href} aria-current={path.startsWith(item.href) ? 'page' : undefined}>
+            {item.label}
+          </a>
+        ))
+      }
+    </nav>
+
+    <div class="header-actions">
+      <button class="search-trigger" type="button" data-search-open aria-label="Search fixes" aria-haspopup="dialog">
+        <Icon name="search" />
+        <span class="search-label">Search fixes…</span>
+        <kbd>⌘K</kbd>
+      </button>
+      <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="Switch color theme">
+        <Icon name="moon" class="icon-moon" />
+        <Icon name="sun" class="icon-sun" />
+      </button>
+      <a class="icon-button" href={SITE.repo.url} aria-label="Source on GitHub" rel="noopener">
+        <Icon name="github" />
+      </a>
+      <button
+        class="icon-button menu-button"
+        type="button"
+        data-menu-toggle
+        aria-controls="site-nav"
+        aria-expanded="false"
+        aria-label="Open menu"
+      >
+        <Icon name="menu" />
+      </button>
+    </div>
+  </div>
+</header>
+
+<script>
+  const header = document.querySelector<HTMLElement>('.site-header');
+  const menuButton = document.querySelector<HTMLButtonElement>('[data-menu-toggle]');
+
+  menuButton?.addEventListener('click', () => {
+    const open = header?.dataset.open !== 'true';
+    if (header) header.dataset.open = String(open);
+    menuButton.setAttribute('aria-expanded', String(open));
+    menuButton.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && header?.dataset.open === 'true') {
+      header.dataset.open = 'false';
+      menuButton?.setAttribute('aria-expanded', 'false');
+      menuButton?.focus();
+    }
+  });
+
+  document.querySelector('[data-theme-toggle]')?.addEventListener('click', () => {
+    const root = document.documentElement;
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    try {
+      localStorage.setItem('theme', next);
+    } catch {
+      // Storage can be unavailable (private mode, blocked site data); the choice still applies to this page.
+    }
+  });
+</script>

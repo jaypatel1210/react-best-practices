@@ -1,0 +1,133 @@
+---
+title: "The hero image appears late and Largest Contentful Paint fails"
+description: "A hero set as a CSS background from a client-side fetch is found late. Render it as an img in the HTML with fetchPriority high, srcSet and sizes, or preload it."
+skill: react-loading-performance
+kind: performance
+symptom: "The page's main photo shows up well after the text, and Lighthouse or field data reports Largest Contentful Paint above 2.5 seconds."
+cause: "The browser can't request the hero until JavaScript runs, a fetch returns and a CSS background applies, and then the image competes with every other image at full size."
+fix: "Server-render the hero as an img with fetchPriority high, no lazy loading, an accurate srcSet and sizes, and a modern format. Preload it if it has to stay in CSS."
+tags: [LCP, fetchPriority, srcSet, preload, images]
+react: "18 and 19"
+order: 1
+source: skills/react-loading-performance/examples/images-and-fonts.md
+published: 2026-10-01
+related: [text-shifts-when-font-loads, entry-bundle-too-big, spinners-appear-one-after-another]
+featured: false
+---
+
+A product landing page opens with a large hero photo. The headline and buttons appear quickly, but the photo fills in a second or two later. Field data puts Largest Contentful Paint (LCP) at 4.1 seconds on mobile, at the 75th percentile, and the photo is the LCP element.
+
+LCP is good at 2.5 seconds or less and poor above 4 seconds, so this page fails. Before changing anything, find out where the 4.1 seconds go.
+
+## Why it happens
+
+LCP splits into four parts. The `web-vitals` attribution build reports them from real users, and the Performance panel shows the same breakdown for one load:
+
+| LCP part | Time |
+|---|---|
+| Time to first byte | 0.6 s |
+| Resource load delay | 1.9 s |
+| Resource load duration | 1.3 s |
+| Element render delay | 0.3 s |
+
+The largest part is *load delay*: the browser started downloading the image almost two seconds after the HTML arrived. The component explains why:
+
+```tsx title="Hero.tsx" bad error="2-3"
+function Hero() {
+  const { data } = useQuery({ queryKey: ['landing'], queryFn: fetchLandingContent });
+  return <div className="hero" style={{ backgroundImage: data ? `url(${data.heroUrl})` : undefined }} />;
+}
+```
+
+The image URL isn't in the HTML. Before the first byte of the image can arrive, the browser has to download and run the JavaScript bundle, let React render, wait for the content fetch, render again and apply the style. The preload scanner, which looks ahead in the HTML for images and scripts, never sees the URL, because it lives in a JSON response and a CSS background.
+
+Once the download starts, it's slow too: the hero is a 1600 px JPEG, even on a phone, and it shares bandwidth with every screenshot and logo on the page.
+
+## The fix
+
+Render the hero on the server as a real `<img>`, so its URL is in the HTML:
+
+```tsx title="Hero.tsx" good mark="6-9,11"
+function Hero({ hero }: { hero: HeroContent }) {
+  return (
+    <img
+      className="hero__image"
+      src={hero.src}
+      srcSet={hero.srcSet} // "/hero-640.avif 640w, /hero-1080.avif 1080w, /hero-1600.avif 1600w"
+      sizes="(min-width: 1200px) 1200px, 100vw"
+      width={1600}
+      height={900}
+      alt={hero.alt}
+      fetchPriority="high"
+      decoding="async"
+    />
+  );
+}
+```
+
+`hero` comes from the server, through server rendering, static generation, a route loader or a Server Component, not from an effect after hydration. Each attribute does a job:
+
+- **The `<img>` in the HTML** lets the preload scanner request the image as soon as the HTML arrives.
+- **`fetchPriority="high"`** moves it ahead of the screenshots and logos competing for bandwidth. It's a hint, not a guarantee.
+- **No `loading="lazy"`.** A lazy image waits until layout confirms it's in the viewport, which delays the most important image on the page.
+- **`srcSet` with `w` descriptors and an accurate `sizes`** lets a phone pick the 640 px file instead of the 1600 px one. A missing `sizes` means `100vw`, which sends oversized files to narrow slots.
+- **AVIF or WebP**, through an image CDN or a `<picture>` element with a JPEG fallback, often halves the bytes again.
+- **`width` and `height`** reserve the right space before the file arrives, so the image doesn't shift the layout.
+
+In this example, load delay drops to about 0.2 s and load duration to about 0.5 s, and LCP lands at 1.9 s.
+
+React 19 knows the `fetchPriority` prop. Earlier versions may warn about it, so use the lowercase `fetchpriority` attribute there.
+
+### When the image has to stay in CSS
+
+If the hero must remain a CSS background, or JavaScript picks it, preload it so the request starts with the HTML. In React 19, `preload` from `react-dom` puts the tag in `<head>`, and when rendering on the server it sends the hint early:
+
+```tsx title="Hero.tsx" good mark="4-9"
+import { preload } from 'react-dom';
+
+function Hero({ hero }: { hero: HeroContent }) {
+  preload(hero.src, {
+    as: 'image',
+    imageSrcSet: hero.srcSet,
+    imageSizes: '(min-width: 1200px) 1200px, 100vw',
+    fetchPriority: 'high',
+  });
+  return <div className="hero" style={{ backgroundImage: `url(${hero.src})` }} />;
+}
+```
+
+In plain HTML, the same hint is `<link rel="preload" as="image">` with `imagesrcset`, `imagesizes` and `fetchpriority` attributes. The preload must match the real request, including the `srcset` candidates and sizes, or the browser downloads two files and warns that the preload went unused.
+
+## Why the fix works
+
+LCP is the end of a dependency chain, and the fix shortens the chain instead of speeding up its links. The original chain was HTML, then JavaScript, then a fetch, then a render, then the image. The fixed chain is HTML, then the image. The other changes make the remaining link shorter: fewer bytes, higher priority, nothing in front of it.
+
+Framework image components handle `srcSet`, formats and sizes for you, but they can't know which image is the LCP. You still have to mark it. With `next/image` on Next.js 16+, give the hero `loading="eager"` or `fetchPriority="high"`, because the `priority` prop is deprecated there. On Next.js 15 and earlier, use `priority`.
+
+## How to confirm the fix
+
+1. Record a load in the Performance panel with network and CPU throttling, and open the LCP breakdown. *Resource load delay* should be close to zero.
+2. In the Network panel, the hero request should start right after the HTML document, with the parser as its initiator and a high priority.
+3. In the field, log the attribution for real users:
+
+```ts title="report-lcp.ts"
+import { onLCP } from 'web-vitals/attribution';
+
+onLCP(({ value, attribution }) => {
+  sendToAnalytics({
+    value,
+    element: attribution.target,
+    loadDelay: attribution.resourceLoadDelay,
+    loadDuration: attribution.resourceLoadDuration,
+  });
+});
+```
+
+Judge the result by the 75th percentile of mobile page loads over the following weeks. Lab runs explain a slow load, but field data decides whether users still see one.
+
+## Watch out for
+
+- **Client-rendered apps.** In a client-only SPA, LCP can't happen before the JavaScript has downloaded and rendered, so server rendering or static generation is usually the biggest single win. With streaming SSR, keep the hero in the shell, not behind a slow Suspense boundary.
+- **Carousels.** Give only the first slide `fetchPriority="high"`, and lower the others with `fetchPriority="low"`, or they compete with the hero.
+- **Anti-flicker snippets.** A/B testing scripts that hide the page until they load delay LCP directly.
+- **Too many preloads.** Everything preloaded competes for early bandwidth. Preload only the LCP image and the one or two fonts the first screen needs.

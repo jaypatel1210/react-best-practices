@@ -1,0 +1,143 @@
+---
+title: "Code for every route and dialog ships with the first page"
+description: "One 1.1 MB entry chunk holds every route, a rich-text editor and a PDF library. Split by route, lazy-load heavy dialogs, and preload their code on hover or focus."
+skill: react-loading-performance
+kind: performance
+symptom: "The landing screen waits for code it never runs: other routes, a rich-text editor and a PDF library all download before the first page can render."
+cause: "Every route and heavy component is imported statically, so the bundler puts them all in the entry chunk the first page needs."
+fix: "Lazy-load routes and interaction-only UI with React.lazy or the router's lazy option, preload chunks on intent, and wrap lazy regions in sized Suspense fallbacks and an error boundary."
+tags: [code splitting, React.lazy, Suspense, dynamic import, preload]
+react: "18 and 19"
+order: 3
+source: skills/react-loading-performance/examples/code-splitting.md
+published: 2026-10-01
+related: [entry-bundle-too-big, tab-switch-blanks-screen, retry-button-does-nothing]
+featured: false
+---
+
+A project-management app has three routes. Board is the landing screen. Timeline renders a Gantt chart library, and Reports draws charts and exports spreadsheets. Cards open a comment editor built on a rich-text library, and boards can be exported to PDF. Everything ships in one 1.1 MB entry chunk, so the board, which needs a fraction of it, waits for all of it.
+
+Unlike <FixLink slug="entry-bundle-too-big">an over-stuffed bundle</FixLink>, none of this code is unused. Most visits need it later, or not at all.
+
+## Why it happens
+
+The app imports everything at the top:
+
+```tsx title="App.tsx" bad error="2-5"
+import BoardPage from './routes/BoardPage';
+import TimelinePage from './routes/TimelinePage'; // the Gantt library
+import ReportsPage from './routes/ReportsPage'; // charts and a spreadsheet exporter
+import CommentEditor from './CommentEditor'; // a rich-text editor
+import { exportBoardPdf } from './export/pdf'; // a PDF library
+```
+
+A static `import` tells the bundler that the module must be loaded before this one runs, so it goes into the same chunk, or a chunk loaded alongside it. A dynamic `import()` is a split point: the bundler puts that module and everything only it uses into a separate chunk, and the browser downloads it when the code calls `import()`.
+
+So the fix is to turn static imports of late code into dynamic ones, at the right places.
+
+## The fix
+
+### Split by route first
+
+Route-level splitting is the largest win for the least risk. Frameworks do it for you: Next.js, React Router's framework mode and TanStack Router's automatic code splitting all load each route's code on navigation. With React Router's data mode, a route's `lazy` option loads its module, and its loader, when navigation starts:
+
+```tsx title="router.tsx" good mark="7-9"
+const router = createBrowserRouter([
+  {
+    path: '/',
+    Component: AppShell,
+    HydrateFallback: AppShellSkeleton,
+    children: [
+      { index: true, lazy: () => import('./routes/board') },
+      { path: 'timeline', lazy: () => import('./routes/timeline') },
+      { path: 'reports', lazy: () => import('./routes/reports') },
+    ],
+  },
+]);
+```
+
+Without a router that does this, use `lazy` and Suspense, with the boundary inside the shell so the navigation stays on screen:
+
+```tsx title="AppShell.tsx" good mark="1-2,8-10"
+const TimelinePage = lazy(() => import('./routes/TimelinePage')); // used in the route config
+const ReportsPage = lazy(() => import('./routes/ReportsPage'));
+
+function AppShell() {
+  return (
+    <>
+      <TopNav />
+      <Suspense fallback={<PageSkeleton />}>
+        <Outlet />
+      </Suspense>
+    </>
+  );
+}
+```
+
+### Then split by interaction, and preload on intent
+
+The comment editor appears only after a click on **Add a comment**. A lazy chunk starts downloading when React first renders the component, which is right after that click, so start it earlier, on hover or focus:
+
+```tsx title="CardComments.tsx" good mark="1-3,15-16"
+const loadCommentEditor = () => import('./CommentEditor');
+const CommentEditor = lazy(loadCommentEditor);
+const preloadCommentEditor = () => void loadCommentEditor().catch(() => {});
+
+function CardComments({ cardId }: { cardId: string }) {
+  const [isEditing, setIsEditing] = useState(false);
+  return isEditing ? (
+    <Suspense fallback={<EditorPlaceholder rows={4} />}>
+      <CommentEditor cardId={cardId} onDone={() => setIsEditing(false)} />
+    </Suspense>
+  ) : (
+    <button
+      type="button"
+      className="comment-placeholder"
+      onPointerEnter={preloadCommentEditor}
+      onFocus={preloadCommentEditor}
+      onClick={() => setIsEditing(true)}
+    >
+      Add a comment…
+    </button>
+  );
+}
+```
+
+The PDF export doesn't render anything, so it doesn't need `lazy` at all. Import the library inside the handler:
+
+```ts title="exportBoard.ts" good mark="2"
+export async function exportBoard(board: Board) {
+  const { exportBoardPdf } = await import('./export/pdf'); // downloads on the first click, then cached
+  await exportBoardPdf(board);
+}
+```
+
+In this example, the entry chunk drops from 1.1 MB to 310 KB, minified. Timeline and Reports load on navigation, the editor preloads on hover or focus, and the PDF library loads on the first export.
+
+## Why the fix works
+
+Each dynamic `import()` moves a library from "every visit pays for it" to "the visits that use it pay, when they need it". The module loader caches `import()` by URL, so the early call in `preloadCommentEditor` and `lazy`'s later call share one request. Hover and focus usually come 100–300 ms before a click, which is often enough to hide the download completely.
+
+A few rules keep lazy components well behaved:
+
+- **Call `lazy` at module scope.** Inside a component, it creates a new component type on every render, which remounts the subtree and loses its state, the same failure as <FixLink slug="input-loses-focus-every-keystroke" />.
+- **`lazy` expects a default export.** For a named one, map it: `lazy(() => import('./Chart').then((m) => ({ default: m.Chart })))`.
+- **Size the fallback like the content.** `EditorPlaceholder` has the editor's height, so the card doesn't jump when the editor replaces it.
+- **Navigate in a transition.** Routers do this. React then keeps the current page visible while the next route's chunk loads, instead of flashing the skeleton (<FixLink slug="tab-switch-blanks-screen" />).
+- **Start the data with the code.** Prefetch the editor's query in the same hover handler, or the chunk arrives and then waits for its data.
+
+## How to confirm the fix
+
+1. Open the bundle report. Timeline, Reports, the editor and the PDF library should each sit in their own chunk.
+2. Reload the board with the Network panel open, filtered to JavaScript. Only the shell and board chunks should download.
+3. Hover **Add a comment** and watch the editor's chunk download. Click, and the editor should appear without a visible wait.
+4. Throttle the network, click through each lazy region, and check that no fallback makes the layout jump.
+
+If a "lazy" library is still in the entry chunk, look for another static import that pulls it in. A shared `components/index.ts` that re-exports `CommentEditor`, imported by the board for an `Avatar`, drags the editor back. Also check vendor chunk rules that bundle every `node_modules` package into one chunk loaded on the first page.
+
+## Watch out for
+
+- **Failed chunk loads after a deploy.** Users with the old page open request chunk files that no longer exist, and the import fails with errors like "Failed to fetch dynamically imported module" (Vite) or `ChunkLoadError` (webpack). Put an error boundary with a **Reload** action around lazy regions. `React.lazy` caches a rejected import, so re-rendering the same lazy component throws the same error again, and a retry button that only re-renders can't fix it (<FixLink slug="retry-button-does-nothing" />).
+- **Splitting too small.** Each chunk costs a request and a loading state. Don't split small or always-visible components.
+- **A split point that's too low.** Lazy-loading a small toolbar while the route statically imports the heavy library elsewhere saves nothing. Split at the module that imports the library.
+- **Unused code.** Splitting moves code. If a chunk is full of code nobody runs, trim it first: <FixLink slug="entry-bundle-too-big" />.

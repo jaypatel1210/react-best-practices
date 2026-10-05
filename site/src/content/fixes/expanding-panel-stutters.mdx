@@ -1,0 +1,121 @@
+---
+title: "An expanding panel stutters because it animates height"
+description: "Animating height forces layout on every frame, so a busy page drops frames. Open the box in one step and animate the content with transform and opacity instead."
+skill: react-animation
+kind: performance
+symptom: "Opening an accordion section or details panel judders, especially on a long page or while the app is busy, and the Performance panel shows Layout on every frame."
+cause: "The animation changes height, a layout property, so every frame recalculates layout for the panel and everything after it, on the main thread."
+fix: "Toggle a data attribute, open the box in a single layout, and animate the content with transform and opacity, which the compositor can run without layout."
+tags: [CSS transitions, height, transform, layout, accordion]
+react: "All versions"
+order: 1
+source: skills/react-animation/examples/choosing-what-to-animate.md
+published: 2026-10-01
+related: [animation-freezes-during-work, drag-stutters-on-pointermove, long-page-slow-first-render]
+featured: false
+---
+
+import PanelAnimationDemo from '@/components/demos/PanelAnimationDemo';
+
+A checkout page summarizes an order in three collapsible sections: shipping, payment and items. Each section slides open over a quarter of a second. On a fast laptop it looks polished. On a mid-range phone, or while live prices stream into the page, the panels jerk open in a few uneven steps, and the totals below them hop downward.
+
+The animation code is short and looks harmless. The problem is which property it animates.
+
+## Reproduce it
+
+<PanelAnimationDemo client:visible />
+
+Open and close a few panels with the issue, then tick **Busy main thread**, which burns 40 ms in every frame, the way a page with heavy rendering or a third-party script can. The height animation now advances in visible steps, and the order total jumps with it. Switch to the fix and repeat: the box opens in one step, and the content's slide and fade stays smooth even with the thread busy. The chips show which rendering stages each frame of the animation needs.
+
+## Why it happens
+
+```tsx title="DetailsPanel.tsx" bad error="6-7,10"
+function DetailsPanel({ open, children }: { open: boolean; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(0);
+
+  useLayoutEffect(() => {
+    setHeight(open ? ref.current!.scrollHeight : 0);
+  }, [open, children]);
+
+  return (
+    <div style={{ height, overflow: 'hidden', transition: 'height 250ms' }}>
+      <div ref={ref}>{children}</div>
+    </div>
+  );
+}
+```
+
+After any style change, the browser runs up to four stages to produce a frame: it recalculates styles, redoes **layout** (sizes and positions), **paints** the changed pixels, and **composites** the layers together. Which stages run depends on what changed:
+
+| Changing… | Costs |
+|---|---|
+| Size, position, margins, fonts (`width`, `height`, `top`, `left`, `padding`) | Layout, paint and compositing |
+| Colors, backgrounds, shadows, border radius | Paint and compositing |
+| `transform` and `opacity` | Compositing only |
+
+`height` is in the top row. Every frame of the transition lays out the panel and everything that flows after it, because each sibling below moves, and then repaints the area. All of that runs on the main thread, alongside React rendering, your event handlers and every other script. A frame lasts 16.7 ms at 60 Hz. When the main thread is already busy for 40 ms at a time, the transition can only advance between those tasks, so it moves in jumps.
+
+Two smaller costs ride along. Reading `scrollHeight` forces a synchronous layout, and because `children` is a new element on every parent render, the layout effect runs, and forces that layout, every time the parent renders, not only when the panel opens.
+
+## The fix
+
+Stop animating the box. Let it open in one step and animate the content inside it, with properties the compositor can handle:
+
+```tsx title="DetailsPanel.tsx" good
+function DetailsPanel({ open, children }: { open: boolean; children: React.ReactNode }) {
+  return (
+    <div className="details" data-open={open}>
+      <div className="details__content" hidden={!open}>
+        {children}
+      </div>
+    </div>
+  );
+}
+```
+
+```css title="details.css" good
+.details {
+  overflow: hidden;
+}
+
+.details[data-open='true'] > .details__content {
+  animation: details-in 200ms ease-out;
+}
+
+@keyframes details-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+```
+
+The component now only toggles an attribute. There's no state that changes per frame, no measuring and no layout effect. Opening the panel costs one layout, when the content appears, and the motion after that is a `transform` and `opacity` animation. The `hidden` attribute keeps closed content out of the accessibility tree and the tab order, and a CSS animation restarts each time the content goes from hidden to shown.
+
+## Why the fix works
+
+Once a `transform` or `opacity` animation starts, the browser gives the element its own layer and hands the animation to the compositor, which moves and fades the already-painted layer without touching layout or paint. In Chromium, Firefox and Safari, that work happens off the main thread in the common case, which is why it stays smooth while scripts run. The main thread still does the setup frame, so a busy thread can delay the start by one task, but it can't make the motion stutter.
+
+The skill describes two other options. Both still lay out on every frame, so choose them with that in mind:
+
+- **A grid row transition.** Transitioning `grid-template-rows` from `0fr` to `1fr` animates the real size with no JavaScript measuring. It's fine for a small, isolated panel, ideally inside `contain: layout paint` when nothing needs to overflow it. Avoid it for tall content or a long page below.
+- **`interpolate-size: allow-keywords`.** This lets `height` transition to `auto` directly in Chromium-based browsers. Treat it as a progressive enhancement, since other browsers snap open, and remember it's still a height animation.
+
+## How to confirm the fix
+
+1. In Chrome DevTools, open the Performance panel, set CPU throttling to 4× or 6×, and record while you open a panel.
+2. Before the fix, purple **Layout** and green **Paint** blocks repeat on every frame of the transition, and the Frames track shows dropped frames. After it, there's one layout at the start, then frames with no layout or paint work for the panel.
+3. Open the **Rendering** drawer and enable **Paint flashing**. Before, the panel and everything below it flash on every frame. After, they flash once.
+4. The **Layers** panel lists the animating content on its own layer, with an active animation as the reason.
+
+## Watch out for
+
+- **Exit animations.** The fix closes instantly. To animate closing, keep the content mounted until the exit animation's `animationend` fires, the way a toast waits before it unmounts. A motion library's presence component handles this for lists.
+- **`will-change` everywhere.** The browser promotes running `transform` animations by itself. Adding `will-change` to every panel "for performance" spends layer memory on elements that aren't moving.
+- **Reduced motion.** Honor `prefers-reduced-motion: reduce` with a near-instant duration rather than `animation: none`, so code waiting for `animationend` still runs. Keep short fades if they help people follow the change.
+- **Many panels at once.** "Expand all" with a height animation lays out the page once per panel per frame. With the fix, it's one layout, then composited motion.
+
+## When this isn't enough
+
+Sometimes the design calls for the box itself to grow, with the content below sliding down smoothly. That's a layout change, and the composited way to animate it is FLIP: measure the siblings' positions before and after the panel opens, then animate each one from its old position with `transform`. See <FixLink slug="reordered-list-jumps" />, or use a library's layout animations when the project has one.

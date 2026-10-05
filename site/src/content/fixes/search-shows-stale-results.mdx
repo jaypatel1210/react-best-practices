@@ -1,0 +1,187 @@
+---
+title: "Search shows results for an old query after fast typing"
+description: "Responses can arrive out of order, so an older, slower request overwrites newer results. Abort the previous request in the effect cleanup, or ignore its result."
+skill: react-data-fetching
+kind: bug
+symptom: "After fast typing, the results on screen belong to an earlier, shorter query than the one in the search box."
+cause: "Every keystroke starts a request, and every response calls the same state setter. The last response to arrive wins, not the last one requested."
+fix: "Abort the previous request in the effect's cleanup with AbortController, or ignore its result with a flag, so only the latest query can set state."
+tags: [useEffect, race conditions, AbortController, data fetching, search]
+react: "All versions"
+order: 1
+source: skills/react-data-fetching/examples/race-conditions.md
+published: 2026-10-01
+related: [debounce-fires-every-keystroke, screen-blanks-between-items, effect-refetches-forever]
+featured: true
+---
+
+import RaceConditionDemo from '@/components/demos/RaceConditionDemo';
+
+A package registry has a search box that queries the API as you type. A user types `react` quickly and gets a list of results that starts with `redux` and `rxjs`. The search box says `react`. The results are for `r`.
+
+It never happens on localhost, where every response takes 5 ms. It happens in production, where a one-letter query matches thousands of packages and takes longer than a precise one. Users describe it as "search is random", and some of them click a wrong result before they notice.
+
+## Reproduce it
+
+<RaceConditionDemo client:visible />
+
+With the issue, press **Type "react" quickly** and wait. In this demo shorter queries are slower, so the request for `r` finishes last. The log shows the response for `react` landing first, then the older ones overwriting it. Switch to the fix and type again: each earlier request is aborted, and the results always match the box.
+
+## Why it happens
+
+Here's the search. `searchPackages` wraps `fetch`, checks `res.ok` and parses the JSON:
+
+```tsx title="PackageSearch.tsx" bad error="7"
+function PackageSearch() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<Package[]>([]);
+
+  useEffect(() => {
+    if (query === '') return;
+    searchPackages(query).then(setResults); // any response, from any past keystroke, can land here
+  }, [query]);
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search packages" />
+      <ResultList results={results} />
+    </>
+  );
+}
+```
+
+Each keystroke changes `query`, so the effect runs again and starts another request. Nothing stops the previous ones. Five keystrokes give five requests in flight at once, and every one of them ends by calling the same `setResults`.
+
+The network makes no promise about order. A short query matches more rows, a cache can be warm for one query and cold for the next, and two requests can take different routes. Here's one plausible run:
+
+1. `r` is sent at 0 ms and takes 1.3 s.
+2. `re`, `rea` and `reac` follow at 140 ms intervals, each a bit faster.
+3. `react` is sent at 560 ms and takes 300 ms. Its results appear at 860 ms. Correct, so far.
+4. The older responses arrive one by one. `r` arrives last, at 1.3 s, and its results replace the correct ones.
+
+The rule to remember: **the last response to resolve wins, not the last one requested.** `async`/`await` doesn't change that. It's the same race with different syntax.
+
+## The fix
+
+Make each effect run responsible for its own request, and cancel that request when the run becomes obsolete:
+
+```tsx title="PackageSearch.tsx" good add="4,8-9,14-17,23"
+function PackageSearch() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<Package[]>([]);
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    if (query === '') return;
+    const controller = new AbortController();
+    searchPackages(query, controller.signal)
+      .then((hits) => {
+        setResults(hits);
+        setError(null);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted) setError(err); // an abort means superseded, not failed
+      });
+    return () => controller.abort(); // runs before the next effect, and on unmount
+  }, [query]);
+
+  return (
+    <>
+      <input value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search packages" />
+      {error ? <p role="alert">Search failed. Try again.</p> : <ResultList results={results} />}
+    </>
+  );
+}
+
+async function searchPackages(query: string, signal?: AbortSignal): Promise<Package[]> {
+  const res = await fetch(`/api/packages?q=${encodeURIComponent(query)}`, { signal });
+  if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+  return res.json();
+}
+```
+
+When `query` changes, React runs the previous effect's cleanup before it runs the next effect. The cleanup aborts the older request, so its promise rejects instead of resolving, and it can never reach `setResults`. The browser also stops downloading it.
+
+The `catch` checks `controller.signal.aborted` rather than the error's name, because that check works whatever reason the abort was given. An `AbortError` name only appears when `abort()` is called without a reason.
+
+## Why the fix works
+
+Each effect run gets its own `controller`, captured by its own callbacks. The cleanup flips only the obsolete run. So at any moment, exactly one run is allowed to write state: the one that matches the current `query`.
+
+When the async work can't be cancelled, such as an SDK call, IndexedDB or a message from a worker, use an ignore flag. It follows the same rule:
+
+```tsx title="PackageSearch.tsx"
+useEffect(() => {
+  if (query === '') return;
+  let ignore = false;
+  registryClient.search(query).then((hits) => {
+    if (!ignore) setResults(hits);
+  });
+  return () => {
+    ignore = true; // this run is obsolete from now on
+  };
+}, [query]);
+```
+
+Prefer `AbortController` for `fetch`, because it also saves the bandwidth and server work of responses nobody will see.
+
+These look like fixes, and aren't:
+
+- **A `loading` flag that blocks new searches.** Users can't type past a slow request, and a stale response still wins if the flag resets early.
+- **Removing StrictMode** because the effect fires twice in development. That double run checks your cleanup. With the fix in place, the first request is aborted and costs nothing.
+- **`key={query}` on the results component.** Remounting drops stale updates, but it also throws away the component's state and re-runs every effect below it.
+
+## How to confirm the fix
+
+1. Make latency vary in development. With a mock server such as MSW, delay each response by an amount that shrinks as the query gets longer.
+2. Type fast, then open the **Network** panel. With the fix, every request except the last shows as cancelled.
+3. Pin it with a test that resolves the responses in the wrong order:
+
+```tsx title="PackageSearch.test.tsx"
+it('keeps the latest results when an older response arrives last', async () => {
+  const resolvers = new Map<string, (hits: Package[]) => void>();
+  vi.mocked(searchPackages).mockImplementation(
+    (query, signal) =>
+      new Promise((resolve, reject) => {
+        resolvers.set(query, resolve);
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      }),
+  );
+  render(<PackageSearch />);
+  await userEvent.type(screen.getByLabelText('Search packages'), 'ab');
+
+  await act(async () => resolvers.get('ab')!([{ name: 'ab-latest' }]));
+  await act(async () => resolvers.get('a')!([{ name: 'a-stale' }])); // the older response lands last
+
+  expect(screen.getByText('ab-latest')).toBeTruthy();
+  expect(screen.queryByText('a-stale')).toBeNull();
+});
+```
+
+Without the fix, the test fails on the last line.
+
+## Watch out for
+
+Searches started from an event handler, rather than an effect, have no cleanup to lean on. Keep the in-flight controller in a ref, and abort it before starting the next request:
+
+```tsx title="useLatestRequest.ts"
+const controllerRef = useRef<AbortController | null>(null);
+useEffect(() => () => controllerRef.current?.abort(), []); // abort on unmount
+
+async function runSearch(query: string) {
+  controllerRef.current?.abort();
+  const controller = new AbortController();
+  controllerRef.current = controller;
+  try {
+    setResults(await searchPackages(query, controller.signal));
+  } catch (err) {
+    if (!controller.signal.aborted) setError(err as Error);
+  }
+}
+```
+
+A debounce pairs well with either version, but it doesn't replace them. Debouncing controls *how many* requests start. Aborting controls *which response* may land. See <FixLink slug="debounce-fires-every-keystroke" />.
+
+## When this isn't enough
+
+If the app already uses a data library, let it own this. TanStack Query stores each result under its query key, so a response for `['packages', 'r']` can't show up as the results for `['packages', 'react']`. Pass the `signal` it gives your query function to `fetch`, so obsolete requests are cancelled too. Seeing the list blank out to a spinner on every keystroke? Keeping the previous results on screen is covered in <FixLink slug="screen-blanks-between-items" />.

@@ -1,0 +1,371 @@
+---
+import { getEntry, render } from 'astro:content';
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import FixCard from '@/components/FixCard.astro';
+import Icon from '@/components/Icon.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import { repoUrl } from '@/config';
+import { UTILITIES } from '@/data/utilities';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getFixes, getSkills, GROUP_LABEL, type Skill } from '@/lib/content';
+import { skillFiles } from '@/lib/repo';
+import { breadcrumbs, itemList } from '@/lib/seo';
+import { skillUrl, utilityUrl } from '@/lib/urls';
+
+export async function getStaticPaths() {
+  const skills = await getSkills();
+  return skills.map((skill, i) => ({
+    params: { skill: skill.id },
+    props: { skill, prev: skills[i - 1], next: skills[i + 1] },
+  }));
+}
+
+interface Props {
+  skill: Skill;
+  prev?: Skill;
+  next?: Skill;
+}
+
+const { skill, prev, next } = Astro.props;
+const { title, headline, description, group, rules, prompts } = skill.data;
+const { Content } = await render(skill);
+const doc = await getEntry('skillDocs', skill.id);
+if (!doc) throw new Error(`No skills/${skill.id}/SKILL.md for the site page src/content/skills/${skill.id}.md.`);
+
+const fixes = (await getFixes()).filter((f) => f.data.skill === skill.id);
+const files = skillFiles(skill.id);
+const utilities = UTILITIES.filter((u) => u.skill === skill.id);
+const fileName = (path: string) => path.split('/').pop();
+
+const path = `/skills/${skill.id}/`;
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Skills', path: '/skills/' },
+  { name: title, path },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  itemList(
+    `${title}: fixes`,
+    fixes.map((f) => ({ name: f.data.title, path: `/fixes/${f.id}/` })),
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={`${title}: the ${skill.id} skill`} description={description} og={`skills/${skill.id}`} schema={schema}>
+  <div class="container">
+    <header class="page-head skill-head">
+      <Breadcrumbs items={crumbs} />
+      <div class="cluster">
+        <span class="badge badge-skill">{skill.id}</span>
+        <span class="badge badge-muted">{GROUP_LABEL[group]}</span>
+        <span class="badge badge-muted">{fixes.length} {fixes.length === 1 ? 'fix' : 'fixes'}</span>
+      </div>
+      <h1>{title}</h1>
+      <p class="lede">{headline}</p>
+    </header>
+
+    <div class="skill-layout">
+      <div class="skill-main">
+        <section class="prose" aria-labelledby="about-title">
+          <h2 id="about-title">What this skill teaches Claude</h2>
+          <Content />
+        </section>
+
+        <section class="rules" aria-labelledby="rules-title">
+          <h2 id="rules-title">Rules worth remembering</h2>
+          <ol>
+            {rules.map((rule) => <li>{rule}</li>)}
+          </ol>
+        </section>
+
+        {
+          fixes.length > 0 && (
+            <section aria-labelledby="fixes-title">
+              <h2 id="fixes-title" class="section-title">
+                Fixes in this skill
+              </h2>
+              <div class="grid grid-2">
+                {fixes.map((fix) => (
+                  <FixCard fix={fix} />
+                ))}
+              </div>
+            </section>
+          )
+        }
+      </div>
+
+      <aside class="skill-side">
+        <section class="side-card" aria-labelledby="prompts-title">
+          <h2 id="prompts-title">Say this to Claude</h2>
+          <ul class="prompts">
+            {prompts.map((prompt) => <li>“{prompt}”</li>)}
+          </ul>
+          <p class="side-note">You don’t name the skill. Claude loads it when what you ask matches its description.</p>
+        </section>
+
+        <section class="side-card" aria-labelledby="desc-title">
+          <h2 id="desc-title">How it describes itself</h2>
+          <p class="skill-desc">{doc.data.description}</p>
+          <p class="side-note">This is the description in SKILL.md that Claude reads to decide when to load it.</p>
+        </section>
+
+        <section class="side-card" aria-labelledby="files-title">
+          <h2 id="files-title">What’s in the folder</h2>
+          <ul class="files">
+            <li>
+              <a href={repoUrl(`skills/${skill.id}/SKILL.md`)} rel="noopener"><code>SKILL.md</code></a>
+              <span>about {files.skillTokens.toLocaleString('en-US')} tokens</span>
+            </li>
+            {
+              files.examples.map((file) => (
+                <li>
+                  <a href={repoUrl(file)} rel="noopener">
+                    <code>examples/{fileName(file)}</code>
+                  </a>
+                </li>
+              ))
+            }
+            {
+              files.references.map((file) => (
+                <li>
+                  <a href={repoUrl(file)} rel="noopener">
+                    <code>references/{fileName(file)}</code>
+                  </a>
+                </li>
+              ))
+            }
+            {
+              files.assets.map((file) => (
+                <li>
+                  <a href={repoUrl(file)} rel="noopener">
+                    <code>assets/{fileName(file)}</code>
+                  </a>
+                </li>
+              ))
+            }
+          </ul>
+          {
+            utilities.length > 0 && (
+              <p class="side-note">
+                Tested code from this skill:{' '}
+                {utilities.map((u, i) => (
+                  <>
+                    {i > 0 && ', '}
+                    <a href={utilityUrl(u.slug)}>{u.name}</a>
+                  </>
+                ))}
+                .
+              </p>
+            )
+          }
+        </section>
+      </aside>
+    </div>
+
+    <section class="skill-install" aria-labelledby="install-title">
+      <div>
+        <h2 id="install-title">Install the skills</h2>
+        <p>All fifteen skills ship together as one Claude Code plugin. Each works on its own, too.</p>
+      </div>
+      <InstallBlock compact />
+    </section>
+
+    <nav class="pager" aria-label="Previous and next skill">
+      {
+        prev && (
+          <a class="prev" href={skillUrl(prev.id)} rel="prev">
+            <span>← Previous skill</span>
+            {prev.data.title}
+          </a>
+        )
+      }
+      {
+        next && (
+          <a class="next" href={skillUrl(next.id)} rel="next">
+            <span>Next skill →</span>
+            {next.data.title}
+          </a>
+        )
+      }
+    </nav>
+    <p class="skill-source">
+      <Icon name="github" size={16} />
+      <a href={repoUrl(`skills/${skill.id}`, 'tree')} rel="noopener">Browse <code>skills/{skill.id}</code> on GitHub</a>
+    </p>
+  </div>
+</BaseLayout>
+
+<style>
+  .skill-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 48px;
+    align-items: start;
+  }
+
+  .skill-main {
+    display: grid;
+    gap: 48px;
+    min-width: 0;
+  }
+
+  .skill-main .prose h2,
+  .section-title,
+  .rules h2 {
+    font-size: 1.45rem;
+    margin: 0 0 14px;
+  }
+
+  .rules ol {
+    counter-reset: rule;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+
+  .rules li {
+    counter-increment: rule;
+    display: grid;
+    grid-template-columns: 32px 1fr;
+    gap: 12px;
+    align-items: start;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    line-height: 1.55;
+  }
+
+  .rules li::before {
+    content: counter(rule);
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: var(--brand-soft);
+    color: var(--brand);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+
+  .skill-side {
+    position: sticky;
+    top: calc(var(--header-h) + 20px);
+    display: grid;
+    gap: 16px;
+  }
+
+  .side-card {
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .side-card h2 {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin-bottom: 12px;
+  }
+
+  .prompts {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+  }
+
+  .prompts li {
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    font-size: 0.94rem;
+  }
+
+  .skill-desc {
+    font-size: 0.9rem;
+    color: var(--text-2);
+    line-height: 1.6;
+  }
+
+  .side-note {
+    margin-top: 10px;
+    font-size: 0.82rem;
+    color: var(--text-3);
+  }
+
+  .files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+    font-size: 0.86rem;
+  }
+
+  .files li {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .files span {
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+
+  .skill-install {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: 24px;
+    align-items: center;
+    margin-top: 56px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+
+  .skill-install h2 {
+    font-size: 1.35rem;
+    margin-bottom: 8px;
+  }
+
+  .skill-install p {
+    color: var(--text-2);
+  }
+
+  .pager {
+    margin-top: 40px;
+  }
+
+  .skill-source {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 24px;
+    color: var(--text-3);
+    font-size: 0.9rem;
+  }
+
+  @media (max-width: 1000px) {
+    .skill-layout,
+    .skill-install {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .skill-side {
+      position: static;
+    }
+  }
+</style>

@@ -4,7 +4,7 @@
 import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { analyzeScenario, scenariosOf } from './analyze.mjs';
-import { benchMarkdown, comparisonRows, flowLine, ms, responseMs, speedHeadline } from './bench.mjs';
+import { aaText, benchMarkdown, comparisonRows, flowLine, ms, refreshAnalysis, responseMs, speedHeadline } from './bench.mjs';
 import { readChanges } from './changes.mjs';
 import { compareScenario } from './compare.mjs';
 import { ratingLabel } from './stats.mjs';
@@ -70,7 +70,7 @@ function benchOf(audit, requested) {
     .map((entry) => entry.name);
   if (requested && !labels.includes(requested)) throw new Error(`--bench ${requested} not found (have: ${labels.join(', ') || 'none'})`);
   const label = requested || labels[labels.length - 1];
-  return label ? { label, dir: join('bench', label), data: readJson(join(root, label, 'bench.json')) } : null;
+  return label ? { label, dir: join('bench', label), data: refreshAnalysis(readJson(join(root, label, 'bench.json'))) } : null;
 }
 
 function fieldOf(audit) {
@@ -84,8 +84,10 @@ function fieldOf(audit) {
 
 const IMPACT_CLASS = { high: 'good', medium: 'good', low: 'muted', none: 'muted' };
 function impactHtml(impact) {
+  if (impact && impact.judged === false) return '<span class="muted">not judged (too few pairs)</span>';
   if (!impact || impact.level === 'none') return '<span class="muted">no measurable change</span>';
   if (impact.direction === 'worse') return `<span class="bad">slower · ${esc(impact.level)}</span>`;
+  if (impact.direction === 'mixed') return `<span class="bad">mixed · ${esc(impact.level)}</span>`;
   return `<span class="${IMPACT_CLASS[impact.level]}">${esc(impact.level)}</span>`;
 }
 
@@ -105,9 +107,13 @@ function speedHtml(bench) {
         html.push(`<tr><td>${esc(row.index)}</td><td>${esc(row.name)}${row.impact.level !== 'none' ? `<br><span class="muted">${esc(row.reasons.join('; '))}</span>` : ''}</td><td>${esc(row.metric)}</td><td><span class="was">${esc(row.beforeText)}</span> → <strong>${esc(row.afterText)}</strong></td><td>${esc(row.change)}${row.relative ? `<br><span class="muted">${esc(row.relative)}</span>` : ''}</td><td>${esc(row.rating)}</td><td>${impactHtml(row.impact)}</td></tr>`);
       }
       html.push('</tbody></table>');
-      html.push(`<p><strong>Whole flow:</strong> ${esc(flowLine(item))} — ${impactHtml(item.analysis.flow.impact)}</p>`);
+      const flowReasons = item.analysis.flow.impact.reasons && item.analysis.flow.impact.reasons.length ? ` <span class="muted">(${esc(item.analysis.flow.impact.reasons.join('; '))})</span>` : '';
+      html.push(`<p><strong>Whole flow:</strong> ${esc(flowLine(item))} — ${impactHtml(item.analysis.flow.impact)}${flowReasons}</p>`);
       const notes = [];
-      if (item.aa) notes.push(!item.aa.judged ? `A/A noise estimate from ${esc(item.aa.pairs)} pairs` : item.aa.ok ? 'A/A check passed (identical runs showed no difference)' : '<span class="bad">A/A check failed: identical runs differed, so small differences deserve caution</span>');
+      if (item.aa) {
+        const text = aaText(item);
+        notes.push(text.startsWith('A/A check FAILED') ? `<span class="bad">${esc(text)}</span>` : esc(text));
+      }
       if (item.replay && item.replay.requests) notes.push(`${esc(item.replay.distinct)} API request(s) recorded once and replayed to both sides`);
       if (item.traces && item.traces.a) notes.push(`Chrome traces: <a href="${esc(join(bench.dir, item.traces.a))}">before</a>${item.traces.b ? ` · <a href="${esc(join(bench.dir, item.traces.b))}">after</a>` : ''} (open in DevTools → Performance → Load profile)`);
       if (notes.length) html.push(`<p class="muted">${notes.join(' · ')}</p>`);

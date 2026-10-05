@@ -1,0 +1,144 @@
+---
+title: "The error screen's Retry button doesn't actually retry"
+description: "Resetting an error boundary re-renders the same children with the same cached failure. Clear or refetch the failing data in onReset, or reset with resetKeys."
+skill: react-error-handling
+kind: bug
+symptom: "Pressing Retry on a widget's error fallback flashes and shows the same fallback again, every time, and no request appears in the network panel."
+cause: "resetErrorBoundary only renders the children again. They read the same cached error or the same bad data, so they throw again immediately."
+fix: "Change what the children will read before they render again: refetch or clear the cache in onReset, reset the query's error, or use resetKeys tied to the data."
+tags: [error boundaries, resetErrorBoundary, onReset, resetKeys, TanStack Query]
+react: "18 and 19"
+order: 3
+source: skills/react-error-handling/examples/boundary-placement.md
+published: 2026-10-01
+related: [one-error-blanks-the-app, async-errors-vanish, effect-refetches-forever]
+featured: false
+---
+
+A dashboard already contains its failures: each widget has an error boundary, and the revenue widget's fallback says "We couldn't load this section" with a **Retry** button. During an API outage it works as designed. The chart shows its fallback, and the rest of the page keeps working.
+
+Ten minutes later the API is back. Users press **Retry**. The card flickers and shows the same fallback. They press it again, with the same result. Only a full page reload brings the chart back, and the network panel shows that **Retry** never sent a request.
+
+## Why it happens
+
+Here's the widget. The chart reads its data with TanStack Query's `useSuspenseQuery`, which sends errors to the nearest boundary:
+
+```tsx title="RevenueWidget.tsx" bad error="3" mark="14"
+function RevenueWidget() {
+  return (
+    <ErrorBoundary
+      fallbackRender={({ resetErrorBoundary }) => (
+        <WidgetError title="Revenue" onRetry={resetErrorBoundary} />
+      )}
+    >
+      <RevenueChart />
+    </ErrorBoundary>
+  );
+}
+
+function RevenueChart() {
+  const { data } = useSuspenseQuery(revenueQuery());
+  return <LineChart points={data.series.map(toChartPoint)} />;
+}
+```
+
+Start with what a reset does. `resetErrorBoundary()` clears the boundary's error state and renders its children again. Because the fallback had replaced them, they mount fresh. That's all. It doesn't refetch anything, clear any cache or change any props.
+
+A component's output is a function of its inputs: props, context, its own fresh state, and whatever external cache it reads. If the input that made it throw hasn't changed, the next render throws the same way. Rendering is deterministic, and a retry that changes nothing is a replay.
+
+In this widget, the input is the query cache:
+
+- **The failed request is cached as an error.** When a query that throws to a boundary has failed, TanStack Query deliberately doesn't retry it on remount until you reset its error. Otherwise a crash and a retry could loop forever. So the remounted chart reads the cached error and throws it again, before any request is sent.
+- **A response with bad data is cached as success.** If the API answered `200` with a renamed field, the cache holds that payload. The remounted chart reads it, calls `undefined.map` again, and throws again.
+
+The same trap exists without a library. If the bad data lives above the boundary, as in `<RevenueChart data={dashboard.revenue} />`, a reset renders the chart with the same props, and it fails the same way.
+
+## The fix
+
+Make the reset change the input. Clear the failing query in `onReset`, which the boundary calls before it renders the children again:
+
+```tsx title="RevenueWidget.tsx" good add="2,5"
+function RevenueWidget() {
+  const queryClient = useQueryClient();
+  return (
+    <ErrorBoundary
+      onReset={() => queryClient.resetQueries({ queryKey: revenueQuery().queryKey })}
+      fallbackRender={({ resetErrorBoundary }) => (
+        <WidgetError title="Revenue" onRetry={resetErrorBoundary} />
+      )}
+    >
+      <RevenueChart />
+    </ErrorBoundary>
+  );
+}
+```
+
+`resetQueries` returns the query to its initial state, which drops both a cached error and cached bad data. When the chart mounts again, the cache is empty, so `useSuspenseQuery` sends a new request. If the API has recovered, the chart renders. If it hasn't, the request fails, the fallback returns, and that's an honest result: the retry really retried.
+
+When only failed requests need resetting, TanStack Query has a component for it:
+
+```tsx title="RevenueWidget.tsx" good
+<QueryErrorResetBoundary>
+  {({ reset }) => (
+    <ErrorBoundary onReset={reset} fallbackRender={({ resetErrorBoundary }) => <WidgetError onRetry={resetErrorBoundary} />}>
+      <RevenueChart />
+    </ErrorBoundary>
+  )}
+</QueryErrorResetBoundary>
+```
+
+`reset` clears the error state of the queries inside, so they fetch again on mount. It doesn't touch successful responses, so for a `200` with bad data, use `resetQueries` or invalidate the query instead.
+
+## Why the fix works
+
+A retry should run only after the cause can plausibly have changed: the user asked again, new data arrived, or they moved to another route or entity. `onReset` is where you make that change. It runs inside `resetErrorBoundary`, before the children render, so they read the new state on their very first render.
+
+The `ErrorBoundary` used on this site has `onReset` and `resetKeys` built in, and you can copy it from the <SiteLink to="/utilities/">tested utilities</SiteLink>. The `react-error-boundary` package has the same props.
+
+**`resetKeys`** covers the other half: resets that should happen without a click. The boundary resets itself when any key changes while the fallback is showing. Two common keys:
+
+```tsx title="AppShell.tsx"
+// Leaving a broken page resets the route boundary
+<ErrorBoundary resetKeys={[pathname]} fallbackRender={({ resetErrorBoundary }) => <PageError onRetry={resetErrorBoundary} />}>
+  <Routes />
+</ErrorBoundary>
+
+// New data for the widget, for example from a background refetch, resets it
+<ErrorBoundary resetKeys={[dashboard.revenue]} fallback={<WidgetError title="Revenue" />}>
+  <RevenueChart data={dashboard.revenue} />
+</ErrorBoundary>
+```
+
+The bundled boundary ignores a key change that arrives in the same update as the error. Navigating *to* a broken page changes the path and throws at once; resetting then would only throw again, so the boundary waits for the next change.
+
+## How to confirm the fix
+
+1. In DevTools, block the revenue endpoint (**Network** → right-click the request → **Block request URL**) and reload. The widget shows its fallback.
+2. Press **Retry** with the block still on. The network panel must show a new request, which fails, and the fallback returns. Before the fix, there's no request at all.
+3. Remove the block and press **Retry** again. The chart renders.
+
+A test covers the same path:
+
+```tsx title="RevenueWidget.test.tsx"
+it('retries the request when Retry is pressed', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {}); // React logs caught errors
+  vi.mocked(fetchRevenue)
+    .mockRejectedValueOnce(new Error('503'))
+    .mockResolvedValueOnce({ series: [42, 55, 61] });
+  renderWithQueryClient(<RevenueWidget />);
+
+  await userEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+  expect(await screen.findByRole('img', { name: 'Revenue chart' })).toBeTruthy();
+  expect(fetchRevenue).toHaveBeenCalledTimes(2);
+});
+```
+
+Set `retry: false` on the test's query client, so the first failure reaches the boundary at once.
+
+## Watch out for
+
+- **`resetKeys` that change on every render.** Keys compare with `Object.is`, like effect dependencies. An inline array or object, such as `resetKeys={[{ id }]}`, is new on every render, so any parent render resets the boundary and the error throws again. Use primitives or stable references: see <FixLink slug="effect-refetches-forever" /> for the same rule in dependency arrays.
+- **Automatic retries in a loop.** Resetting from `onError`, or on a short timer, hammers a failing API and floods your error tracker. If you retry automatically, back off, cap the attempts, and leave the last one to the user.
+- **Retries that erase work.** Resetting a boundary remounts its children, so any state inside them starts over. Keep draft input above the boundary, or in storage, if a widget holds something the user typed.
+
+If the fallback never shows in the first place because the error came from a handler or a promise, start with <FixLink slug="async-errors-vanish" />.

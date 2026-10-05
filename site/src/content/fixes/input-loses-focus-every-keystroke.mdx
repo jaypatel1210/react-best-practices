@@ -1,0 +1,171 @@
+---
+title: "An input loses focus after every keystroke"
+description: "A component defined inside another component is a new type on every render, so React remounts its input and focus is lost. Define it at module scope."
+skill: react-reconciliation
+kind: bug
+symptom: "After typing one character, the cursor leaves the field, so you have to click back into it for every letter."
+cause: "The field component is defined inside the form's body, so every render creates a new component type and React replaces the input instead of updating it."
+fix: "Move the component to module scope and pass in, as props, the values it used to read from the closure."
+tags: [remounts, component identity, focus, forms, static-components]
+react: "All versions"
+order: 1
+source: skills/react-reconciliation/examples/components-defined-in-render.md
+published: 2026-10-01
+related: [toggling-wrapper-resets-state, index-keys-mix-up-row-state, hoc-swallows-callbacks]
+featured: true
+---
+
+import InlineComponentDemo from '@/components/demos/InlineComponentDemo';
+
+A settings page has a profile form with name, email and bio fields. Each field needs the same label markup, so the developer wrote a small `Field` component right inside the form, where it can read the form's state directly.
+
+The first character you type appears, and then the cursor is gone. Click back into the field, type another letter, and it's gone again. Nothing shows up in the console.
+
+## Reproduce it
+
+<InlineComponentDemo client:visible />
+
+With the issue, click into a field and type a word. After the first character, focus leaves the input, so the rest of the word goes nowhere. Switch to the fix and type again: the input keeps focus, and the text arrives normally.
+
+## Why it happens
+
+```tsx title="ProfileForm.tsx" bad error="4"
+function ProfileForm({ onSave }: { onSave: (values: Profile) => void }) {
+  const [values, setValues] = useState<Profile>({ name: '', email: '', bio: '' });
+
+  const Field = ({ name, label }: { name: keyof Profile; label: string }) => (
+    <label className="field">
+      <span>{label}</span>
+      <input
+        value={values[name]}
+        onChange={(e) => setValues({ ...values, [name]: e.target.value })}
+      />
+    </label>
+  );
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSave(values);
+      }}
+    >
+      <Field name="name" label="Name" />
+      <Field name="email" label="Email" />
+      <Field name="bio" label="Bio" />
+      <button>Save</button>
+    </form>
+  );
+}
+```
+
+To decide what to keep between renders, React compares each element a component returns with the element in the same position last time. If the **type** and the **key** match, React updates the existing component: it keeps its state and DOM nodes and passes the new props. If the type differs, React unmounts the old component, removing its DOM nodes, and mounts a new one.
+
+For a component, the type is the function itself, compared by reference.
+
+Now follow one keystroke:
+
+1. `onChange` calls `setValues`, so `ProfileForm` renders again.
+2. The render runs `const Field = …` again, which creates a **new function**. Its code is identical, but it's a different object from the previous render's `Field`.
+3. React compares the first slot in the form: last time one `Field`, now a different `Field`. The types don't match, so React unmounts the old one and mounts the new one, with a brand-new `<input>`.
+4. The new input shows the right value, because the value comes from state. But the element that had focus was removed from the document, so focus falls back to the page body.
+
+Focus is only the visible part. Every keystroke also throws away any state inside `Field`, re-runs its mount effects, and rebuilds the DOM for every field in the form.
+
+## The fix
+
+Define `Field` once, at module scope, and pass in what it used to read from the closure:
+
+```tsx title="ProfileForm.tsx" good mark="7" add="18-19,28-30"
+type FieldProps = {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+};
+
+function Field({ label, value, onChange }: FieldProps) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <input value={value} onChange={(e) => onChange(e.target.value)} />
+    </label>
+  );
+}
+
+function ProfileForm({ onSave }: { onSave: (values: Profile) => void }) {
+  const [values, setValues] = useState<Profile>({ name: '', email: '', bio: '' });
+  const update = (name: keyof Profile) => (value: string) =>
+    setValues((prev) => ({ ...prev, [name]: value }));
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSave(values);
+      }}
+    >
+      <Field label="Name" value={values.name} onChange={update('name')} />
+      <Field label="Email" value={values.email} onChange={update('email')} />
+      <Field label="Bio" value={values.bio} onChange={update('bio')} />
+      <button>Save</button>
+    </form>
+  );
+}
+```
+
+`Field` is now the same function on every render, so React finds the same type in each slot and updates the existing inputs in place. Focus, cursor position and text selection survive, because the DOM nodes do.
+
+The `values` and `setValues` that the inline version captured are now explicit props. The `update` helper uses a functional update, so each change builds on the latest state rather than on the `values` of the render that created the handler.
+
+## Why the fix works
+
+A component's identity is its type, its position among its siblings, and its key. While all three stay the same, React keeps the instance. A component created during render fails the first test every time, so it remounts whenever its parent renders, whatever it contains.
+
+The same trap comes in other shapes. Each of these creates a new type on every render:
+
+- a higher-order component applied in the body, such as `const TrackedCard = withTracking(Card)`;
+- a styled component created during render, such as `` const Pill = styled.span`…` ``;
+- `lazy(() => import('./Chart'))` called inside a component.
+
+Move them all to module scope. Wrapping the definition in `useMemo` isn't a fix: the component would capture the first render's values, and React may discard the cache anyway.
+
+A render helper that you **call** is fine. `{renderField('bio', 'Bio')}` returns elements whose types, `label` and `input`, never change. It can't use hooks, though. Once it needs state or effects, promote it to a module-level component.
+
+## How to confirm the fix
+
+Click into a field and type a full word without touching the mouse. Then make it provable.
+
+**Log mounts.** Add this to `Field` for a moment:
+
+```tsx title="Field.tsx"
+useEffect(() => {
+  console.log('mount', label);
+  return () => console.log('unmount', label);
+}, []);
+```
+
+Before the fix, every keystroke logs an unmount and a mount for every field. After it, each field logs a single mount. In development, StrictMode adds one extra unmount and mount when the form first appears, and never again.
+
+**Add a test.** This one fails while `Field` is defined inside the form, because the second character goes to the page body instead of the input:
+
+```tsx title="ProfileForm.test.tsx"
+test('keeps focus while typing', async () => {
+  const user = userEvent.setup();
+  render(<ProfileForm onSave={vi.fn()} />);
+
+  await user.type(screen.getByLabelText('Name'), 'Ada');
+
+  expect(screen.getByLabelText('Name')).toHaveValue('Ada');
+  expect(screen.getByLabelText('Name')).toHaveFocus();
+});
+```
+
+## How to spot this in review
+
+- A capitalized `const Field = (…) =>` or `function Field` inside another component's body.
+- Calls such as `withSomething(…)`, `styled.…` or `lazy(…)` that aren't at module scope.
+- `eslint-plugin-react-hooks` 7 and later report this with the `static-components` rule, which is part of the `recommended` config. Turn it on.
+
+## When this isn't enough
+
+If `Field` already lives at module scope and focus still disappears, something else is remounting the input. Look for a key generated during render, such as `key={Math.random()}`, a key derived from the text being typed, such as `<input key={value} />`, or a wrapper that changes type when a condition flips. That last one has its own page: <FixLink slug="toggling-wrapper-resets-state" />.

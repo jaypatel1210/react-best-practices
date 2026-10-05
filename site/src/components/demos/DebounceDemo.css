@@ -1,0 +1,23 @@
+.ddm-mark {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: var(--text-3);
+}
+
+.ddm-request {
+  width: 8px;
+  margin-left: -4px;
+  background: var(--brand);
+}
+
+.demo[data-mode='issue'] .ddm-request {
+  background: var(--issue);
+}
+
+.demo[data-mode='fix'] .ddm-request {
+  background: var(--fix);
+}

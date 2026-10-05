@@ -1,0 +1,124 @@
+---
+title: "The first visit downloads a huge JavaScript bundle"
+description: "A 780 KB entry chunk carries date locales, all of lodash and every icon. Read the bundle report, fix the imports that defeat tree-shaking, and budget the chunk in CI."
+skill: react-loading-performance
+kind: performance
+symptom: "Every page, even the login screen, waits for one large JavaScript file, and Lighthouse reports unused JavaScript and long main-thread work during load."
+cause: "Imports that defeat tree-shaking, such as CommonJS lodash, namespace imports of an icon set, a date library with every locale and barrel files without sideEffects, pull unused code into the entry chunk."
+fix: "Inspect the bundle report, replace or narrow the heavy imports, declare sideEffects in internal packages, set real browser targets, and fail CI when the entry chunk grows."
+tags: [bundle size, tree-shaking, sideEffects, size-limit, lodash]
+react: "All versions"
+order: 2
+source: skills/react-loading-performance/examples/trimming-the-bundle.md
+published: 2026-10-01
+related: [every-route-ships-upfront, hero-image-loads-late, file-import-freezes-page]
+featured: false
+---
+
+An invoicing app built with Vite ships a 780 KB entry chunk, minified. Every page waits for it, including the login screen, which needs a form and two buttons. On a mid-range phone the cost isn't only the download: the browser also has to parse, compile and run that code before React can render anything, and the work lands on the main thread at the moment users try to interact.
+
+Nobody added 780 KB on purpose. It arrived a few imports at a time.
+
+## Why it happens
+
+Here are three of those imports:
+
+```ts title="src/lib/format.ts" bad error="1-2"
+import moment from 'moment';
+import _ from 'lodash';
+
+export const formatDue = (date: Date) => moment(date).format('MMM D, YYYY');
+export const fromNow = (date: Date) => moment(date).fromNow();
+export const groupByStatus = (invoices: Invoice[]) => _.groupBy(invoices, 'status');
+```
+
+```tsx title="src/components/Icon.tsx" bad error="1,4"
+import * as Icons from '@acme/icons';
+
+export function Icon({ name }: { name: keyof typeof Icons }) {
+  const Svg = Icons[name];
+  return <Svg aria-hidden />;
+}
+```
+
+Bundlers drop unused code through **tree-shaking**, and tree-shaking only works when the bundler can prove code is unused. It needs static ES module imports, and modules that don't do anything when they're imported. Each import above breaks one of those conditions:
+
+- **The CommonJS build of `lodash`** can't be analyzed, so the whole library ships for one `groupBy`.
+- **Dynamic access on a namespace import.** `Icons[name]` could be any export, so all 1,600 icons stay.
+- **A date library that bundles its data.** Formatting two dates pulls in the library with every locale, about 230 KB here.
+
+A fourth cause doesn't show up in the app's own files. A design-system package re-exports a markdown editor from its index file, and because its `package.json` has no `"sideEffects"` field, the bundler must assume every re-exported module does something on import. The editor lands in the entry chunk even though the invoice list imports only `Button` and `Avatar`.
+
+## The fix
+
+Look before you cut. Open a bundle report and sort it by size, starting with the entry chunk:
+
+```bash
+npx vite-bundle-visualizer   # or rollup-plugin-visualizer, or @next/bundle-analyzer for Next.js
+```
+
+Then fix what it shows, one import at a time. Dates and grouping need no library at all:
+
+```ts title="src/lib/format.ts" good
+const dateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+
+export const formatDue = (date: Date) => dateFormat.format(date);
+export const fromNow = (date: Date) => relative.format(Math.round((date.getTime() - Date.now()) / 86_400_000), 'day');
+export const groupByStatus = (invoices: Invoice[]) => Object.groupBy(invoices, (invoice) => invoice.status);
+```
+
+Create `Intl` formatters once, at module scope, because constructing them is the expensive part. `Object.groupBy` is Baseline 2024. When date math gets complicated, with time zones or recurrence, use a modular library such as `date-fns` and import only the functions you call. For lodash functions you still need, import the ES module build by name (`import { isEqual } from 'lodash-es'`) or by path (`import isEqual from 'lodash/isEqual'`).
+
+Name the icons the app actually uses:
+
+```tsx title="src/components/Icon.tsx" good
+import { Bell, Check, Download, FileText, Search } from '@acme/icons';
+
+const icons = { bell: Bell, check: Check, download: Download, 'file-text': FileText, search: Search } as const;
+export type IconName = keyof typeof icons;
+
+export function Icon({ name }: { name: IconName }) {
+  const Svg = icons[name];
+  return <Svg aria-hidden />;
+}
+```
+
+And tell the bundler which files in the internal package really have side effects:
+
+```json title="packages/ui/package.json" good
+{
+  "name": "@acme/ui",
+  "sideEffects": ["*.css"]
+}
+```
+
+With the field declared, unused re-exports are dropped, while the package's CSS files still load. Then lazy-load the editor on the one page that uses it.
+
+Two smaller wins finish the job. Check `browserslist`: an old `> 0.2%, not dead` query, or a legacy plugin enabled as a precaution, ships transpiled code and polyfills that modern browsers never run. And keep it from coming back with a budget in CI:
+
+```json title="package.json (excerpt)"
+{
+  "size-limit": [{ "name": "entry", "path": "dist/assets/index-*.js", "limit": "120 kB" }]
+}
+```
+
+## Why the fix works
+
+The entry chunk is on the critical path of every page, so every kilobyte in it delays every first render. The fixes don't hide code behind loading states. They remove code nobody runs, by giving the bundler imports it can analyze. In this example, the entry chunk went from 780 KB to 240 KB minified, about 75 KB compressed, and the login page no longer downloads the editor, the icon set or the date locales.
+
+A common starting budget for first-load JavaScript is around 150–200 KB compressed for the whole page, framework included. Know what each tool measures before you compare numbers. `size-limit` reports compressed size. Vite's `build.chunkSizeWarningLimit`, 500 kB by default, compares uncompressed size. webpack's `performance.maxEntrypointSize` uses the size of emitted files.
+
+## How to confirm the fix
+
+1. Rebuild and open the bundle report again. The libraries you replaced should be gone from the entry chunk, and nothing should appear twice.
+2. In DevTools, open the **Coverage** tab and reload. It shows how much of each script went unused during load.
+3. Run Lighthouse and check the **Reduce unused JavaScript** audit and Total Blocking Time.
+4. Open a pull request that adds a large import, and check that `size-limit` fails it with a size diff.
+
+## Watch out for
+
+- **`"sideEffects": false` with global CSS.** If the package imports a stylesheet or a polyfill for its side effect, `false` makes the bundler drop it silently in production. List those files instead.
+- **Barrel files in your own app.** A shared `components/index.ts` that re-exports everything can drag a heavy component into every chunk that imports one small thing from it. Import from the component's own file. In Next.js, `optimizePackageImports` rewrites barrel imports from listed packages.
+- **Duplicate versions.** Two copies of the same library, pulled in by different dependencies, show up as two blocks in the report. Deduplicate them in the lockfile.
+- **Code you need, but not yet.** Trimming removes unused code. Code that's used, but on another route or after a click, belongs in a separate chunk: see <FixLink slug="every-route-ships-upfront" />.

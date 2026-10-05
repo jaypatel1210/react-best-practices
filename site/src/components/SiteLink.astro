@@ -1,0 +1,13 @@
+---
+/** A link to any page on this site, e.g. <SiteLink to="/checklist/">review checklist</SiteLink>. */
+import { url } from '../lib/urls';
+
+interface Props {
+  to: string;
+}
+
+const { to } = Astro.props;
+if (!to.startsWith('/')) throw new Error(`<SiteLink to="${to}"> must be a site path starting with "/".`);
+---
+
+<a href={url(to)}><slot /></a>

@@ -1,0 +1,107 @@
+---
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import SkillCard from '@/components/SkillCard.astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getFixes, getSkills, GROUP_LABEL, GROUP_ORDER } from '@/lib/content';
+import { breadcrumbs, itemList } from '@/lib/seo';
+
+const [skills, fixes] = await Promise.all([getSkills(), getFixes()]);
+const counts = Object.fromEntries(skills.map((s) => [s.id, fixes.filter((f) => f.data.skill === s.id).length]));
+const groups = GROUP_ORDER.map((group) => ({
+  group,
+  label: GROUP_LABEL[group],
+  skills: skills.filter((s) => s.data.group === group),
+})).filter((g) => g.skills.length > 0);
+
+const title = 'Fifteen React skills for Claude';
+const description =
+  'Open-source Agent Skills that teach Claude to write, review and debug React: re-renders, memoization, keys, effects, context, data fetching, INP, lists and loading.';
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Skills', path: '/skills/' },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  itemList(
+    'React skills',
+    skills.map((s) => ({ name: s.data.title, path: `/skills/${s.id}/` })),
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={title} description={description} og="skills" schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        Each skill is a folder of instructions, worked examples and tested code that Claude loads only when your task
+        needs it. One entry skill holds the mental model and routes to the fourteen focused ones.
+      </p>
+    </header>
+
+    {
+      groups.map(({ group, label, skills: list }) => (
+        <section class="skill-group" aria-labelledby={`g-${group}`}>
+          <h2 id={`g-${group}`}>{label}</h2>
+          <div class="grid grid-3">
+            {list.map((skill) => (
+              <SkillCard skill={skill} fixCount={counts[skill.id] ?? 0} />
+            ))}
+          </div>
+        </section>
+      ))
+    }
+
+    <section class="skills-install" aria-labelledby="install-title">
+      <div>
+        <h2 id="install-title">Install all fifteen at once</h2>
+        <p>
+          The repository is a Claude Code plugin and its own marketplace. Two commands install every skill, and Claude
+          picks the right one from each skill’s description as you work.
+        </p>
+      </div>
+      <InstallBlock />
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .skill-group {
+    margin-top: 40px;
+  }
+
+  .skill-group h2 {
+    font-size: 1.35rem;
+    margin-bottom: 16px;
+  }
+
+  .skills-install {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: 28px;
+    align-items: center;
+    margin-top: 64px;
+    padding: clamp(20px, 4vw, 32px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+
+  .skills-install h2 {
+    font-size: 1.5rem;
+    margin-bottom: 10px;
+  }
+
+  .skills-install p {
+    color: var(--text-2);
+  }
+
+  @media (max-width: 860px) {
+    .skills-install {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

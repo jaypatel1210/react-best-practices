@@ -1,0 +1,118 @@
+---
+title: "useMemo and useCallback everywhere, and the app is no faster"
+description: "Wrapping every value in useMemo and every handler in useCallback adds work and stale-dependency bugs. Memoize only for a comparison or a measured cost."
+skill: react-memoization
+kind: maintainability
+symptom: "Most values and handlers are wrapped in useMemo or useCallback, yet profiles show no improvement and dependency arrays keep causing bugs."
+cause: "Memoization only helps when something compares the result, such as a memo child or a dependency array. Without one, it adds work and risk."
+fix: "Keep memoization where a comparison or a measured expensive calculation needs it, and replace the rest with plain expressions and module constants."
+tags: [useMemo, useCallback, memoization, code review, profiling]
+react: "18 and 19"
+order: 2
+source: skills/react-memoization/examples/expensive-calculations.md
+published: 2026-10-01
+related: [memo-component-still-rerenders, manual-memo-fights-compiler, effect-refetches-forever]
+featured: false
+---
+
+During a performance push, a team adopted a rule: every derived value goes in `useMemo`, and every handler goes in `useCallback`. Months later, most components open with a stack of memo hooks, reviews argue about dependency arrays, and the profiles look the same as before the push.
+
+Then a bug ships. After switching projects, the toolbar's **Save** button saves the *previous* project. The cause is a dependency array that nobody noticed was incomplete.
+
+## Why it happens
+
+Here's a typical component from that codebase:
+
+```tsx title="ProjectToolbar.tsx" bad error="7" warn="2-5"
+function ProjectToolbar({ project, user, onSave }: ProjectToolbarProps) {
+  const fullName = useMemo(() => `${user.first} ${user.last}`, [user.first, user.last]);
+  const isAdmin = useMemo(() => user.roles.includes('admin'), [user.roles]);
+  const label = useMemo(() => `Save ${project.unsavedCount} changes`, [project.unsavedCount]);
+  const iconStyle = useMemo(() => ({ padding: 8 }), []);
+
+  const handleSave = useCallback(() => onSave(project.id), [onSave]);
+
+  return (
+    <div className="toolbar">
+      <span>Editing as {fullName}</span>
+      <button onClick={handleSave}>{label}</button>
+      {isAdmin && <IconButton icon="settings" style={iconStyle} />}
+    </div>
+  );
+}
+```
+
+Memoization has one job: keep a reference stable between renders so that **a comparison somewhere else** succeeds. That comparison is either a `memo` component checking its props or a hook checking its dependency array. When nothing compares the result, the cache saves nothing.
+
+Go through the component with that in mind:
+
+- **`fullName`, `isAdmin` and `label`** are a string join, an array lookup and a template string. On every render, `useMemo` still allocates a dependency array and compares each entry, which costs more than the work it skips. None of the three values goes to anything that compares it.
+- **`iconStyle`** goes to `IconButton`, which isn't wrapped in `memo`. It re-renders whenever the toolbar does, whatever its props.
+- **`handleSave`** goes to a `<button>`. DOM elements don't compare props, so a stable function changes nothing. `useCallback` doesn't even save the function's creation: the arrow is created on every render and then discarded when the cached one is returned.
+
+And `handleSave` is the bug. It lists `onSave` but not `project.id`. When the parent passes a stable `onSave`, the cached function keeps the first `project.id` it saw, and the button saves the wrong project. The memoization prevented no work, and it introduced a stale closure.
+
+Each hook also adds work on the first render and keeps its previous value in memory. One of them costs nothing you'd notice. Hundreds across an app measurably slow the initial render, and every dependency array is code that someone has to keep correct.
+
+## The fix
+
+Write plain expressions, and keep memoization only where a comparison benefits from it:
+
+```tsx title="ProjectToolbar.tsx" good add="1,4-5,10-11"
+const ICON_STYLE = { padding: 8 };
+
+function ProjectToolbar({ project, user, onSave }: ProjectToolbarProps) {
+  const fullName = `${user.first} ${user.last}`;
+  const isAdmin = user.roles.includes('admin');
+
+  return (
+    <div className="toolbar">
+      <span>Editing as {fullName}</span>
+      <button onClick={() => onSave(project.id)}>Save {project.unsavedCount} changes</button>
+      {isAdmin && <IconButton icon="settings" style={ICON_STYLE} />}
+    </div>
+  );
+}
+```
+
+The component is shorter, does a little less work per render, and can't go stale: the inline handler reads `project.id` from the render that created it. The style never changes, so it moved to module scope, where it's stable without a hook.
+
+## Why the fix works
+
+Memoize a value or a function only when at least one of these is true:
+
+1. **It's a prop of a `memo` component**, and every other prop of that component is stable too.
+2. **It's a hook dependency** of `useEffect`, `useLayoutEffect`, `useMemo` or `useCallback`, in this component or in a child or custom hook that receives it.
+3. **It's returned from a reusable custom hook**, because callers may do 1 or 2 with it.
+4. **It's a context provider's value**, which every consumer compares.
+5. **It's a measured expensive calculation** that would otherwise re-run on renders where its inputs didn't change.
+
+If none applies, the hook is noise. Some values are stable already and never need it: state setters, `dispatch`, the object returned by `useRef`, module-level constants, and values created once in a `useState(() => …)` initializer.
+
+### Is the calculation expensive?
+
+"Expensive" is a measurement, not a feeling. Wrap the calculation in `console.time` and `console.timeEnd`, use a production build with 4–6× CPU throttling and realistic data, and trigger the re-render that matters, such as a keystroke elsewhere on the page. Then compare the result with the component's render time in the Profiler:
+
+| Calculation | Component render | Decision |
+|---|---|---|
+| 0.2 ms | 25 ms | Don't memoize it. The render is the cost, so fix that instead |
+| 8 ms | 12 ms | Memoize it, and ask why the component re-renders so often |
+| 60 ms | any | Memoize it, and move it out of render, for example to when the data arrives |
+
+Even a justified `useMemo` helps only on renders where its dependencies didn't change. It adds work on mount, it recomputes every time a dependency changes, and React may discard its cache, so the code must stay correct if the calculation re-runs.
+
+## How to confirm the fix
+
+1. Record the same interaction in the React DevTools Profiler before and after the cleanup. Commit times should stay the same or drop slightly, most visibly on mount.
+2. Before you delete each hook, find its consumer. Use "find references" on the value, and check whether the receiving component is wrapped in `memo` or lists the value in a dependency array.
+3. Run the tests for flows that rely on effects, since an effect's dependency may be a value you touched.
+
+## How to spot this in review
+
+For every `useMemo` and `useCallback`, ask one question: **what compares this?** If the answer is "a `memo` child", "an effect's dependency array" or "a context provider", keep it and check that its dependencies are complete. If the answer is "nothing", ask for a measurement or remove it.
+
+## Watch out for
+
+- **Memoization that something downstream depends on.** A `useCallback` whose function a child lists in a `useEffect` dependency array is load-bearing. Remove it, and the effect re-runs on every render; if the effect sets state, it can loop. See <FixLink slug="effect-refetches-forever" />.
+- **Shared hooks and providers.** Reusable custom hooks should keep returning stable functions and objects, and provider values should stay memoized, because you can't see every caller.
+- **React Compiler.** If the project compiles with it, don't hand-write new memoization at all, and leave existing hooks in place until you can test their removal. See <FixLink slug="manual-memo-fights-compiler" />.

@@ -1,0 +1,26 @@
+---
+import Icon from './Icon.astro';
+
+interface Props {
+  symptom: string;
+  cause: string;
+  fix: string;
+}
+
+const { symptom, cause, fix } = Astro.props;
+---
+
+<dl class="diagnosis" aria-label="Diagnosis at a glance">
+  <div class="d-symptom">
+    <dt><Icon name="symptom" /> Symptom</dt>
+    <dd>{symptom}</dd>
+  </div>
+  <div class="d-cause">
+    <dt><Icon name="cause" /> Root cause</dt>
+    <dd>{cause}</dd>
+  </div>
+  <div class="d-fix">
+    <dt><Icon name="fix" /> Fix</dt>
+    <dd>{fix}</dd>
+  </div>
+</dl>

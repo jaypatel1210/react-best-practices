@@ -1,0 +1,492 @@
+---
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import CodeBlock from '@/components/CodeBlock.astro';
+import Icon from '@/components/Icon.astro';
+import { repoUrl } from '@/config';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getSkillTitles } from '@/lib/content';
+import { breadcrumbs, techArticle } from '@/lib/seo';
+import { inlineMarkdown, loadChecklist } from '@/lib/skill-tables';
+import { absoluteUrl, fixUrl, ogImageUrl, skillUrl } from '@/lib/urls';
+
+const checklist = loadChecklist();
+const skillTitles = await getSkillTitles();
+const total = checklist.sections.reduce((sum, s) => sum + s.items.length, 0);
+const SOURCE = 'skills/react-best-practices/references/review-checklist.md';
+
+const title = 'React code review checklist';
+const description = `The ${total} checks Claude works through when it reviews React code, each with what to look for, why it matters and the fix. Tick them off as you review a pull request.`;
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Review checklist', path: '/checklist/' },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  techArticle(
+    {
+      path: '/checklist/',
+      headline: title,
+      description,
+      section: 'Code review',
+      keywords: ['React', 'code review', 'checklist', 'pull request', 'performance'],
+      published: new Date('2026-10-01'),
+      image: absoluteUrl(ogImageUrl('checklist'), Astro.site),
+    },
+    Astro.site,
+  ),
+];
+const severityTone: Record<string, string> = { high: 'bug', medium: 'performance', low: 'maintainability' };
+---
+
+<BaseLayout title={`${title}: ${total} checks with fixes`} description={description} og="checklist" schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        These are the {total} checks Claude works through when you ask it to review React code. Each one names a
+        pattern to look for, why it matters, and the fix. Flag only what applies to the code in front of you.
+      </p>
+    </header>
+
+    <section class="severity" aria-labelledby="severity-title">
+      <h2 id="severity-title" class="visually-hidden">Severity guide</h2>
+      {
+        checklist.severity.map((level) => {
+          const key = level.label.split(' ')[0].toLowerCase();
+          return (
+            <div class="severity-card">
+              <span class="badge badge-dot" data-kind={severityTone[key]}>
+                {level.label}
+              </span>
+              <p set:html={inlineMarkdown(level.text)} />
+            </div>
+          );
+        })
+      }
+    </section>
+
+    <div class="checklist-bar" data-bar>
+      <div class="progress" aria-hidden="true"><span data-progress-fill></span></div>
+      <p class="progress-label" aria-live="polite" data-progress-label>0 of {total} checked</p>
+      <div class="cluster">
+        <label class="chip">
+          <input type="checkbox" data-hide-checked />
+          Hide checked
+        </label>
+        <button type="button" class="button button-ghost button-sm" data-copy-md>
+          <Icon name="copy" /> Copy as Markdown
+        </button>
+        <button type="button" class="button button-ghost button-sm" data-reset>
+          <Icon name="reset" /> Reset
+        </button>
+      </div>
+    </div>
+
+    <div class="checklist-layout">
+      <nav class="checklist-nav" aria-label="Checklist sections">
+        <ol>
+          {
+            checklist.sections.map((s) => (
+              <li>
+                <a href={`#${s.id}`}>
+                  <span>{s.title}</span>
+                  <span class="nav-count" data-section-count={s.id}>
+                    0/{s.items.length}
+                  </span>
+                </a>
+              </li>
+            ))
+          }
+        </ol>
+      </nav>
+
+      <div class="checklist-body" data-checklist>
+        {
+          checklist.sections.map((section) => (
+            <section class="check-section" id={section.id} aria-labelledby={`${section.id}-title`}>
+              <h2 id={`${section.id}-title`}>
+                <span class="section-num">{String(section.number).padStart(2, '0')}</span>
+                {section.title}
+              </h2>
+              <ul>
+                {section.items.map((item) => (
+                  <li class="check-item" data-item={item.id} data-section={section.id}>
+                    <label class="check-look">
+                      <input type="checkbox" data-check={item.id} />
+                      <span set:html={inlineMarkdown(item.lookFor)} />
+                    </label>
+                    <dl>
+                      <div>
+                        <dt>Why it matters</dt>
+                        <dd set:html={inlineMarkdown(item.why)} />
+                      </div>
+                      <div>
+                        <dt>Fix</dt>
+                        <dd>
+                          <span set:html={inlineMarkdown(item.fix)} />
+                          {item.skills.length > 0 && (
+                            <span class="check-skills">
+                              {item.skills.map((id) => (
+                                <a class="badge badge-skill" href={skillUrl(id)}>
+                                  {skillTitles[id] ?? id}
+                                </a>
+                              ))}
+                            </span>
+                          )}
+                        </dd>
+                      </div>
+                    </dl>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))
+        }
+
+        <section class="check-section" aria-labelledby="format-title">
+          <h2 id="format-title">How to write up a finding</h2>
+          <p class="format-intro">
+            Order findings by severity, then impact. Give each a location, a concrete scenario a user or developer would
+            hit, the rule behind it, and a minimal fix. See a full example in the{' '}
+            <a href={fixUrl('react-code-review-walkthrough')}>code review walkthrough</a>.
+          </p>
+          <CodeBlock code={checklist.outputFormat} lang="md" title="finding.md" />
+        </section>
+
+        <p class="check-source">
+          Source: <a href={repoUrl(SOURCE)} rel="noopener"><code>{SOURCE}</code></a>. Your ticks are saved in this
+          browser only.
+        </p>
+      </div>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .severity {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .severity-card {
+    display: grid;
+    gap: 10px;
+    align-content: start;
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .severity-card .badge {
+    justify-self: start;
+  }
+
+  .severity-card p {
+    color: var(--text-2);
+    font-size: 0.92rem;
+  }
+
+  .checklist-bar {
+    position: sticky;
+    top: var(--header-h);
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 18px;
+    margin: 28px calc(var(--gutter) * -1) 0;
+    padding: 12px var(--gutter);
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .progress {
+    flex: 1 1 200px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    overflow: hidden;
+  }
+
+  .progress span {
+    display: block;
+    height: 100%;
+    width: 100%;
+    background: var(--fix);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 200ms ease;
+  }
+
+  .progress-label {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-2);
+  }
+
+  .checklist-layout {
+    display: grid;
+    grid-template-columns: 250px minmax(0, 1fr);
+    gap: 40px;
+    margin-top: 28px;
+    align-items: start;
+  }
+
+  .checklist-nav {
+    position: sticky;
+    top: calc(var(--header-h) + 76px);
+  }
+
+  .checklist-nav ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .checklist-nav a {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    color: var(--text-2);
+    text-decoration: none;
+    font-size: 0.9rem;
+  }
+
+  .checklist-nav a:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .nav-count {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-3);
+  }
+
+  .nav-count[data-done='true'] {
+    color: var(--fix);
+  }
+
+  .checklist-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 44px;
+    min-width: 0;
+  }
+
+  .check-section h2 {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    font-size: 1.4rem;
+    margin-bottom: 14px;
+  }
+
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--brand);
+  }
+
+  .check-section ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+
+  .check-item {
+    padding: 14px 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    transition: border-color 150ms ease;
+  }
+
+  .check-item:has(input:checked) {
+    border-color: color-mix(in srgb, var(--fix) 45%, var(--border));
+    background: color-mix(in srgb, var(--fix-soft) 45%, var(--surface));
+  }
+
+  .checklist-body[data-hide-checked='true'] .check-item:has(input:checked) {
+    display: none;
+  }
+
+  .check-look {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    font-weight: 600;
+    line-height: 1.5;
+    cursor: pointer;
+  }
+
+  .check-look input {
+    width: 18px;
+    height: 18px;
+    margin: 3px 0 0;
+    accent-color: var(--fix);
+    cursor: pointer;
+  }
+
+  .check-item dl {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px 24px;
+    margin: 10px 0 0 34px;
+  }
+
+  .check-item dt {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin-bottom: 4px;
+  }
+
+  .check-item dd {
+    margin: 0;
+    color: var(--text-2);
+    font-size: 0.93rem;
+    line-height: 1.55;
+  }
+
+  .check-item :global(code) {
+    overflow-wrap: anywhere;
+    padding: 0.1em 0.35em;
+    border-radius: 5px;
+    background: var(--code-inline);
+    font-size: 0.86em;
+  }
+
+  .check-skills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .format-intro {
+    color: var(--text-2);
+    max-width: 70ch;
+  }
+
+  .check-source {
+    color: var(--text-3);
+    font-size: 0.88rem;
+  }
+
+  @media (max-width: 900px) {
+    .severity {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .checklist-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .checklist-nav {
+      display: none;
+    }
+    .check-item dl {
+      grid-template-columns: minmax(0, 1fr);
+      margin-left: 0;
+    }
+  }
+</style>
+
+<script>
+  const KEY = 'rbp-checklist-v1';
+  const body = document.querySelector<HTMLElement>('[data-checklist]');
+  const boxes = Array.from(document.querySelectorAll<HTMLInputElement>('[data-check]'));
+  const fill = document.querySelector<HTMLElement>('[data-progress-fill]');
+  const label = document.querySelector<HTMLElement>('[data-progress-label]');
+  const hide = document.querySelector<HTMLInputElement>('[data-hide-checked]');
+
+  function load(): Set<string> {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(KEY) ?? '[]') as string[]);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function save(ids: Set<string>) {
+    try {
+      localStorage.setItem(KEY, JSON.stringify([...ids]));
+    } catch {
+      // Storage may be unavailable; ticks still work for this visit.
+    }
+  }
+
+  const checked = load();
+  boxes.forEach((box) => (box.checked = checked.has(box.dataset.check!)));
+
+  function update() {
+    const done = boxes.filter((b) => b.checked).length;
+    if (fill) fill.style.transform = `scaleX(${boxes.length ? done / boxes.length : 0})`;
+    if (label) label.textContent = `${done} of ${boxes.length} checked`;
+    document.querySelectorAll<HTMLElement>('[data-section-count]').forEach((count) => {
+      const id = count.dataset.sectionCount;
+      const items = boxes.filter((b) => b.closest<HTMLElement>('[data-section]')?.dataset.section === id);
+      const sectionDone = items.filter((b) => b.checked).length;
+      count.textContent = `${sectionDone}/${items.length}`;
+      count.dataset.done = String(sectionDone === items.length);
+    });
+  }
+
+  boxes.forEach((box) =>
+    box.addEventListener('change', () => {
+      if (box.checked) checked.add(box.dataset.check!);
+      else checked.delete(box.dataset.check!);
+      save(checked);
+      update();
+    }),
+  );
+
+  hide?.addEventListener('change', () => {
+    if (body) body.dataset.hideChecked = String(hide.checked);
+  });
+
+  document.querySelector('[data-reset]')?.addEventListener('click', () => {
+    checked.clear();
+    boxes.forEach((b) => (b.checked = false));
+    save(checked);
+    update();
+  });
+
+  document.querySelector<HTMLButtonElement>('[data-copy-md]')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const lines: string[] = ['## React review checklist', ''];
+    document.querySelectorAll<HTMLElement>('.check-section[id]').forEach((section) => {
+      lines.push(`### ${section.querySelector('h2')?.textContent?.replace(/^\d+/, '').trim()}`, '');
+      section.querySelectorAll<HTMLElement>('.check-item').forEach((item) => {
+        const box = item.querySelector<HTMLInputElement>('[data-check]');
+        const text = item.querySelector('.check-look span')?.textContent?.trim();
+        lines.push(`- [${box?.checked ? 'x' : ' '}] ${text}`);
+      });
+      lines.push('');
+    });
+    const original = button.innerHTML;
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      button.textContent = 'Copied';
+    } catch {
+      button.textContent = 'Copy failed';
+    }
+    setTimeout(() => (button.innerHTML = original), 1600);
+  });
+
+  update();
+</script>

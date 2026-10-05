@@ -1,0 +1,141 @@
+---
+title: "Typing lags because the input's state lives in the page"
+description: "Every keystroke re-renders the whole page when an input's state sits in a page component. Move the state into a small field component and typing stays instant."
+skill: react-rerenders
+kind: performance
+symptom: "Typing in one field feels sticky, and parts of the page that never read the text re-render on every keystroke."
+cause: "The draft text is state in the page component, and a state change re-renders everything that component renders."
+fix: "Move the state, together with the elements that read it, into a small component. Pass only the committed value up."
+tags: [useState, re-renders, state colocation, inputs, typing lag]
+react: "All versions"
+order: 1
+source: skills/react-rerenders/examples/move-state-down.md
+published: 2026-10-01
+related: [wrapper-state-rerenders-children, custom-hook-state-rerenders-host, typing-lags-heavy-list]
+featured: true
+---
+
+import StateTooHighDemo from '@/components/demos/StateTooHighDemo';
+
+A support tool has an order page. Agents type a coupon code into a field and press **Apply**. The same page renders a long order timeline and an invoice preview, and each of those takes about 20 ms to render. Nobody touched the timeline or the invoice, yet typing in the coupon field feels like typing through mud.
+
+This is one of the most common React performance problems, and it rarely needs `memo` to fix.
+
+## Reproduce it
+
+<StateTooHighDemo client:visible />
+
+With the issue, type a few letters and watch the render counters. `OrderTimeline` and `InvoicePreview` re-render once per keystroke, and the main-thread work per keystroke is in the tens of milliseconds. Switch to the fix and type again: only `CouponField` re-renders.
+
+## Why it happens
+
+Here's the page. The coupon draft is a `useState` in `OrderPage`, because that's where the **Apply** button needs it:
+
+```tsx title="OrderPage.tsx" bad
+function OrderPage({ order }: { order: Order }) {
+  const [coupon, setCoupon] = useState(''); // [!code error]
+  const [appliedCoupon, setAppliedCoupon] = useState<string | null>(null);
+  const isValidFormat = /^[A-Z0-9]{6,12}$/.test(coupon);
+
+  return (
+    <div className="order-page">
+      <section>
+        <input
+          value={coupon}
+          onChange={(e) => setCoupon(e.target.value.toUpperCase())} // [!code error]
+          aria-invalid={!isValidFormat}
+        />
+        <button disabled={!isValidFormat} onClick={() => setAppliedCoupon(coupon)}>
+          Apply
+        </button>
+      </section>
+
+      <OrderTimeline events={order.events} />
+      <InvoicePreview order={order} coupon={appliedCoupon} />
+    </div>
+  );
+}
+```
+
+Two facts about React explain the lag:
+
+1. **A re-render starts from a state change.** Each keystroke calls `setCoupon`, so `OrderPage` renders again.
+2. **Re-rendering a component re-renders everything it renders.** React doesn't check whether `OrderTimeline` uses `coupon`. When the parent renders, the children render too, unless something stops it.
+
+So one keystroke costs the input, plus the timeline, plus the invoice. At 20 ms each, that's over 40 ms of main-thread work per character, which is enough to drop frames and make the field feel sluggish on a mid-range laptop. On a phone it's worse.
+
+## The fix
+
+Split the state by **how often it changes**. The draft changes on every keystroke, and only the field needs it. The applied coupon changes rarely, and the invoice needs it. Give each its own home:
+
+```tsx title="OrderPage.tsx" good add="6,12-13"
+function OrderPage({ order }: { order: Order }) {
+  const [appliedCoupon, setAppliedCoupon] = useState<string | null>(null);
+
+  return (
+    <div className="order-page">
+      <CouponField onApply={setAppliedCoupon} />
+      <OrderTimeline events={order.events} />
+      <InvoicePreview order={order} coupon={appliedCoupon} />
+    </div>
+  );
+}
+
+function CouponField({ onApply }: { onApply: (code: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const isValidFormat = /^[A-Z0-9]{6,12}$/.test(draft);
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (isValidFormat) onApply(draft);
+      }}
+    >
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value.toUpperCase())}
+        aria-invalid={!isValidFormat}
+      />
+      <button disabled={!isValidFormat}>Apply</button>
+    </form>
+  );
+}
+```
+
+Typing now re-renders `CouponField` and nothing else. The heavy components re-render only when a coupon is applied, which is the one update they need to show.
+
+## Why the fix works
+
+The fix doesn't make anything faster. It makes React do less. State changes re-render the component that owns the state and its subtree, so the cheapest re-render is one that starts as low in the tree as possible.
+
+Notice what the fix *didn't* need:
+
+- **No `memo`.** You could wrap `OrderTimeline` and `InvoicePreview` in `memo`, but that adds a props comparison to every render and breaks silently the moment someone passes an inline object or callback. Moving the state removes the problem instead of guarding against it.
+- **No `useCallback`.** `onApply={setAppliedCoupon}` passes a state setter, and React guarantees setters keep the same identity across renders.
+
+A form element also replaced the click handler, so pressing <kbd>Enter</kbd> applies the coupon. When you extract a component, it's a good moment to fix small things like that.
+
+## How to confirm the fix
+
+1. Open React DevTools, go to **Profiler**, and enable **Highlight updates when components render** in its settings.
+2. Record while you type five characters.
+3. Before the fix, each commit lists `OrderPage`, `OrderTimeline` and `InvoicePreview`. After it, each commit lists only `CouponField`.
+
+Profile a production build when you measure timings. Development builds are several times slower and exaggerate render costs.
+
+## How to spot this pattern in review
+
+- A `useState`, or a custom hook that holds one, near the top of a large component.
+- The value is read by one or two small elements.
+- The rest of the JSX doesn't reference it.
+
+Extract "the state plus everything that reads it" into a component named after what it does: `CouponField`, `ShareButton`, `SearchBox`. If the parent needs the result, pass a callback such as `onApply` or `onSelect` for the **committed** value instead of lifting the high-frequency draft.
+
+<Callout type="warn" title="Hooks can hide the same problem">
+A custom hook that calls `useState` puts that state in the component that *calls* the hook. `const share = useDisclosure()` at the top of a product page makes opening the share sheet re-render the whole page. Move the hook call into a `ShareButton` component along with the elements that use it.
+</Callout>
+
+## When this isn't enough
+
+Sometimes the heavy part genuinely depends on the text, like a list that filters as you type. Moving state can't help there, because the list *should* update. That case needs a deferred value or a transition instead: see <FixLink slug="typing-lags-heavy-list" />.

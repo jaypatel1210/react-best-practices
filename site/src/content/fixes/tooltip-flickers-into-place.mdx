@@ -1,0 +1,156 @@
+---
+title: "A tooltip flashes in the wrong spot, then jumps into place"
+description: "Positioning a tooltip in useEffect lets the browser paint it in its default spot first. Measure and place it in useLayoutEffect so users only see the final position."
+skill: react-layout-portals
+kind: bug
+symptom: "A tooltip or popover appears for a moment above its button, or in the corner of the screen, then jumps to where it belongs, most often on slow devices."
+cause: "The position is measured and set in useEffect, which usually runs after the browser has already painted the first, unadjusted render."
+fix: "Measure and set the position in useLayoutEffect, which runs before paint, and keep the tooltip invisible until it has a position."
+tags: [useLayoutEffect, useEffect, tooltips, flicker, getBoundingClientRect]
+react: "All versions"
+order: 2
+source: skills/react-layout-portals/examples/measure-before-paint.md
+published: 2026-10-01
+related: [modal-hidden-under-header, effect-chain-out-of-sync, reordered-list-jumps]
+featured: false
+---
+
+import LayoutFlickerDemo from '@/components/demos/LayoutFlickerDemo';
+
+A document editor has a toolbar pinned to the top of the page. Each button has a tooltip that prefers to sit above it and flips below when there's no room, and since the toolbar is at the top, every tooltip flips. On your laptop it looks fine. On a mid-range phone, testers see each tooltip flash above its button, half off the screen, and then jump below it.
+
+The positioning math is correct. The bug is when it runs.
+
+## Reproduce it
+
+<LayoutFlickerDemo client:visible />
+
+With the issue and slow motion on, click a toolbar button. The tooltip appears above, poking out of the document box, and moves below 300 ms later. Slow motion delays only the position update, standing in for a device where the first frame stays on screen long enough to notice. Untick it to see real speed: the wrong frame is brief, and on a fast machine it often doesn't appear at all, which is exactly how this bug survives testing. The counter shows how many frames were drawn before the tooltip reached its place. With the fix, it stays at zero.
+
+## Why it happens
+
+`Placement` is `'top' | 'bottom'`, and `GAP` is 8 pixels:
+
+```tsx title="Tooltip.tsx" bad error="3,5"
+function Tooltip({ anchorRef, children }: TooltipProps) {
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<Position>({ top: 0, left: 0, placement: 'top' });
+
+  useEffect(() => {
+    const a = anchorRef.current!.getBoundingClientRect();
+    const t = tooltipRef.current!.getBoundingClientRect();
+    const placement: Placement = a.top - t.height - GAP >= 0 ? 'top' : 'bottom';
+    setPosition({
+      placement,
+      top: placement === 'top' ? a.top - t.height - GAP : a.bottom + GAP,
+      left: a.left + a.width / 2 - t.width / 2,
+    });
+  }, [anchorRef]);
+
+  return createPortal(
+    <div
+      ref={tooltipRef}
+      role="tooltip"
+      className={`tooltip tooltip--${position.placement}`}
+      style={{ position: 'fixed', top: position.top, left: position.left }}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+```
+
+Follow one tooltip through React and the browser:
+
+1. React renders the tooltip with its default position, the top-left corner, and commits it to the DOM.
+2. The browser paints that frame. The tooltip is visible in the corner.
+3. The effect runs, measures the anchor and the tooltip, and sets the real position.
+4. React renders again, and the browser paints the tooltip where it belongs.
+
+Step 2 is the flash. `useEffect` usually runs after the browser paints, and that's deliberate: most effects, such as subscriptions, logging and fetching, shouldn't delay the screen. React does flush effects caused by a click or key press before the next paint, but you can't build on that. Updates from hovering, scrolling, resizing or data arriving take the after-paint path, and how long the first frame stays up depends on the device.
+
+`useLayoutEffect` runs at a different moment: after React has updated the DOM, so you can measure it, but before the browser paints. A state update inside it is processed synchronously, so the browser only ever paints the adjusted result.
+
+## The fix
+
+```tsx title="Tooltip.tsx" good add="3,5,20-25,32,37"
+function Tooltip({ anchorRef, children }: TooltipProps) {
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<Position | null>(null);
+
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current;
+    const tooltip = tooltipRef.current;
+    if (!anchor || !tooltip) return;
+
+    const update = () => {
+      const a = anchor.getBoundingClientRect();
+      const t = tooltip.getBoundingClientRect();
+      const placement: Placement = a.top - t.height - GAP >= 0 ? 'top' : 'bottom';
+      const top = placement === 'top' ? a.top - t.height - GAP : a.bottom + GAP;
+      const left = Math.min(Math.max(GAP, a.left + a.width / 2 - t.width / 2), window.innerWidth - t.width - GAP);
+      setPosition({ top, left, placement });
+    };
+
+    update();
+    window.addEventListener('scroll', update, { capture: true, passive: true });
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, { capture: true });
+      window.removeEventListener('resize', update);
+    };
+  }, [anchorRef]);
+
+  return createPortal(
+    <div
+      ref={tooltipRef}
+      role="tooltip"
+      className={position ? `tooltip tooltip--${position.placement}` : 'tooltip'}
+      style={{
+        position: 'fixed',
+        top: position?.top ?? 0,
+        left: position?.left ?? 0,
+        visibility: position ? 'visible' : 'hidden',
+      }}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+```
+
+What changed:
+
+- **`useLayoutEffect` instead of `useEffect`**, so the measurement and the corrected position land before the first paint.
+- **`visibility: hidden` until there's a position.** The tooltip still takes up space, so it can be measured, but it can't be seen in the wrong place, even if a frame slipped through.
+- **Re-measuring while open,** on resize and on scroll in the capture phase, so scrolling any container counts, not only the window.
+- **A portal and `position: fixed`.** `getBoundingClientRect()` returns viewport coordinates, and with the tooltip in `<body>`, no transformed ancestor can redefine what "fixed" means, so the numbers match exactly.
+
+Render it only while it's open, which happens on the client after an interaction, so `document` exists:
+
+```tsx title="CopyButton.tsx" good
+{isOpen && <Tooltip anchorRef={buttonRef}>Copied!</Tooltip>}
+```
+
+## Why the fix works
+
+Measure-then-adjust is a two-pass layout, and the user should only see the second pass. Layout effects exist for exactly this: React runs them once the DOM is updated, where measuring is possible, and finishes any updates they schedule before the browser gets to paint.
+
+The cost is that layout effects block painting. Keep them small: read what you need, compute, set state. Fetching, logging and anything that doesn't change the first visible frame stay in `useEffect`. The demo's slow motion shows the trade: with the fix, the 300 ms happen before paint, so the tooltip appears late but in the right place.
+
+Prefer CSS when it can do the job. CSS anchor positioning can place and flip a tooltip without JavaScript in current Chromium, Safari and Firefox, but it isn't Baseline yet, so treat it as a progressive enhancement with this code as the fallback.
+
+## How to confirm the fix
+
+1. In Chrome DevTools, open the Performance panel, enable **Screenshots**, set CPU throttling to 6×, and record while you open the tooltip.
+2. Step through the filmstrip. With `useEffect`, at least one frame shows the tooltip in its default spot before the corrected one. With `useLayoutEffect`, the first frame that contains the tooltip already has it in place.
+3. Search the codebase for the same shape elsewhere: a `useEffect` that reads `getBoundingClientRect`, `offsetWidth` or `scrollHeight` and then sets state that changes layout.
+
+## Watch out for
+
+- **Server rendering.** Neither kind of effect runs on the server, so the HTML users see before hydration is always the unmeasured layout. Choose CSS that makes that state acceptable, such as hidden until placed, clipped, or a sensible default, and never branch on `typeof window` in render to produce different markup.
+- **Many components measuring themselves.** When every row runs its own measure-and-adjust layout effect, reads and writes interleave across components and force layout again and again. Measure once in the parent, or use `ResizeObserver` (see <SkillLink name="react-animation" />).
+- **Size changes you didn't cause.** Fonts loading and content changing resize elements without a window resize event. Observe the element itself with `ResizeObserver`.
+- **Production tooltips.** Collision detection, arrows, shifting along an edge and virtual anchors add up to a lot of code. Floating UI or the project's UI library handle them, and they follow the same principle.

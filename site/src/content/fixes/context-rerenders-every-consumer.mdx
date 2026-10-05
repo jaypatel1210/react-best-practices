@@ -1,0 +1,188 @@
+---
+title: "One context update re-renders every consumer in the app"
+description: "An inline value={{ … }} gives a context provider a new object on every render, so every consumer re-renders. Memoize the value and split state from actions."
+skill: react-context
+kind: performance
+symptom: "Typing in a field that has nothing to do with the settings re-renders every component that reads the settings context, including a slow report panel."
+cause: "The provider's value is an object created inline, so every render of its parent makes a new one, and React re-renders all consumers whenever the value's identity changes."
+fix: "Memoize the provider value and keep its functions stable, move the state into a provider that renders children, and split state from actions."
+tags: [useContext, createContext, useMemo, provider value, re-renders]
+react: "18 and 19"
+order: 1
+source: skills/react-context/examples/provider-patterns.md
+published: 2026-10-01
+related: [action-only-consumers-rerender, context-slice-still-rerenders, memo-component-still-rerenders]
+featured: true
+---
+
+import ContextDemo from '@/components/demos/ContextDemo';
+
+A reporting app keeps its theme in a settings context. A badge shows the current theme, a button toggles it, and a report panel styles its charts with it. That panel takes about 16 ms to render.
+
+Then someone adds a quick-note field to the top of the app, next to where the theme state lives. Typing in it feels sluggish, and the Profiler shows the badge, the button and the report panel re-rendering on every keystroke. None of them reads the note, and the theme hasn't changed.
+
+## Reproduce it
+
+<ContextDemo client:visible />
+
+All three consumers in the demo are wrapped in `memo`, so nothing except a context change can re-render them. With **Inline value** selected, type a few letters in the note field. `ThemeBadge`, `ToggleThemeButton` and the 16 ms `ReportPanel` re-render on every keystroke, and the meter shows what each keystroke costs, even though the theme never changes.
+
+Switch to **Memoized and split** and type again: only `App` re-renders. Then press **Toggle theme**. `ThemeBadge` and `ReportPanel` re-render because they show the theme, while `ToggleThemeButton`, which only calls an action, stays still.
+
+## Why it happens
+
+Here's the app. The theme state and the note both live in `App`, and the provider's value is written inline:
+
+```tsx title="App.tsx" bad error="7,10"
+type Theme = 'light' | 'dark';
+const SettingsContext = createContext<{ theme: Theme; toggleTheme: () => void } | null>(null);
+
+function App() {
+  const [note, setNote] = useState('');
+  const [theme, setTheme] = useState<Theme>('light');
+  const toggleTheme = () => setTheme((t) => (t === 'light' ? 'dark' : 'light'));
+
+  return (
+    <SettingsContext.Provider value={{ theme, toggleTheme }}>
+      <NoteField value={note} onChange={setNote} />
+      <Workspace />
+    </SettingsContext.Provider>
+  );
+}
+
+// memo stops App's re-renders here, so only a context change can reach the consumers
+const Workspace = memo(function Workspace() {
+  return (
+    <>
+      <ThemeBadge />
+      <ToggleThemeButton />
+      <ReportPanel />
+    </>
+  );
+});
+```
+
+The consumers read the context through a small hook:
+
+```tsx title="settings.tsx"
+export function useSettings() {
+  const settings = useContext(SettingsContext);
+  if (!settings) throw new Error('useSettings must be used inside SettingsContext');
+  return settings;
+}
+
+function ToggleThemeButton() {
+  const { toggleTheme } = useSettings(); // reads only the action
+  return <button onClick={toggleTheme}>Toggle theme</button>;
+}
+```
+
+Three facts about context explain the lag:
+
+1. **Consumers re-render when the provider's `value` changes identity.** React compares the old and new value with `Object.is`, not by looking inside.
+2. **Every consumer re-renders**, including those that read a part of the value that didn't change. Destructuring `{ toggleTheme }` doesn't narrow the subscription: `ToggleThemeButton` subscribes to the whole value.
+3. **`memo` doesn't stop it.** Reading a context works like owning state. A `memo` component still re-renders when a context it reads changes, whatever its props.
+
+Now follow one keystroke. `setNote` re-renders `App`. That render runs `{ theme, toggleTheme }` again, which creates a new object, and `toggleTheme` is a new function too. React sees a different value, finds every component that reads `SettingsContext`, and re-renders each one, straight past the `memo` on `Workspace`.
+
+An inline value is often harmless on day one, when the provider sits in a component that rarely renders. It turns into a bug the day someone adds frequently changing state next to it, like this note field.
+
+## The fix
+
+The minimum fix is to keep the value's identity stable until its contents change:
+
+```tsx title="App.tsx" good add="4-5,8"
+function App() {
+  const [note, setNote] = useState('');
+  const [theme, setTheme] = useState<Theme>('light');
+  const toggleTheme = useCallback(() => setTheme((t) => (t === 'light' ? 'dark' : 'light')), []);
+  const value = useMemo(() => ({ theme, toggleTheme }), [theme, toggleTheme]);
+
+  return (
+    <SettingsContext.Provider value={value}>
+      <NoteField value={note} onChange={setNote} />
+      <Workspace />
+    </SettingsContext.Provider>
+  );
+}
+```
+
+Typing now re-renders no consumer. Toggling the theme still re-renders all three, including `ToggleThemeButton`, which never displays the theme. The complete fix moves the state into a provider component and gives the theme and its action separate contexts:
+
+```tsx title="SettingsProvider.tsx" good add="4-5,9-12,15-16"
+type Theme = 'light' | 'dark';
+type ThemeActions = { toggleTheme: () => void };
+
+const ThemeContext = createContext<Theme | null>(null);
+const ThemeActionsContext = createContext<ThemeActions | null>(null);
+
+export function SettingsProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState<Theme>('light');
+  const actions = useMemo<ThemeActions>(
+    () => ({ toggleTheme: () => setTheme((t) => (t === 'light' ? 'dark' : 'light')) }),
+    [], // setTheme never changes, and the functional update doesn't read theme
+  );
+
+  return (
+    <ThemeActionsContext.Provider value={actions}>
+      <ThemeContext.Provider value={theme}>{children}</ThemeContext.Provider>
+    </ThemeActionsContext.Provider>
+  );
+}
+
+export function useTheme() {
+  const theme = useContext(ThemeContext);
+  if (theme === null) throw new Error('useTheme must be used inside SettingsProvider');
+  return theme;
+}
+
+export function useThemeActions() {
+  const actions = useContext(ThemeActionsContext);
+  if (actions === null) throw new Error('useThemeActions must be used inside SettingsProvider');
+  return actions;
+}
+```
+
+`App` keeps only the note. `ThemeBadge` and `ReportPanel` call `useTheme()`, and `ToggleThemeButton` calls `useThemeActions()`:
+
+```tsx title="App.tsx" good
+function App() {
+  const [note, setNote] = useState('');
+  return (
+    <SettingsProvider>
+      <NoteField value={note} onChange={setNote} />
+      <Workspace />
+    </SettingsProvider>
+  );
+}
+```
+
+## Why the fix works
+
+Each piece removes one reason to re-render:
+
+- **A memoized value keeps its identity** until something in it changes. When `App` re-renders for the note, the providers receive the same `actions` object and the same `theme` string, so React has nothing to propagate.
+- **The provider owns its state and renders `children`.** The elements inside `SettingsProvider` were created by `App`. When only the theme changes, `SettingsProvider` re-renders, but `children` is the same element as before, so React skips the tree in between and visits only the consumers. Compare that with theme state in `App`, which re-renders all of `App`'s output on every toggle.
+- **Separate contexts mean separate subscriptions.** A theme change updates `ThemeContext` only. The actions context never changes, so `ToggleThemeButton` never re-renders because of the theme. <FixLink slug="action-only-consumers-rerender" /> covers this split, and keeping actions independent of state, in depth.
+
+Memoize provider values by default. Most memoization should wait for a measurement, but a provider value is one of the few places where it's right up front, because you can't know which component will render the provider a few months from now.
+
+A few version notes:
+
+- **On React 19**, you can render `<ThemeContext value={theme}>` instead of `<ThemeContext.Provider value={theme}>`. Both work, so follow the codebase.
+- **With React Compiler**, a compiled component memoizes the inline object for you. The compiler doesn't change context semantics, though: every consumer still re-renders when the value changes, so splitting contexts is still your job.
+
+## How to confirm the fix
+
+1. In React DevTools, open **Profiler** and turn on **Highlight updates when components render** in its settings.
+2. Record while you type five characters in the note field. Before the fix, each commit includes every consumer. After it, the commits include `App` and the components it renders directly, but no consumer.
+3. Record while you toggle the theme. After the full fix, the commit includes `ThemeBadge` and `ReportPanel`, and not `ToggleThemeButton`.
+
+Profile a production build when you measure timings, since development builds exaggerate render costs.
+
+## Watch out for
+
+- **One context for everything.** Theme, the signed-in user, feature flags and the cart change at different rates and are read by different components. Give each its own context instead of one `AppContext`.
+- **Fast-changing values in a widely read context.** Pointer position, scroll offset and typed text re-render every consumer on every change, even with a perfect value. Keep them local, or move them to a store that supports selectors, as <FixLink slug="context-slice-still-rerenders" /> explains.
+- **A provider placed higher than it needs to be.** Every screen under it subscribes, so render it around the part of the app that uses it.
+- **A missing provider.** With a `null` default and a hook that throws, a component rendered outside the provider fails right away with a clear message, instead of quietly reading a default value.

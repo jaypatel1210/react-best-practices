@@ -1,0 +1,160 @@
+---
+title: "Handlers fire twice, then three times, and memory keeps growing"
+description: "An effect that subscribes without a cleanup leaks one handler per visit, so handlers run N times and memory climbs. Return a cleanup that releases everything."
+skill: react-effects
+kind: bug
+symptom: "After a few visits to a screen, a shortcut or socket handler runs several times per event, and the tab's memory rises with every navigation."
+cause: "The effect acquires a listener, timer, socket or widget and returns no cleanup, so each mount leaves one more copy running after the component unmounts."
+fix: "Return a cleanup from every effect that acquires something: unsubscribe, clear, close, disconnect, destroy. Group resources that share a lifetime."
+tags: [useEffect, cleanup, memory leaks, addEventListener, AbortController, StrictMode]
+react: "All versions"
+order: 3
+source: skills/react-effects/examples/cleanup-and-leaks.md
+published: 2026-10-01
+related: [interval-counter-stuck-at-one, handler-sees-old-state, effect-refetches-forever]
+featured: false
+---
+
+import LeakDemo from '@/components/demos/LeakDemo';
+
+An operations dashboard has a live metrics panel for each service. It streams points over a WebSocket, shows "updated 12 s ago", draws a chart with a third-party library, and resets the chart's zoom when you press <kbd>R</kbd>.
+
+The first visit works. Support tickets start after longer sessions: pressing <kbd>R</kbd> feels slow, the browser tab uses over a gigabyte after an afternoon of switching between services, and the chart sometimes shows points from a service the user left ten minutes ago. Nobody can reproduce it in a quick test, because a quick test visits the screen once.
+
+## Reproduce it
+
+<LeakDemo client:visible />
+
+With the issue, open and close the panel four or five times, then leave it closed. **Handlers attached** stays at the number of times you opened it, and every tick of the feed calls all of them, for panels that no longer exist. Switch to the fix and repeat: the count is 1 while the panel is open and 0 once it closes.
+
+## Why it happens
+
+Here's the panel. Each effect sets something up, and none of them returns a cleanup:
+
+```tsx title="LiveMetricsPanel.tsx" bad error="7,12,16-18"
+function LiveMetricsPanel({ serviceId }: { serviceId: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [points, setPoints] = useState<MetricPoint[]>([]);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const socket = new WebSocket(`${METRICS_URL}/${serviceId}`);
+    socket.onmessage = (e) => setPoints((prev) => [...prev.slice(-299), JSON.parse(e.data)]);
+  }, [serviceId]);
+
+  useEffect(() => {
+    setInterval(() => setNow(Date.now()), 1000);
+  }, []);
+
+  useEffect(() => {
+    const chart = createLineChart(containerRef.current!);
+    new ResizeObserver(([entry]) => chart.resize(entry.contentRect.width)).observe(containerRef.current!);
+    window.addEventListener('keydown', (e) => e.key === 'r' && chart.resetZoom());
+  }, []);
+
+  // ...renders the chart container and the "updated 12 s ago" label
+}
+```
+
+An effect has two halves. The setup runs after the component mounts, and again whenever a dependency changes. The cleanup, the function the setup returns, runs before each re-run and once more when the component unmounts. If there's no cleanup, React has nothing to call, and whatever the setup acquired keeps going.
+
+Unmounting removes the component from React's tree. It doesn't reach into the browser and undo what your effect did. The socket, the interval, the observer and the window listener belong to the browser, and each one holds a closure. Those closures hold the component's state setters, its chart instance and its DOM container, so none of it can be garbage collected.
+
+Here's what one visit leaves behind:
+
+| Acquired in setup | What happens after unmount |
+|---|---|
+| WebSocket | Stays open. When `serviceId` changes, the old socket keeps calling `setPoints`, so another service's points mix into the chart. |
+| Interval | Ticks forever, and keeps its closure alive. |
+| Chart instance | Never destroyed. Its canvas and buffers survive, and its container becomes a detached DOM node: off the page, still referenced. |
+| ResizeObserver | Keeps watching the detached container. |
+| Keydown listener | An anonymous function, so nothing can remove it. After five visits, <kbd>R</kbd> resets five charts, four of them invisible. |
+
+That's the signature of a missing cleanup: **it leaks once per mount.** The first visit is fine. The tenth runs ten handlers.
+
+React doesn't warn you. Older versions logged "Can't perform a React state update on an unmounted component". React 18 removed that warning, because a state update on an unmounted component is a harmless no-op. The leak is the subscription that keeps calling it.
+
+## The fix
+
+Return a cleanup that releases everything the setup acquired:
+
+```tsx title="LiveMetricsPanel.tsx" good add="10,14-15,24-25,27-28,30-35"
+function LiveMetricsPanel({ serviceId }: { serviceId: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<LineChart | null>(null);
+  const [points, setPoints] = useState<MetricPoint[]>([]);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const socket = new WebSocket(`${METRICS_URL}/${serviceId}`);
+    socket.onmessage = (e) => setPoints((prev) => [...prev.slice(-299), JSON.parse(e.data)]);
+    return () => socket.close();
+  }, [serviceId]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // The chart, its observer and its shortcut share one lifetime
+  useEffect(() => {
+    const container = containerRef.current!;
+    const chart = createLineChart(container);
+    chartRef.current = chart;
+
+    const observer = new ResizeObserver(([entry]) => chart.resize(entry.contentRect.width));
+    observer.observe(container);
+
+    const listeners = new AbortController();
+    window.addEventListener('keydown', (e) => e.key === 'r' && chart.resetZoom(), { signal: listeners.signal });
+
+    return () => {
+      listeners.abort();
+      observer.disconnect();
+      chart.destroy();
+      chartRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    chartRef.current?.setData(points);
+  }, [points]);
+
+  // ...renders the chart container and the "updated 12 s ago" label
+}
+```
+
+What changed:
+
+- **Every setup has a matching release.** `close()` for the socket, `clearInterval` for the timer, `disconnect()` for the observer, `destroy()` for the chart.
+- **Resources that live and die together share one effect.** The chart, its observer and its shortcut are created and destroyed as a unit. The socket depends on `serviceId` and the chart doesn't, so they stay in separate effects.
+- **The listener is removed with a signal.** Passing `{ signal }` to `addEventListener` and calling `abort()` removes it without keeping a reference to the function.
+- **A closed socket stops delivering messages**, so the old service's connection can't write into the new one's state.
+
+## Why the fix works
+
+The rule is symmetric: **everything an effect acquires, its cleanup releases.** React guarantees the cleanup runs before the next setup and on unmount, so with matching pairs, the number of live subscriptions always equals the number of mounted components that need them. That's 1 while the panel is open and 0 after it closes, no matter how many visits came before.
+
+The same pairs cover most of what effects acquire: `addEventListener` with `removeEventListener` (same function, same `capture` flag) or a signal, observers with `disconnect()`, `requestAnimationFrame` with `cancelAnimationFrame`, a `Worker` with `terminate()`, `URL.createObjectURL` with `URL.revokeObjectURL`, and an emitter's subscribe with the unsubscribe function it returns. For a store you read during render, `useSyncExternalStore` subscribes and unsubscribes for you.
+
+<Callout type="warn" title="removeEventListener can silently do nothing">
+`removeEventListener` removes a listener only when it receives the same function and the same `capture` flag. An inline arrow, or `{ capture: true }` on one side only, removes nothing and throws no error. The `{ signal }` option avoids both mistakes.
+</Callout>
+
+## How to confirm the fix
+
+1. Repeat a cycle ten times: open and close the screen, or switch between two services.
+2. In Chrome DevTools, open **Memory** and take a heap snapshot after the first cycle. Repeat the cycles, press the garbage-collection button, and take a second snapshot.
+3. In the **Comparison** view, sort by delta. Objects whose count grows with each cycle are the leak. Filter by "Detached" to find DOM trees that are off the page but still referenced, and read the **Retainers** panel: the chain usually ends at a listener, an interval or a third-party instance.
+4. Run `getEventListeners(window)` in the Chrome console after each visit. The `keydown` count should stay flat.
+5. Watch the **Performance monitor**'s JS heap size while cycling. A sawtooth that returns to its baseline is healthy. A baseline that rises every cycle isn't.
+
+Close DevTools' console, or clear it, before trusting a snapshot: logged objects stay reachable while the console holds them.
+
+## Watch out for
+
+- **StrictMode is your early warning.** In development, React runs setup, cleanup, setup on mount. If that shows two charts or two connections, the cleanup is missing or incomplete. Fix the cleanup. A "has run" ref hides the warning and keeps the leak.
+- **Stale data after a prop change.** Closing the old socket stops new points, but the old service's points stay in state. Render `<LiveMetricsPanel key={serviceId} serviceId={serviceId} />` so each service starts empty.
+- **Leaks outside effects.** A module-level `Map` keyed by objects keeps every key alive (use a `WeakMap`). Callbacks registered on an emitter from an event handler, DOM nodes saved in module variables, and widgets created on click all need an explicit release, too.
+
+Timers have a second classic bug, a stale closure that reads the first render's state forever: see <FixLink slug="interval-counter-stuck-at-one" />.

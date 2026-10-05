@@ -1,0 +1,53 @@
+---
+import Icon from '@/components/Icon.astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { url } from '@/lib/urls';
+---
+
+<BaseLayout
+  title="Page not found"
+  description="This page doesn't exist. Search the fixes by symptom, or start from the list of every React issue on the site."
+  noindex
+>
+  <div class="container not-found">
+    <p class="code">404</p>
+    <h1>This page unmounted</h1>
+    <p class="lede">
+      The link may be old, or the page may have moved. Describe what you’re seeing and search for it, or browse every fix.
+    </p>
+    <div class="cluster">
+      <button type="button" class="button button-primary" data-search-open>
+        <Icon name="search" /> Search fixes
+      </button>
+      <a class="button button-secondary" href={url('/fixes/')}>All fixes</a>
+      <a class="button button-ghost" href={url('/')}>Home</a>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .not-found {
+    display: grid;
+    justify-items: start;
+    gap: 18px;
+    padding-block: clamp(64px, 12vw, 140px);
+    max-width: 720px;
+  }
+
+  .code {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--issue);
+    font-size: 1rem;
+    letter-spacing: 0.1em;
+  }
+
+  .not-found h1 {
+    font-size: clamp(2.2rem, 5vw, 3.2rem);
+  }
+
+  .lede {
+    color: var(--text-2);
+    font-size: 1.12rem;
+  }
+</style>

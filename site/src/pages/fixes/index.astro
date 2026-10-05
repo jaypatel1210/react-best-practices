@@ -1,0 +1,247 @@
+---
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import FixCard from '@/components/FixCard.astro';
+import Icon from '@/components/Icon.astro';
+import { FIX_KINDS } from '@/content.config';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getFixes, getSkills, KIND_LABEL } from '@/lib/content';
+import { breadcrumbs, itemList } from '@/lib/seo';
+import { fixUrl, skillUrl } from '@/lib/urls';
+
+const [fixes, skills] = await Promise.all([getFixes(), getSkills()]);
+const skillTitles = Object.fromEntries(skills.map((s) => [s.id, s.data.title]));
+const groups = skills
+  .map((skill) => ({ skill, fixes: fixes.filter((f) => f.data.skill === skill.id) }))
+  .filter((g) => g.fixes.length > 0);
+const kindCounts = Object.fromEntries(FIX_KINDS.map((k) => [k, fixes.filter((f) => f.data.kind === k).length]));
+
+const title = 'React issues and how to fix them';
+const description = `${fixes.length} real React issues, each with the symptom, the root cause, the fix and how to confirm it: re-renders, keys, effects, context, data fetching, INP and more.`;
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Fixes', path: '/fixes/' },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  itemList(
+    'React fixes',
+    fixes.map((f) => ({ name: f.data.title, path: `/fixes/${f.id}/` })),
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={title} description={description} og="fixes" schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        Start from what you see. Every page names the symptom, explains why React behaves that way, and shows the fix
+        with code you can copy. Many come with a live demo you can break and repair.
+      </p>
+    </header>
+
+    <form class="filters" role="search" aria-label="Filter fixes" data-filters>
+      <label class="filter-search">
+        <Icon name="search" />
+        <span class="visually-hidden">Search fixes</span>
+        <input type="search" name="q" placeholder="Filter by symptom, API or keyword" autocomplete="off" />
+      </label>
+      <fieldset class="cluster filter-kinds">
+        <legend class="visually-hidden">Kind of issue</legend>
+        <label class="chip">
+          <input type="radio" name="kind" value="" checked />
+          All <span class="count">{fixes.length}</span>
+        </label>
+        {
+          FIX_KINDS.map((kind) => (
+            <label class="chip">
+              <input type="radio" name="kind" value={kind} />
+              {KIND_LABEL[kind]} <span class="count">{kindCounts[kind]}</span>
+            </label>
+          ))
+        }
+      </fieldset>
+      <label class="filter-skill">
+        <span class="visually-hidden">Skill</span>
+        <select name="skill">
+          <option value="">All skills</option>
+          {skills.map((skill) => <option value={skill.id}>{skill.data.title}</option>)}
+        </select>
+      </label>
+      <p class="filter-status" aria-live="polite" data-status>Showing all {fixes.length} fixes</p>
+    </form>
+
+    <div class="fix-groups">
+      {
+        groups.map(({ skill, fixes: list }) => (
+          <section class="fix-group" data-group aria-labelledby={`group-${skill.id}`}>
+            <div class="fix-group-head">
+              <h2 id={`group-${skill.id}`}>{skill.data.title}</h2>
+              <a class="badge badge-skill" href={skillUrl(skill.id)}>
+                {skill.id}
+              </a>
+            </div>
+            <div class="grid grid-3">
+              {list.map((fix) => (
+                <FixCard fix={fix} skillTitle={skillTitles[fix.data.skill]} />
+              ))}
+            </div>
+          </section>
+        ))
+      }
+    </div>
+    <p class="filter-empty" data-empty hidden>
+      No fixes match. Clear the filters, or try the <a href={fixUrl('react-code-review-walkthrough')}>code review walkthrough</a>
+      for a broader tour.
+    </p>
+  </div>
+</BaseLayout>
+
+<style>
+  .filters {
+    position: sticky;
+    top: var(--header-h);
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 14px;
+    margin: 0 calc(var(--gutter) * -1) 8px;
+    padding: 14px var(--gutter);
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .filter-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 260px;
+    min-height: 42px;
+    padding: 0 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text-3);
+  }
+
+  .filter-search:focus-within {
+    outline: 2px solid var(--brand);
+    outline-offset: 1px;
+  }
+
+  .filter-search :global(svg) {
+    width: 18px;
+    height: 18px;
+    flex: none;
+  }
+
+  .filter-search input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+  }
+
+  .filter-kinds {
+    border: 0;
+    margin: 0;
+    padding: 0;
+  }
+
+  .filter-skill select {
+    min-height: 42px;
+    padding: 0 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+
+  .filter-status {
+    width: 100%;
+    color: var(--text-3);
+    font-size: 0.88rem;
+  }
+
+  .fix-groups {
+    display: grid;
+    gap: 48px;
+    margin-top: 28px;
+  }
+
+  .fix-group-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .fix-group-head h2 {
+    font-size: 1.45rem;
+  }
+
+  .filter-empty {
+    padding: 48px 0;
+    color: var(--text-2);
+    text-align: center;
+  }
+</style>
+
+<script>
+  const form = document.querySelector<HTMLFormElement>('[data-filters]');
+  const cards = Array.from(document.querySelectorAll<HTMLElement>('[data-fix]'));
+  const groups = Array.from(document.querySelectorAll<HTMLElement>('[data-group]'));
+  const status = document.querySelector<HTMLElement>('[data-status]');
+  const empty = document.querySelector<HTMLElement>('[data-empty]');
+
+  if (form) {
+    const query = form.elements.namedItem('q') as HTMLInputElement;
+    const skill = form.elements.namedItem('skill') as HTMLSelectElement;
+
+    // Restore filters from the URL, so a filtered view can be shared or bookmarked.
+    const params = new URLSearchParams(location.search);
+    query.value = params.get('q') ?? '';
+    skill.value = params.get('skill') ?? '';
+    const kindParam = params.get('kind') ?? '';
+    form.querySelectorAll<HTMLInputElement>('input[name="kind"]').forEach((radio) => {
+      radio.checked = radio.value === kindParam;
+    });
+
+    const apply = () => {
+      const terms = query.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const kind = (form.querySelector<HTMLInputElement>('input[name="kind"]:checked')?.value ?? '').trim();
+      let shown = 0;
+      for (const card of cards) {
+        const visible =
+          (!kind || card.dataset.kind === kind) &&
+          (!skill.value || card.dataset.skill === skill.value) &&
+          terms.every((term) => card.dataset.search?.includes(term));
+        card.hidden = !visible;
+        if (visible) shown++;
+      }
+      for (const group of groups) {
+        group.hidden = !group.querySelector('[data-fix]:not([hidden])');
+      }
+      if (status) status.textContent = shown === cards.length ? `Showing all ${cards.length} fixes` : `Showing ${shown} of ${cards.length} fixes`;
+      if (empty) empty.hidden = shown > 0;
+
+      const next = new URLSearchParams();
+      if (query.value.trim()) next.set('q', query.value.trim());
+      if (kind) next.set('kind', kind);
+      if (skill.value) next.set('skill', skill.value);
+      const search = next.toString();
+      history.replaceState(null, '', search ? `?${search}` : location.pathname);
+    };
+
+    form.addEventListener('input', apply);
+    form.addEventListener('submit', (event) => event.preventDefault());
+    apply();
+  }
+</script>

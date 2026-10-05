@@ -1,0 +1,117 @@
+---
+title: "A loading animation freezes while the page is busy"
+description: "A spinner driven by React state can't move while the main thread is blocked. A CSS animation of transform keeps turning on the compositor through heavy work."
+skill: react-animation
+kind: performance
+symptom: "The spinner stops turning exactly when the app works hardest, during a big render, hydration or a long computation, so the page looks frozen or crashed."
+cause: "Each frame of the spinner is a state update from a timer or frame callback, and timers, React renders and paints all wait for the main thread to be free."
+fix: "Animate the spinner with a CSS keyframe animation, or the Web Animations API, of transform, which the browser can run on its compositor thread."
+tags: [CSS animations, compositor, spinners, main thread, requestAnimationFrame]
+react: "All versions"
+order: 2
+source: skills/react-animation/examples/choosing-what-to-animate.md
+published: 2026-10-01
+related: [file-import-freezes-page, expanding-panel-stutters, tab-switch-blanks-screen]
+featured: false
+---
+
+import FrozenAnimationDemo from '@/components/demos/FrozenAnimationDemo';
+
+A reporting app builds large reports in the browser: it parses a few megabytes of JSON, groups and sorts thousands of rows, and renders the result. While that runs, the page shows a spinner and "Building your report…". Users say the app freezes, and in a sense they're right: the spinner stops turning for a second and a half, which reads as a crash.
+
+The work is a separate problem with its own fix. This page is about the indicator, which should keep moving while the work runs.
+
+## Reproduce it
+
+<FrozenAnimationDemo client:visible />
+
+With the issue, press **Run heavy task**: the spinner stops for 1.5 seconds and then jumps ahead. Switch to the fix and press it again: the spinner keeps turning. In both modes, the clock driven by a JavaScript timer freezes and the meter reports about 1,500 ms of blocked main thread, because the fix doesn't make the task any shorter. It keeps the animation alive.
+
+## Why it happens
+
+```tsx title="Spinner.tsx" bad error="5,10"
+function Spinner() {
+  const [angle, setAngle] = useState(0);
+  useEffect(() => {
+    let id = requestAnimationFrame(function tick(now) {
+      setAngle(((now % 800) / 800) * 360);
+      id = requestAnimationFrame(tick);
+    });
+    return () => cancelAnimationFrame(id);
+  }, []);
+  return <span className="spinner" role="status" aria-label="Loading" style={{ transform: `rotate(${angle}deg)` }} />;
+}
+```
+
+Every frame of this spinner needs the main thread three times: to run the frame callback, to render the component with the new angle, and to commit the new `transform` so the browser can draw it. The same thread also runs your event handlers, React's rendering of the report, garbage collection and hydration.
+
+While a 1.5-second task runs, none of that can happen. Frame callbacks don't fire, React can't render, and the browser has nothing new to draw for the spinner. A `setInterval` version fails the same way, and adds judder even when the page is idle, because its timer isn't aligned with the display's refresh. Either way, the indicator depends on the very thread that the work it represents is blocking.
+
+It also costs something when nothing else is happening: sixty renders a second, competing with everything else for the same frame budget.
+
+## The fix
+
+Let CSS run the animation:
+
+```tsx title="Spinner.tsx" good
+function Spinner() {
+  return <span className="spinner" role="status" aria-label="Loading" />;
+}
+```
+
+```css title="spinner.css" good
+.spinner {
+  display: inline-block;
+  width: 32px;
+  height: 32px;
+  border: 4px solid rgb(0 0 0 / 0.12);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+```
+
+The component has no state, no effect and no frame loop. React renders it once, and the browser owns the motion from then on. If you need to start, pause or reverse it from code, the Web Animations API gives the same result through a ref:
+
+```ts title="spin.ts" good
+const spin = el.animate([{ transform: 'rotate(0turn)' }, { transform: 'rotate(1turn)' }], {
+  duration: 800,
+  iterations: Infinity,
+});
+```
+
+Keep the returned `Animation` and call `spin.cancel()` in the effect's cleanup.
+
+## Why the fix works
+
+Browsers split rendering across threads. The main thread computes styles, layout and paint, and a separate compositor thread assembles the painted layers into frames on screen. A `transform` or `opacity` change needs only that last step. So once a declarative animation of those properties starts, the browser can promote the element to its own layer and let the compositor apply the next rotation on every frame, without asking the main thread for anything.
+
+This holds in Chromium-based browsers, and Firefox and Safari also run `transform` and `opacity` animations off the main thread in the common case. It's an optimization each engine makes, not a guarantee in the CSS specification, so a browser can fall back to animating on the main thread in some situations. Treat it as very likely rather than certain, and check your target browsers. It works only for declarative animations, meaning CSS animations, transitions and the Web Animations API, because a JavaScript loop needs the main thread on every frame by definition.
+
+## How to confirm the fix
+
+1. Show the spinner, then run a deliberate long task in the DevTools console: `const end = performance.now() + 2000; while (performance.now() < end) {}`. A CSS spinner keeps turning. A state-driven one stops for two seconds.
+2. Record the real workload in the Performance panel with 4× CPU throttling. The long task shows as one wide block on the main thread, with no frame callbacks or React renders inside it, yet the spinner keeps turning on screen, because the compositor is drawing it.
+3. In the **Layers** panel, the spinner has its own layer, with an active transform animation as the reason.
+4. In the React DevTools Profiler, the spinner no longer renders at all while it spins.
+
+## Watch out for
+
+- **The spinner must paint before the work starts.** If the same click shows the spinner and then runs the heavy work synchronously, the browser never gets to paint the spinner at all. Let it paint first, then start the work in a later task:
+
+  ```tsx title="ReportPage.tsx" good
+  function startReport() {
+    setStatus('building');
+    requestAnimationFrame(() => setTimeout(buildReport)); // runs after the next paint
+  }
+  ```
+
+- **Only the composited parts survive.** Many spinners grow and shrink an arc with `stroke-dashoffset` or animate `width`. Those are paint and layout properties, so they freeze while the rotation keeps going. Build busy indicators from `transform` and `opacity` alone.
+- **A spinning spinner isn't a responsive page.** Clicks and typing still wait for the task to end. Chunk the work with yields, or move it to a Web Worker, so the page responds while it runs: see <FixLink slug="file-import-freezes-page" />.
+- **Reduced motion.** A global `prefers-reduced-motion` rule often stops spinners entirely. Keep a text label such as "Building your report…" next to the indicator, so the loading state is clear without motion.

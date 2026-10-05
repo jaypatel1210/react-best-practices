@@ -1,0 +1,170 @@
+---
+title: "Importing a large file freezes the whole page"
+description: "A 60,000-row CSV import runs as one long task, so clicks, scrolling and spinners freeze. Process it in short slices that yield, or move it to a Web Worker."
+skill: react-responsiveness
+kind: performance
+symptom: "After you pick a large file, the page stops responding for a second or more: spinners stop, clicks and scrolling wait, and the progress bar never moves."
+cause: "Parsing, validating and summarizing every row runs as one synchronous task, and the browser can't handle input or paint a frame until that task ends."
+fix: "Process the rows in short slices that yield to the browser, update progress at most once per percent, and move seconds of CPU work into a Web Worker."
+tags: [long tasks, scheduler.yield, Web Workers, INP, AbortController]
+react: "All versions"
+order: 2
+source: skills/react-responsiveness/examples/long-tasks-and-workers.md
+published: 2026-10-01
+related: [animation-freezes-during-work, typing-lags-heavy-list, drag-stutters-on-pointermove]
+featured: false
+---
+
+import LongTaskDemo from '@/components/demos/LongTaskDemo';
+
+A budgeting app imports bank exports. A user picks a CSV of about 60,000 rows, and the app parses it, validates each row and shows totals per category. The spinner next to the button stops turning, the page won't scroll, and a click on **Cancel** does nothing. A second later, everything jumps to the finished state.
+
+Nothing is wrong with the parsing code. It's correct and reasonably fast. The trouble is that it runs all at once, on the thread that also has to draw the page.
+
+## Reproduce it
+
+<LongTaskDemo client:visible />
+
+With **One long task**, press **Import** and watch the dot and the frame counter. Both stop for about a second and a half, and the progress bar jumps from empty to full. The "longest gap between frames" meter shows how long the page was frozen. Switch to **Chunks that yield** and import again: the dot keeps moving, the bar fills in steps, and the longest gap drops to a fraction of that.
+
+## Why it happens
+
+Here's the import, written the obvious way:
+
+```tsx title="ImportButton.tsx" bad error="7-9"
+function ImportButton({ onImported }: { onImported: (summary: ImportSummary) => void }) {
+  const [status, setStatus] = useState<'idle' | 'working'>('idle');
+
+  const handleFile = async (file: File) => {
+    setStatus('working');
+    const text = await file.text();
+    const rows = parseCsv(text); // ~600 ms
+    const valid = rows.filter(isValid); // ~300 ms
+    onImported(summarize(valid)); // ~200 ms
+    setStatus('idle');
+  };
+
+  return (
+    <>
+      <input type="file" accept=".csv" onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
+      {status === 'working' && <p>Importing…</p>}
+    </>
+  );
+}
+```
+
+JavaScript, React rendering, style, layout and paint all share one main thread, and the browser runs one task at a time. It can only handle a click or paint a frame *between* tasks. Any task over 50 ms counts as a long task, and users start to notice delays at around 100 ms.
+
+`await file.text()` reads the file without blocking. Everything after it, though, runs as one task of about 1.1 seconds. During that second:
+
+- Clicks, key presses and scroll events wait in a queue. Each one's Interaction to Next Paint includes the rest of the import.
+- `requestAnimationFrame` callbacks don't run, so a JavaScript-driven spinner freezes mid-turn.
+- State updates can't paint. A progress percentage set inside the loop would render only after the loop ends, at 100%.
+
+`async` doesn't help here. An `async` function runs synchronously until it reaches an `await`, and the parse has none.
+
+## The fix
+
+Process the rows in short slices and give the browser a turn between them. `runInChunks()` from the skill's <SiteLink to="/utilities/">tested utilities</SiteLink> does the slicing:
+
+```tsx title="useCsvImport.ts" good mark="21,29,32"
+import { flushSync } from 'react-dom';
+import { runInChunks } from './yield-to-main'; // from the react-responsiveness assets
+
+export function useCsvImport() {
+  const [progress, setProgress] = useState<number | null>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => controllerRef.current?.abort(), []); // stop on unmount
+
+  const importFile = async (file: File): Promise<ImportSummary | null> => {
+    controllerRef.current?.abort(); // a newer import replaces an older one
+    const controller = new AbortController();
+    controllerRef.current = controller;
+
+    setProgress(0);
+    const lines = (await file.text()).split('\n');
+    const summary = createSummary();
+    let lastPercent = 0;
+
+    try {
+      await runInChunks(
+        lines,
+        (line, i) => {
+          const row = parseLine(line);
+          if (row && isValid(row)) addToSummary(summary, row);
+          const percent = Math.floor((i / lines.length) * 100);
+          if (percent !== lastPercent) {
+            lastPercent = percent;
+            flushSync(() => setProgress(percent)); // at most 100 updates
+          }
+        },
+        { signal: controller.signal },
+      );
+      return summary;
+    } catch (error) {
+      if (controller.signal.aborted) return null; // replaced or unmounted, not a failure
+      throw error;
+    } finally {
+      if (controllerRef.current === controller) setProgress(null);
+    }
+  };
+
+  return { importFile, progress };
+}
+```
+
+What changed:
+
+- **The loop runs in slices of about 10 ms.** `runInChunks(items, work, { budgetMs, signal })` processes items until its time budget is used up, then awaits `yieldToMain()`. The browser handles queued input and can paint before the next slice starts.
+- **Rows are accumulated, not collected.** `addToSummary` updates running totals, so there are no intermediate `rows` and `valid` arrays and memory stays flat.
+- **Progress is coarse.** One update per percent means at most 100 renders, not 60,000.
+- **Abort stops it cleanly.** Starting another import or leaving the page aborts the signal, and the loop stops at the next item.
+
+The import takes slightly longer in total, because of the yields. In exchange, the page is never blocked for more than a slice.
+
+## Why the fix works
+
+The work didn't shrink. It got split into many short tasks instead of one long one, and every gap between them is a chance for the browser to respond. `yieldToMain()` uses `scheduler.yield()` where it exists (Chromium 129+, Firefox 142+). Its continuation resumes ahead of other queued tasks, so yielding costs little. Elsewhere, such as Safari, it posts a fresh task through a `MessageChannel`, which avoids the minimum delay browsers add to nested `setTimeout(0)` calls.
+
+That priority is also why the progress update uses `flushSync`. A plain `setProgress` schedules React's render as an ordinary task. In browsers with `scheduler.yield()`, the loop's continuations run ahead of ordinary tasks, so that render can wait until the whole import ends. `flushSync` renders the progress bar immediately, and the browser paints it at the next frame. It's cheap here, because it runs at most 100 times, and each time it renders one small component.
+
+Chunking fits work of a few hundred milliseconds that's easy to slice. For seconds of CPU work, or a library you can't slice, such as a parser, a compressor or an image codec, move the work off the main thread:
+
+```ts title="import.worker.ts" good
+import { addToSummary, createSummary, isValid, parseLine } from './csv';
+
+self.onmessage = (event: MessageEvent<{ id: number; buffer: ArrayBuffer }>) => {
+  const { id, buffer } = event.data;
+  const text = new TextDecoder().decode(buffer);
+  const summary = createSummary();
+  for (const line of text.split('\n')) {
+    const row = parseLine(line);
+    if (row && isValid(row)) addToSummary(summary, row);
+  }
+  self.postMessage({ id, summary }); // only the totals travel back
+};
+```
+
+On the main thread, create the worker once with `new Worker(new URL('./import.worker.ts', import.meta.url), { type: 'module' })`, a form Vite, webpack 5 and Next.js all bundle. Send the file with `worker.postMessage({ id, buffer }, [buffer])`, which transfers the `ArrayBuffer` instead of copying it. Tag each job with an ID and ignore replies from older jobs, listen for the worker's `error` event, and call `worker.terminate()` when the owner unmounts. A busy worker can't process a "cancel" message until its current job finishes, so `terminate()` is the only hard stop.
+
+| Work | Approach |
+|---|---|
+| Under about 50 ms in total | Leave it on the main thread |
+| Hundreds of milliseconds, easy to slice, updates state as it goes | `runInChunks` with coarse progress |
+| Seconds of CPU work, or a library you can't slice | A Web Worker, with transferred buffers and small results |
+| Needs the DOM | Main thread only, so reduce the work itself |
+
+## How to confirm the fix
+
+1. Open the Performance panel, set CPU throttling to 4×, and record while you import the file.
+2. Before the fix, the main thread shows one long task of a second or more, flagged in red, with no frames inside it. After it, you see a row of short tasks of about 10 ms, with frames painted between them.
+3. Click a button or type in a field during the import. Each interaction responds within a slice.
+4. In the field, the Long Animation Frames API (`PerformanceObserver` with type `long-animation-frame`, Chromium 123+) reports frames blocked by script, with the script that blocked them.
+
+## Watch out for
+
+- **Feedback that never paints.** Setting "Importing…" and then running a long loop in the same task shows nothing, because the browser paints only after the task ends. `flushSync` updates the DOM, but it doesn't paint. Yield before unavoidable work, then chunk it or send it to a worker.
+- **A single slow item.** `runInChunks` runs at least one item per slice, so one item that takes 200 ms still blocks for 200 ms. Keep `work` itself short.
+- **Yielding at unsafe points.** Other code, including React renders, can run between slices and change state. Don't yield in the middle of work that must stay consistent.
+- **A CSS spinner that hides the freeze.** CSS `transform` and `opacity` animations can keep running on the compositor while the main thread is blocked. The page still ignores input. See <FixLink slug="animation-freezes-during-work" />.

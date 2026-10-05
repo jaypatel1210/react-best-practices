@@ -1,0 +1,55 @@
+---
+import { SITE, repoUrl } from '../config';
+import { url } from '../lib/urls';
+import BrandMark from './BrandMark.astro';
+
+const year = new Date().getUTCFullYear();
+---
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-about">
+        <a class="brand" href={url('/')}>
+          <BrandMark class="brand-mark" />
+          <span>{SITE.name}</span>
+        </a>
+        <p>
+          Fifteen open-source skills that teach Claude to write, review and debug React, with every rule shown as a real
+          issue and its fix.
+        </p>
+      </div>
+      <div>
+        <h2>Learn</h2>
+        <ul>
+          <li><a href={url('/fixes/')}>All fixes</a></li>
+          <li><a href={url('/skills/')}>Skills</a></li>
+          <li><a href={url('/checklist/')}>Review checklist</a></li>
+          <li><a href={url('/utilities/')}>Tested utilities</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href={url('/how-it-works/')}>How it works</a></li>
+          <li><a href={url('/about/')}>About</a></li>
+          <li><a href={url('/rss.xml')}>RSS feed</a></li>
+          <li><a href={url('/sitemap-index.xml')}>Sitemap</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Source</h2>
+        <ul>
+          <li><a href={SITE.repo.url} rel="noopener">GitHub repository</a></li>
+          <li><a href={repoUrl('skills', 'tree')} rel="noopener">Skill files</a></li>
+          <li><a href={`${SITE.repo.url}/issues`} rel="noopener">Report an issue</a></li>
+          <li><a href={repoUrl('LICENSE')} rel="noopener">MIT license</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-base">
+      <span>© {year} {SITE.author.name}. Code and content under the MIT license.</span>
+      <span>Not affiliated with Meta or the React team.</span>
+    </div>
+  </div>
+</footer>

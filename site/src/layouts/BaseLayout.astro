@@ -1,0 +1,111 @@
+---
+import displayFont from '@fontsource-variable/space-grotesk/files/space-grotesk-latin-wght-normal.woff2?url';
+import Footer from '../components/Footer.astro';
+import Header from '../components/Header.astro';
+import Search from '../components/Search.astro';
+import Seo, { type SeoProps } from '../components/Seo.astro';
+import { SITE } from '../config';
+import { url } from '../lib/urls';
+import '../styles/global.css';
+
+type Props = SeoProps;
+
+const props = Astro.props;
+
+// Latin subset of the variable display face; one file covers every weight.
+const fontFace = `@font-face{font-family:'Space Grotesk';font-style:normal;font-display:swap;font-weight:300 700;src:url(${displayFont}) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}`;
+
+// Prerender same-site pages when a link is hovered or pressed (Chromium); other browsers ignore it.
+const speculationRules = JSON.stringify({
+  prerender: [{ where: { href_matches: `${url('/')}*` }, eagerness: 'moderate' }],
+});
+---
+
+<!doctype html>
+<html lang={SITE.lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script is:inline>
+      // Set the theme before first paint to avoid a flash of the wrong colors.
+      (function () {
+        var root = document.documentElement;
+        var dark = window.matchMedia('(prefers-color-scheme: dark)');
+        var stored = null;
+        try {
+          stored = localStorage.getItem('theme');
+        } catch (e) {}
+        root.dataset.theme = stored === 'light' || stored === 'dark' ? stored : dark.matches ? 'dark' : 'light';
+        dark.addEventListener('change', function (event) {
+          var current = null;
+          try {
+            current = localStorage.getItem('theme');
+          } catch (e) {}
+          if (!current) root.dataset.theme = event.matches ? 'dark' : 'light';
+        });
+      })();
+    </script>
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content={SITE.themeColor.light} />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content={SITE.themeColor.dark} />
+    <link rel="preload" href={displayFont} as="font" type="font/woff2" crossorigin />
+    <style set:html={fontFace}></style>
+    <Seo {...props} />
+    <script type="speculationrules" set:html={speculationRules} />
+    <slot name="head" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <Header />
+    <main id="main">
+      <slot />
+    </main>
+    <Footer />
+    <Search />
+
+    <script>
+      // Copy buttons for code blocks. Lines removed in a diff are left out of the copied text.
+      const COPY_ICON =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg>';
+
+      function codeText(root: Element): string {
+        const lines = root.querySelectorAll('.line');
+        if (!lines.length) return root.textContent ?? '';
+        return Array.from(lines)
+          .filter((line) => !line.classList.contains('remove'))
+          .map((line) => line.textContent ?? '')
+          .join('\n');
+      }
+
+      async function copy(button: HTMLButtonElement, text: string) {
+        try {
+          await navigator.clipboard.writeText(text);
+          button.dataset.copied = 'true';
+          button.lastChild!.textContent = 'Copied';
+        } catch {
+          button.lastChild!.textContent = 'Press ⌘C';
+        }
+        setTimeout(() => {
+          button.dataset.copied = 'false';
+          button.lastChild!.textContent = 'Copy';
+        }, 1600);
+      }
+
+      document.querySelectorAll('figure.code').forEach((figure) => {
+        const head = figure.querySelector('.code-head');
+        const pre = figure.querySelector('pre');
+        if (!head || !pre) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'copy-button';
+        button.setAttribute('aria-label', 'Copy code');
+        button.innerHTML = `${COPY_ICON}<span>Copy</span>`;
+        button.addEventListener('click', () => copy(button, codeText(pre)));
+        head.append(button);
+      });
+
+      document.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach((button) => {
+        button.addEventListener('click', () => copy(button, button.dataset.copy ?? ''));
+      });
+    </script>
+  </body>
+</html>

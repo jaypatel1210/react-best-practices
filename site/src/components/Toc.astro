@@ -1,0 +1,51 @@
+---
+import type { MarkdownHeading } from 'astro';
+
+interface Props {
+  headings: MarkdownHeading[];
+}
+
+const items = Astro.props.headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+{
+  items.length > 1 && (
+    <nav class="toc" aria-labelledby="toc-title" data-toc>
+      <h2 id="toc-title">On this page</h2>
+      <ol>
+        {items.map((h) => (
+          <li class={`depth-${h.depth}`}>
+            <a href={`#${h.slug}`}>{h.text}</a>
+          </li>
+        ))}
+      </ol>
+    </nav>
+  )
+}
+
+<script>
+  // Mark the section currently in view.
+  const toc = document.querySelector('[data-toc]');
+  if (toc && 'IntersectionObserver' in window) {
+    const links = new Map(
+      Array.from(toc.querySelectorAll<HTMLAnchorElement>('a')).map((a) => [decodeURIComponent(a.hash.slice(1)), a]),
+    );
+    const headings = Array.from(links.keys())
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
+    const visible = new Set<string>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) visible.add(entry.target.id);
+          else visible.delete(entry.target.id);
+        }
+        const current = headings.find((h) => visible.has(h.id));
+        if (!current) return;
+        links.forEach((link, id) => link.setAttribute('aria-current', String(id === current.id)));
+      },
+      { rootMargin: '-72px 0px -60% 0px' },
+    );
+    headings.forEach((h) => observer.observe(h));
+  }
+</script>

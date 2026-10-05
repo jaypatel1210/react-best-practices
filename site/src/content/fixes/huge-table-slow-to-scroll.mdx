@@ -1,0 +1,154 @@
+---
+title: "A table with thousands of rows is slow to render and scroll"
+description: "Mapping 20,000 entries into JSX mounts every row and DOM node. Virtualize: render only the rows in view plus a few extra, inside a fixed-height scroll container."
+skill: react-large-lists
+kind: performance
+symptom: "A log or data table takes seconds to appear, scrolling and filtering stutter, and the page holds tens of thousands of DOM elements."
+cause: "The component maps every entry to a row, so React renders and the browser lays out all of them, even though about twenty fit on screen."
+fix: "Virtualize the list: render the visible rows plus a small overscan inside a bounded scroll container, with data-ID keys, memoized rows and ARIA row counts."
+tags: [virtualization, TanStack Virtual, large lists, DOM size, memo]
+react: "All versions"
+order: 1
+source: skills/react-large-lists/examples/virtualized-table.md
+published: 2026-10-01
+related: [typing-lags-heavy-list, index-keys-mix-up-row-state, list-rows-all-rerender]
+featured: true
+---
+
+import VirtualListDemo from '@/components/demos/VirtualListDemo';
+
+An admin screen shows an audit log of 20,000 entries: time, actor, action and target. Opening it freezes the tab for about two seconds. Scrolling stutters, filtering is slow, and the Elements panel takes a while even to expand the table. About twenty rows fit on screen at once.
+
+Making each row cheaper won't fix this. The problem is how many rows exist.
+
+## Reproduce it
+
+<VirtualListDemo client:visible />
+
+With **Render every row**, press **Load** and watch the mount time and the element count, then scroll the log. Reset, switch to **Render the window** and load again. The mount takes a few milliseconds, and the row count stays near 30 wherever you scroll, out of 10,000 entries.
+
+## Why it happens
+
+The log maps every entry to a row:
+
+```tsx title="AuditLog.tsx" bad error="5-7"
+function AuditLog({ entries }: { entries: AuditEntry[] }) {
+  return (
+    <div role="table" aria-label="Audit log" className="audit-log">
+      <AuditHeader />
+      {entries.map((entry) => (
+        <AuditRow key={entry.id} entry={entry} />
+      ))}
+    </div>
+  );
+}
+```
+
+A list costs what React renders and the browser lays out, not what the user can see. With 20,000 entries and five or six elements per row, that's over 100,000 DOM elements:
+
+- **React renders and mounts every row**: 20,000 component calls and DOM insertions before the first paint.
+- **The browser computes style and layout for every element**, and repeats much of that work whenever something above or around the rows changes size.
+- **Memory grows** with each node, and every later update to the list has to reconcile all 20,000 rows.
+
+`memo` on the rows doesn't help the first render, because there's nothing to skip yet, and it doesn't shrink the DOM. Profile first: when the time goes to rendering rows, the cure is fewer rows. When it's in *Layout* or *Recalculate Style*, DOM size is the cause, and the cure is the same.
+
+## The fix
+
+Render only the rows inside the viewport, plus a small buffer, inside a scroll container of fixed height. TanStack Virtual is the usual production choice: it's headless, so your markup and styles stay yours.
+
+```tsx title="AuditLog.tsx" good mark="7-13,18-20"
+import { useVirtualizer } from '@tanstack/react-virtual';
+
+const ROW_HEIGHT = 36;
+
+function AuditLog({ entries }: { entries: AuditEntry[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: entries.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 8,
+    getItemKey: (index) => entries[index].id, // identity follows the entry, not the slot
+  });
+
+  return (
+    <div role="table" aria-label="Audit log" aria-rowcount={entries.length + 1} className="audit-log">
+      <AuditHeader />
+      <div ref={scrollRef} className="audit-log__body" style={{ height: 600, overflow: 'auto' }}>
+        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((item) => (
+            <AuditRow
+              key={item.key}
+              entry={entries[item.index]}
+              rowIndex={item.index + 2} // aria-rowindex is 1-based, and the header is row 1
+              start={item.start}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const AuditRow = memo(function AuditRow({ entry, rowIndex, start }: AuditRowProps) {
+  return (
+    <div
+      role="row"
+      aria-rowindex={rowIndex}
+      className="audit-row"
+      style={{ position: 'absolute', top: 0, left: 0, right: 0, height: ROW_HEIGHT, transform: `translateY(${start}px)` }}
+    >
+      <span role="cell">{formatTime(entry.at)}</span>
+      <span role="cell">{entry.actor}</span>
+      <span role="cell">{entry.action}</span>
+      <span role="cell">{entry.target}</span>
+    </div>
+  );
+});
+```
+
+What each part does:
+
+- **A bounded scroll container.** The body has a fixed height and `overflow: auto`. A container that grows with its content makes every row "visible", and the virtualizer can't skip anything.
+- **A spacer as tall as the whole list.** `getTotalSize()` keeps the scrollbar honest, and each row is positioned inside it with `translateY`.
+- **Keys from the data.** `getItemKey` ties each row's identity to its entry, so when a filter removes entries, row state doesn't shift to a neighbor (<FixLink slug="index-keys-mix-up-row-state" />).
+- **Memoized rows with primitive props.** The row gets `start` as a number and builds its style inside. When the window moves, rows already on screen keep the same props and skip rendering, and only the newly visible ones render.
+- **Modest overscan.** Eight rows on each side hide blank gaps during fast scrolling. Much more brings the rendering cost back.
+- **ARIA row counts.** `aria-rowcount` tells assistive technology the log has 20,001 rows, and `aria-rowindex` says where each rendered row sits.
+
+A `div` grid stands in for `<table>`, because absolutely positioned rows don't work well inside table layout. Share the column widths between the header and the rows with one `grid-template-columns` value, for example a custom property on `.audit-log`.
+
+## Why the fix works
+
+Underneath, a virtualizer is a few lines of arithmetic, which is all the demo does by hand:
+
+```ts title="window.ts"
+const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+const last = Math.min(count, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN);
+// render entries.slice(first, last), each at translateY(index * ROW_HEIGHT)
+```
+
+The cost of the list now depends on the height of the viewport, not the length of the data. Mounting 20,000 entries costs the same as mounting 30. Scrolling re-renders the list component, but memoized rows mean only a row or two actually render each time the window moves.
+
+Use a library rather than that arithmetic in production. It handles the parts that get fiddly: measuring rows of different heights, following container resizes, scrolling to an index, window scrolling and grids. Use the one the project already has, whether that's TanStack Virtual, react-window or react-virtuoso.
+
+When rows expand to show details, heights stop being fixed. Render each row with `ref={virtualizer.measureElement}` and `data-index={item.index}`, give `estimateSize` a value close to the real average so the scrollbar doesn't jump, and don't set a fixed `height` on measured rows.
+
+## How to confirm the fix
+
+1. Record opening the log in the Performance panel with 4× CPU throttling. Before, there's one long task with large *Layout* blocks. After, the mount takes a few milliseconds.
+2. In the console, run `document.querySelectorAll('.audit-log *').length`. It should drop from six figures to a few hundred.
+3. Record a scroll in the React DevTools Profiler. Rows that stay on screen show as not rendered, and only the newly visible rows render.
+4. Scroll to the very end. The last entry must be reachable, and the scrollbar thumb should be as small as 20,000 rows imply.
+
+## Watch out for
+
+- **Row state resets.** Rows unmount when they scroll away, so an expanded row collapses when you scroll back. Keep that state in the parent, keyed by ID: a `Set` of expanded IDs and one stable `onToggle(id)` for every row.
+- **`scrollIntoView` can't reach a row that isn't rendered.** To jump to a deep-linked entry, find its index and call `virtualizer.scrollToIndex(index, { align: 'center' })`, then move focus into the row once it mounts.
+- **Browser features see only the window.** Find-in-page, printing and "select all" work on rendered rows only. Offer a filter box and an export, and say so in the UI.
+- **Screen readers read rendered rows only.** `aria-rowcount` gives the true size, but arrow-key navigation between rows has to scroll the virtualizer.
+- **The React Compiler.** The hooks lint plugin flags `useVirtualizer` with its `incompatible-library` rule, and the compiler leaves values derived from it unmemoized. Keep the component that calls it thin, and put the work in memoized rows.
+
+## When this isn't enough
+
+Virtualization makes rendering cheap, but filtering 20,000 entries on every keystroke is still work. Pair the virtualizer with a deferred filter, as in <FixLink slug="typing-lags-heavy-list" />. And when the list is a few hundred simple rows, skip virtualization: render them all, with memoized rows, or paginate.

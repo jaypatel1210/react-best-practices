@@ -1,0 +1,95 @@
+/* WaterfallDemo: the mini dashboard cards, spinners and the timeline axis. */
+
+.wfd-page {
+  display: grid;
+  gap: 8px;
+  min-height: 150px;
+  align-content: start;
+}
+
+.wfd-card {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 0.88rem;
+}
+
+.wfd-card-title {
+  margin: 0 0 4px;
+  font-size: 0.74rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.wfd-card ul {
+  margin: 0;
+  padding-left: 1.1em;
+}
+
+.wfd-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  color: var(--text-3);
+  font-size: 0.88rem;
+}
+
+.wfd-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: wfd-spin 800ms linear infinite;
+}
+
+@keyframes wfd-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.wfd-waiting {
+  position: absolute;
+  inset: 0 8px;
+  display: flex;
+  align-items: center;
+  color: var(--text-3);
+  font-size: 0.74rem;
+}
+
+.wfd-axis {
+  position: relative;
+  height: 1.2em;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+
+.wfd-axis span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+}
+
+.wfd-axis span:first-child {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wfd-spinner {
+    animation: none;
+    border-top-color: var(--border-strong);
+  }
+}
+
+/* Inside article prose, list rules from .prose would otherwise add extra spacing. */
+.demo .wfd-card li + li {
+  margin-top: 0;
+}

@@ -1,0 +1,61 @@
+/* FlipDemo: a six-row leaderboard. */
+
+.fl-round {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.fl-board {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fl-row {
+  display: grid;
+  grid-template-columns: 2ch 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.fl-rank {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--text-3);
+  text-align: right;
+}
+
+.fl-avatar {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.fl-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.fl-score {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.fl-note {
+  color: var(--text-3);
+  font-size: 0.85rem;
+}

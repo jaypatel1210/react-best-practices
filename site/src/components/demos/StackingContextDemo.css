@@ -1,0 +1,145 @@
+/* StackingContextDemo: a mini app whose frame stands in for the browser window. */
+
+.sc-app {
+  position: relative;
+  height: 300px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+  /* Containment makes the frame the containing block for position: fixed descendants, so the
+     dialog's "fixed" positioning fills this frame instead of the real window. */
+  contain: layout paint;
+}
+
+.sc-viewport {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.sc-viewport:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+.sc-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  min-height: 46px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.sc-logo {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.sc-page {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.sc-card {
+  position: relative;
+  display: grid;
+  justify-items: start;
+  align-content: start;
+  gap: 8px;
+  height: 120px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+  /* A leftover "GPU layer" hack. It also creates a stacking context and a containing block. */
+  transform: translateZ(0);
+}
+
+.sc-card-title {
+  font-weight: 650;
+  color: var(--text);
+}
+
+.sc-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sc-list li {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 0.88rem;
+}
+
+.sc-badge {
+  padding: 0 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1.7;
+  color: var(--info);
+  background: var(--info-soft);
+  white-space: nowrap;
+}
+
+/* The dialog: identical in both modes. */
+.sc-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+}
+
+.sc-dialog {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  translate: -50% -50%;
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  width: min(290px, calc(100% - 24px));
+  min-height: 190px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.sc-dialog:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.sc-dialog-title {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.sc-dialog-text {
+  color: var(--text-2);
+  font-size: 0.88rem;
+}
+
+.sc-dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-self: end;
+  align-self: end;
+}

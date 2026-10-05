@@ -1,0 +1,24 @@
+---
+import Icon, { type IconName } from './Icon.astro';
+
+interface Props {
+  type?: 'note' | 'tip' | 'warn' | 'danger';
+  title?: string;
+}
+
+const { type = 'note', title } = Astro.props;
+const ICON: Record<NonNullable<Props['type']>, IconName> = {
+  note: 'info',
+  tip: 'tip',
+  warn: 'warn',
+  danger: 'warn',
+};
+---
+
+<aside class="callout" data-type={type}>
+  <Icon name={ICON[type]} />
+  <div class="callout-body">
+    {title && <p class="callout-title">{title}</p>}
+    <slot />
+  </div>
+</aside>

@@ -1,0 +1,129 @@
+---
+title: "A chain of effects renders values that disagree for a frame"
+description: "Effects that copy state into more state add a render per link and briefly show mismatched values. Derive them during render, and set choices in the handler."
+skill: react-effects
+kind: performance
+symptom: "Changing one input renders the component several times, and for a moment the screen shows values that don't belong together, such as a price for the wrong country."
+cause: "Each effect copies one piece of state into the next. Effects run after a commit, so every link adds a render in which some values are new and some are stale."
+fix: "Keep only what the user chose in state, compute everything else during render, and set related state together in the event handler."
+tags: [useEffect, derived state, effect chains, set-state-in-effect, batching]
+react: "All versions"
+order: 2
+source: skills/react-effects/examples/effects-you-dont-need.md
+published: 2026-10-01
+related: [form-keeps-previous-items-text, effect-refetches-forever, usememo-everywhere-no-faster]
+featured: false
+---
+
+A checkout page has a shipping estimate. The customer picks a country, the zone list updates, the first zone is preselected, and the price follows. Each step is an effect that reads one piece of state and writes the next.
+
+It looks fine on a fast laptop. On a mid-range phone, QA reports that switching from the United States to Germany briefly shows a US price next to German zones. Someone adds a loading flag to hide the flicker, which takes one more effect. The component gets harder to follow, and the flicker is still there under load.
+
+## Why it happens
+
+Here's the estimate. Every value lives in state, and three effects keep them in step:
+
+```tsx title="ShippingEstimate.tsx" bad error="7-9"
+function ShippingEstimate({ cart }: { cart: Cart }) {
+  const [country, setCountry] = useState<CountryCode>('US');
+  const [zones, setZones] = useState<Zone[]>([]);
+  const [zone, setZone] = useState<Zone | null>(null);
+  const [cost, setCost] = useState(0);
+
+  useEffect(() => setZones(zonesFor(country)), [country]);
+  useEffect(() => setZone(zones[0] ?? null), [zones]);
+  useEffect(() => setCost(zone ? priceFor(zone, cart.weightKg) : 0), [zone, cart.weightKg]);
+
+  return (
+    <>
+      <CountrySelect value={country} onChange={setCountry} />
+      <ZoneSelect zones={zones} value={zone} onChange={setZone} />
+      <p>Shipping: {formatMoney(cost)}</p>
+    </>
+  );
+}
+```
+
+The key fact: **an effect runs after React commits a render.** So an effect that sets state always means "render with the old values, commit, run the effect, render again." A chain of three effects turns one change into four renders, and each of those renders is committed with a different mix of old and new values:
+
+| Render | `country` | `zones` | `zone` | `cost` |
+|---|---|---|---|---|
+| 1, from the select's change | Germany | US zones | US zone | US price |
+| 2, after the first effect | Germany | German zones | US zone | US price |
+| 3, after the second effect | Germany | German zones | first German zone | US price |
+| 4, after the third effect | Germany | German zones | first German zone | German price |
+
+Only the last row is a state that should exist. Whether the browser paints the others depends on timing, and slower devices paint more of them. Even unpainted, they're real commits: every child re-renders with them, and any child effect runs with a price that belongs to another country.
+
+The chain also hides a coupling. If the zones ever arrive asynchronously, or the list gets refreshed into a new array, the second effect fires again and replaces the zone the customer picked with the first one in the list. Nothing in the code says "reset the selection on refresh". It happens because of how the effects are wired.
+
+## The fix
+
+Store only what the customer chose. Compute everything else during render:
+
+```tsx title="ShippingEstimate.tsx" good add="3,5-7,14-15,18"
+function ShippingEstimate({ cart }: { cart: Cart }) {
+  const [country, setCountry] = useState<CountryCode>('US');
+  const [zoneId, setZoneId] = useState<string | null>(null);
+
+  const zones = zonesFor(country);
+  const zone = zones.find((z) => z.id === zoneId) ?? zones[0] ?? null;
+  const cost = zone ? priceFor(zone, cart.weightKg) : 0;
+
+  return (
+    <>
+      <CountrySelect
+        value={country}
+        onChange={(next) => {
+          setCountry(next);
+          setZoneId(null);
+        }}
+      />
+      <ZoneSelect zones={zones} value={zone} onChange={(z) => setZoneId(z.id)} />
+      <p>Shipping: {formatMoney(cost)}</p>
+    </>
+  );
+}
+```
+
+What changed:
+
+- **Two pieces of state instead of four.** The country and the zone are things the customer picks. The zone list and the price are consequences, so they're computed.
+- **Every render is consistent.** `zones`, `zone` and `cost` come from the same inputs in the same pass, so there's no render where they disagree.
+- **The selection is an ID, not a copy of the zone.** If the list is rebuilt, the ID still finds the right entry. If the ID disappears, the fallback picks the first zone, without an effect.
+- **The country handler resets the zone itself.** Both updates happen in one event handler, so React batches them into a single render.
+
+## Why the fix works
+
+An effect exists to synchronize a component with something outside React: the network, a subscription, a timer, the DOM. `zonesFor` and `priceFor` are plain functions of state and props. There's nothing external to synchronize, so an effect can only add a render and a moment of inconsistency.
+
+The rule that replaces the chain: **if a value can be computed from props and state, compute it during render.** State is for what can't be recomputed: what the user chose, typed or toggled.
+
+What you don't need:
+
+- **No `useMemo` by default.** `zonesFor` looks up a short list. Computing it on every render is cheaper than the bookkeeping a memo adds. If profiling shows it's expensive, wrap it in `useMemo(() => zonesFor(country), [country])`, and keep it derived.
+- **No loading flag to hide the flicker.** The flicker was the chain. Without the chain there's nothing to hide.
+
+## How to confirm the fix
+
+1. Open React DevTools, go to **Profiler**, and record while you change the country once.
+2. Before the fix, the recording shows four commits for one change. After it, one.
+3. To see the mismatched frames, open the browser's **Performance** panel, set CPU throttling to a 4× or 6× slowdown, and record with screenshots while you switch countries. Before the fix you can often catch a frame with the old price. After it, there's none to catch.
+
+Recent versions of `eslint-plugin-react-hooks` include a `react-hooks/set-state-in-effect` rule that flags `setState` called synchronously in an effect body. Each line in the chain above trips it. Enable the rule, and treat each warning as a question: what external system does this effect synchronize with?
+
+## How to spot this in review
+
+- An effect whose body is one `setX(…)` call computed from its dependencies.
+- State that copies a prop or another piece of state: `zones`, `fullName`, `filteredItems`, `total`.
+- A selected *object* in state, next to the list it came from. Store its ID instead.
+
+Ask three questions of any effect. Which external system does it synchronize with? If none, remove it. Would running it twice in a row, with a cleanup in between, still be correct? If not, it's missing a cleanup. Does it store something render could calculate? Then derive it.
+
+<Callout type="tip" title="The same smell, in other shapes">
+An effect that resets state when a prop changes, such as `useEffect(() => setDraft(''), [itemId])`, shows the old draft for a frame. Give the component `key={itemId}` instead, so React starts it fresh: see <FixLink slug="form-keeps-previous-items-text" />. An effect that calls a parent's `onChange` after your state updates tells the parent one render late. Call the callback in the same handler that sets the state.
+</Callout>
+
+## When this isn't enough
+
+If the zones come from the server, fetching them does need an effect, or better, a data library or a route loader. Keep the rest of the fix anyway: fetch the list, and still derive the selected zone and the price during render from the list, `zoneId` and the cart. Copying fetched data into more state with more effects brings the chain back. For fetching in effects without loops or races, see <FixLink slug="effect-refetches-forever" />.

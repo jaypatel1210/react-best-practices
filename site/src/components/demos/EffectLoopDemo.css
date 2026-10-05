@@ -1,0 +1,69 @@
+/* EffectLoopDemo: the reports panel, its rows and the safety-stop notice. */
+
+.elp-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+
+.elp-field .demo-input {
+  min-width: 110px;
+}
+
+.elp-page {
+  font-size: 0.86rem;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.elp-rows {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.elp-rows li {
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 0.86rem;
+}
+
+.elp-rows .elp-empty {
+  color: var(--text-3);
+}
+
+.elp-log li {
+  flex-wrap: wrap;
+}
+
+.elp-log li > :last-child {
+  margin-left: auto;
+}
+
+.elp-stop {
+  padding: 10px 12px;
+  border: 1px solid var(--issue);
+  border-radius: 10px;
+  background: var(--issue-soft);
+  color: var(--text);
+  font-size: 0.88rem;
+}
+
+/* Inside article prose, list rules from .prose would otherwise win over demo.css. */
+.demo .elp-log {
+  padding: 8px;
+}
+
+.demo .elp-rows {
+  padding: 0;
+}
+
+.demo .elp-log li + li,
+.demo .elp-rows li + li {
+  margin-top: 0;
+}

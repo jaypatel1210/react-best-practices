@@ -1,0 +1,116 @@
+---
+title: "A long page of heavy sections is slow to render and scroll"
+description: "Forty settings sections cost the browser style and layout work on load, even offscreen. content-visibility: auto with contain-intrinsic-size lets it skip them."
+skill: react-large-lists
+kind: performance
+symptom: "A long page of forms, tables and previews, such as settings or documentation, takes most of a second to appear and stutters while you scroll, though only one section is on screen."
+cause: "The browser computes style, layout and paint for every section on load and after many changes, because nothing tells it that offscreen sections can wait."
+fix: "Give each section content-visibility: auto with a contain-intrinsic-size estimate, portal overlays out of contained sections, and mount the heaviest widgets as they approach."
+tags: [content-visibility, contain-intrinsic-size, CSS containment, IntersectionObserver, useInView]
+react: "All versions"
+order: 3
+source: skills/react-large-lists/examples/long-pages.md
+published: 2026-10-01
+related: [huge-table-slow-to-scroll, modal-hidden-under-header, hero-image-loads-late]
+featured: false
+---
+
+An organization settings page has 40 sections: members, roles, billing, integrations, webhooks, audit options and more. Each renders real forms, tables and previews. Everything has to be reachable through anchor links such as `#webhooks` and searchable with find-in-page, so virtualizing the page would break things users rely on.
+
+The Performance panel tells the story. Opening the page spends about 900 ms in *Recalculate Style* and *Layout*, and scrolling stutters. React's own rendering is a small part of the total.
+
+## Why it happens
+
+The page renders every section, which is what you want:
+
+```tsx title="SettingsPage.tsx" bad mark="4-7"
+function SettingsPage({ sections }: { sections: SettingsSectionConfig[] }) {
+  return (
+    <main className="settings">
+      {sections.map((section) => (
+        <section key={section.id} id={section.id} className="settings-section" aria-labelledby={`${section.id}-title`}>
+          <h2 id={`${section.id}-title`}>{section.title}</h2>
+          <section.Component />
+        </section>
+      ))}
+    </main>
+  );
+}
+```
+
+The cost isn't React's. After React commits, the browser has to work out the style of every element and the size and position of every box, on screen or not, before the first paint. Forty sections of forms and tables is tens of thousands of elements. Later changes, such as a font arriving, the window resizing or a section expanding, can send the browser back through layout for much of the page.
+
+React has no lever here. It skips re-renders, but it can't tell the browser to skip layout. CSS can.
+
+## The fix
+
+Let the browser skip sections that are far from the viewport:
+
+```css title="settings.css" good add="2-3"
+.settings-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 720px; /* roughly the average section height */
+}
+```
+
+- **`content-visibility: auto`** tells the browser it may skip style, layout and paint for a section's contents while the section is offscreen, and do that work as it approaches the viewport.
+- **`contain-intrinsic-size: auto 720px`** gives skipped sections a placeholder height, so the page keeps roughly its real length and the scrollbar stays put. The `auto` keyword makes the browser remember each section's real height once it has rendered, so scrolling back up is stable.
+
+React still renders and mounts every section, so the DOM is all there. Anchor links, the accessibility tree and find-in-page, in most browsers, keep working.
+
+### Fix what containment changes
+
+Right after the change, two bugs usually appear, both from the containment that `content-visibility: auto` always applies, even to visible sections:
+
+- **A dropdown is cut off at the section's edge.** Paint containment means nothing inside the section paints outside its box. Render menus, popovers and tooltips through a portal or the browser's top layer (<FixLink slug="modal-hidden-under-header" />), which is the right fix for overflow and stacking problems anyway.
+- **A "fixed" save bar scrolls with its section.** A contained element becomes the containing block for `position: fixed` descendants. Move the bar outside the sections, or portal it.
+
+A third problem shows up as you scroll: the scrollbar jumps when a section's real height is far from the estimate. The members table might be 3,000 px tall. Give outliers their own estimate:
+
+```css title="settings.css" good
+.settings-section[data-size='tall'] {
+  contain-intrinsic-size: auto 2400px;
+}
+```
+
+### Mount the heaviest parts on approach
+
+`content-visibility` saves browser work, not JavaScript. An embedded chart or a live preview still loads and runs its code on page load. Mount those when they get close:
+
+```tsx title="UsageChartSection.tsx" good
+function UsageChartSection() {
+  const [ref, inView] = useInView<HTMLDivElement>({ rootMargin: '400px 0px', once: true });
+  return (
+    <div ref={ref} style={{ minHeight: 320 }}>
+      {inView ? <UsageChart /> : <ChartPlaceholder />}
+    </div>
+  );
+}
+```
+
+`useInView` (React 18+) is one of the skill's <SiteLink to="/utilities/">tested utilities</SiteLink>. The `minHeight` reserves the chart's space, so mounting it doesn't shift the page, and `once: true` stops observing after the first hit. Plain iframes and images don't need a hook: `loading="lazy"` is the browser's built-in version of the same idea, as long as you keep their `width` and `height`.
+
+## Why the fix works
+
+`content-visibility: auto` is a promise that a section's contents don't affect anything outside it, which lets the browser treat each section as a closed box. While a box is far away, it only needs the box's estimated size, so the cost of the first render tracks what's near the viewport instead of the length of the page.
+
+It fits a page like this one, with dozens of large, independent sections that must stay in the DOM. It doesn't replace virtualization for thousands of list rows, because React would still render and mount every row.
+
+It's Baseline since September 2025, and browsers without it render the page normally, so it's a safe progressive enhancement. In Safari 18, find-in-page doesn't search skipped sections.
+
+## How to confirm the fix
+
+1. Record a page load in the Performance panel, before and after. Compare the time in *Recalculate Style* and *Layout*, and do the same for a scroll from top to bottom. The DOM node count stays the same, which is expected.
+2. Open every dropdown, tooltip and date picker in a contained section, and check that none is clipped.
+3. Scroll from the top to the bottom and back. If the scrollbar thumb jumps, adjust the estimates for the sections that cause it.
+4. Use find-in-page for text deep in the page, and follow a few anchor links.
+
+## Watch out for
+
+- **Work in skipped sections.** A section that polls, animates or draws on a canvas keeps doing it while skipped. Listen for the `contentvisibilityautostatechange` event on the section itself: its `skipped` flag says whether the browser is skipping it, so you can pause polling while it's `true`.
+- **Sections visible on load.** Leave the first screen's sections without `content-visibility`, since there's nothing to skip there.
+- **Tiny elements.** Apply it to large blocks such as sections and cards, not to rows of a few pixels, where the bookkeeping costs more than it saves.
+
+## When this isn't enough
+
+With hundreds of sections or thousands of list items, React still renders and mounts all of them, and the DOM stays huge. That calls for virtualization or pagination: <FixLink slug="huge-table-slow-to-scroll" />. And sections whose state changes often while offscreen still cost React renders, so keep that state local to the section, or pause its updates while it's skipped.

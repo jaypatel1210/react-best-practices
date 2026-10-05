@@ -1,0 +1,83 @@
+/* LayoutFlickerDemo: a document box with a toolbar pinned to its top edge. */
+
+.lf-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.lf-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--brand);
+}
+
+.lf-doc {
+  position: relative;
+  padding: 14px 16px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.lf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lf-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.lf-tip {
+  position: absolute;
+  left: 0;
+  z-index: 2;
+  padding: 5px 10px;
+  border-radius: 7px;
+  background: var(--text);
+  color: var(--bg);
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+
+.lf-tip[data-placement='top'] {
+  bottom: calc(100% + 8px);
+}
+
+.lf-tip[data-placement='bottom'] {
+  top: calc(100% + 8px);
+}
+
+.lf-lines {
+  display: grid;
+  gap: 9px;
+  margin-top: 22px;
+}
+
+.lf-lines i {
+  display: block;
+  height: 9px;
+  border-radius: 5px;
+  background: var(--surface-3);
+}
+
+.lf-lines i:nth-child(2) {
+  width: 88%;
+}
+
+.lf-lines i:nth-child(3) {
+  width: 94%;
+}
+
+.lf-lines i:nth-child(4) {
+  width: 60%;
+}

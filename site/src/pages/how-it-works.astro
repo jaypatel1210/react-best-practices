@@ -1,0 +1,388 @@
+---
+import { getCollection } from 'astro:content';
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import SessionExplainer, { type ExplainerScenario } from '@/components/explainer/SessionExplainer';
+import Icon from '@/components/Icon.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import { repoUrl, SITE } from '@/config';
+import { SKILL_IDS } from '@/content.config';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { approxTokens, skillFiles } from '@/lib/repo';
+import { breadcrumbs } from '@/lib/seo';
+import { fixUrl, url } from '@/lib/urls';
+
+const docs = await getCollection('skillDocs');
+const metadataTokens = Math.round(docs.reduce((sum, d) => sum + d.data.name.length + d.data.description.length, 0) / 4);
+const totalTokens = SKILL_IDS.reduce((sum, id) => {
+  const f = skillFiles(id);
+  return sum + f.skillTokens + [...f.examples, ...f.references, ...f.assets].reduce((s, p) => s + approxTokens(p), 0);
+}, 0);
+
+const read = (file: string, text: string) => ({ actor: 'load' as const, file, tokens: approxTokens(file), text });
+
+const scenarios: ExplainerScenario[] = [
+  {
+    id: 'laggy',
+    label: 'Laggy typing',
+    steps: [
+      { actor: 'you', text: 'Typing in the coupon field on the order page is laggy. Can you fix it?' },
+      {
+        actor: 'match',
+        text: 'Every skill’s name and description is already in context. “laggy typing” matches react-best-practices and react-rerenders.',
+      },
+      read('skills/react-best-practices/SKILL.md', 'The entry skill: the mental model, and a symptom map that routes “typing feels laggy” to re-renders.'),
+      read('skills/react-rerenders/SKILL.md', 'The focused skill: find the state that changes, list what its owner renders, then fix the structure.'),
+      {
+        actor: 'claude',
+        text: 'OrderPage owns the coupon draft, so each keystroke re-renders OrderTimeline and InvoicePreview, about 20 ms each. Neither reads the draft.',
+      },
+      read('skills/react-rerenders/examples/move-state-down.md', 'The worked example that matches this case: page-level input state.'),
+      {
+        actor: 'claude',
+        text: 'Moving the draft into a CouponField component. The page keeps only the applied coupon.',
+        code: `- const [coupon, setCoupon] = useState('');\n+ <CouponField onApply={setAppliedCoupon} />`,
+      },
+      {
+        actor: 'claude',
+        text: 'Checked in the Profiler: typing now re-renders CouponField only. No memo needed.',
+        link: { href: fixUrl('typing-lags-state-too-high'), label: 'Read this fix' },
+      },
+    ],
+  },
+  {
+    id: 'modal',
+    label: 'Modal under the header',
+    steps: [
+      { actor: 'you', text: 'Our modal shows up under the sticky header, even with z-index: 9999.' },
+      { actor: 'match', text: 'The description of react-layout-portals mentions modals, z-index and clipping. It matches.' },
+      read('skills/react-layout-portals/SKILL.md', 'Stacking contexts, containing blocks, portals and the top layer.'),
+      {
+        actor: 'claude',
+        text: 'The card around the modal has transform set, which creates a stacking context. Inside it, no z-index can beat the header.',
+      },
+      read('skills/react-layout-portals/examples/portals-and-overlays.md', 'The worked example: the trap, the portal fix, and the surprises portals bring.'),
+      {
+        actor: 'claude',
+        text: 'Rendering the modal into document.body with createPortal, so the card’s stacking context no longer applies.',
+        code: `+ return createPortal(<Modal … />, document.body);`,
+      },
+      {
+        actor: 'claude',
+        text: 'One more check from the example: clicks inside the portal still bubble to the card’s onClick, so I stop them at the overlay root.',
+        link: { href: fixUrl('modal-hidden-under-header'), label: 'Read this fix' },
+      },
+    ],
+  },
+  {
+    id: 'review',
+    label: 'Review a pull request',
+    steps: [
+      { actor: 'you', text: 'Review OrdersTable.tsx before I merge.' },
+      { actor: 'match', text: 'A React review matches the entry skill, which holds the review workflow.' },
+      read('skills/react-best-practices/SKILL.md', 'How to review: order findings by impact, give each a failure scenario and a fix.'),
+      read('skills/react-best-practices/references/review-checklist.md', 'The checklist, grouped by area, with a severity guide.'),
+      {
+        actor: 'claude',
+        text: '[High] key={index} on a sortable table: expanded rows stay at their position after a sort. [Medium] An inline style makes memo(Row) re-render on every sort. [Low] A useCallback on a handler passed only to a button.',
+      },
+      read('skills/react-reconciliation/SKILL.md', 'A focused skill opens only for the finding that needs depth.'),
+      {
+        actor: 'claude',
+        text: 'Fix for the high-severity finding: key={order.id}. Everything else is listed with a minimal diff.',
+        link: { href: url('/checklist/'), label: 'Open the review checklist' },
+      },
+    ],
+  },
+];
+
+const title = 'How the React skills work with Claude';
+const description =
+  'Claude loads only what a task needs: skill descriptions first, then SKILL.md, then one worked example. See it step by step, and install the skills in two commands.';
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'How it works', path: '/how-it-works/' },
+];
+const faqs = [
+  {
+    q: 'Do I need to call a skill by name?',
+    a: 'No. Work as usual. Claude compares what you ask with each skill’s description and loads the ones that match. You can still name one, for example “use the react-memoization skill to review this component”.',
+  },
+  {
+    q: 'Which React versions and frameworks do the skills cover?',
+    a: 'React 18 and 19, including 19.2 and the React Compiler, in any framework: Next.js, Vite, Remix, React Router, or React Native (except the DOM-specific parts). The skills check your package.json before giving version-specific advice.',
+  },
+  {
+    q: 'Does it work with JavaScript, not only TypeScript?',
+    a: 'Yes. The examples are written in TypeScript, and Claude drops the type annotations in JavaScript projects.',
+  },
+  {
+    q: 'Will Claude add memo everywhere?',
+    a: 'The opposite. The skills teach structural fixes first (moving state, passing children, fixing keys), and memoization only where a measured hot path remains. With the React Compiler on, they tell Claude not to hand-memoize new code.',
+  },
+  {
+    q: 'Can I use the skills outside Claude Code?',
+    a: 'Yes. Each folder under skills/ is a standard Agent Skill. Zip one and upload it where your Claude plan allows custom skills, or attach it through the Skills API.',
+  },
+  {
+    q: 'Can I use the fixes on this site without Claude?',
+    a: 'Of course. Every fix is written for people first: the symptom, the cause, the code and how to confirm it. The tested utilities are plain TypeScript files you can copy.',
+  },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  {
+    '@type': 'FAQPage',
+    mainEntity: faqs.map((f) => ({ '@type': 'Question', name: f.q, acceptedAnswer: { '@type': 'Answer', text: f.a } })),
+  },
+];
+---
+
+<BaseLayout title={title} description={description} og="how-it-works" schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        A skill is a folder of instructions that Claude reads only when a task calls for it. Fifteen of them cover
+        React from re-renders to Core Web Vitals, without crowding the context window.
+      </p>
+    </header>
+
+    <ol class="layers" aria-label="What Claude loads, and when">
+      <li>
+        <span class="layer-num">1</span>
+        <h2>Descriptions, always</h2>
+        <p>
+          The name and description of all 15 skills, about {metadataTokens.toLocaleString('en-US')} tokens in total. This
+          is how Claude knows which skill fits your request.
+        </p>
+      </li>
+      <li>
+        <span class="layer-num">2</span>
+        <h2>SKILL.md, when it matches</h2>
+        <p>The rules for one area, kept short: a mental model, a diagnosis workflow, fixes and anti-patterns.</p>
+      </li>
+      <li>
+        <span class="layer-num">3</span>
+        <h2>Examples, on demand</h2>
+        <p>
+          Worked before-and-after scenarios, references and tested code, opened only for the case in front of Claude.
+        </p>
+      </li>
+    </ol>
+
+    <section class="explainer" aria-label="Interactive session walkthrough">
+      <SessionExplainer
+        client:visible
+        scenarios={scenarios}
+        skills={[...SKILL_IDS]}
+        metadataTokens={metadataTokens}
+        totalTokens={totalTokens}
+      />
+      <p class="explainer-note">
+        A dramatized session. The files are real, and the token counts are estimated from their length (about four
+        characters per token).
+      </p>
+    </section>
+
+    <section class="install" aria-labelledby="install-title">
+      <h2 id="install-title">Install</h2>
+      <div class="install-grid">
+        <div class="install-card">
+          <h3><Icon name="terminal" /> Claude Code plugin (recommended)</h3>
+          <p>The repository is both a plugin and a plugin marketplace. In Claude Code, run:</p>
+          <InstallBlock compact />
+          <p class="small">
+            Update later with <code>/plugin update react-best-practices</code>. Skills appear namespaced, for example
+            <code>react-best-practices:react-rerenders</code>.
+          </p>
+        </div>
+        <div class="install-card">
+          <h3><Icon name="layers" /> Copy the skills</h3>
+          <p>Copy any folder from <code>skills/</code> into one of these:</p>
+          <ul>
+            <li><code>~/.claude/skills/</code> to use it in every project</li>
+            <li><code>&lt;project&gt;/.claude/skills/</code> to share it with your team through the repository</li>
+          </ul>
+          <p class="small">Each skill works on its own. The entry skill names the others and still works without them.</p>
+        </div>
+        <div class="install-card">
+          <h3><Icon name="spark" /> Claude apps and the API</h3>
+          <p>
+            Each skill is a standard Agent Skill: a <code>SKILL.md</code> with YAML frontmatter plus resources. Zip a
+            folder and upload it where your plan allows custom skills, or attach it through the Skills API.
+          </p>
+          <p class="small"><a href={repoUrl()} rel="noopener">Read the README on GitHub</a></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="faq" aria-labelledby="faq-title">
+      <h2 id="faq-title">Questions</h2>
+      {
+        faqs.map((f) => (
+          <details>
+            <summary>{f.q}</summary>
+            <p>{f.a}</p>
+          </details>
+        ))
+      }
+    </section>
+
+    <p class="credit">
+      Built and maintained by <a href={SITE.author.url} rel="noopener">{SITE.author.name}</a>. Issues and pull requests
+      are welcome on <a href={SITE.repo.url} rel="noopener">GitHub</a>.
+    </p>
+  </div>
+</BaseLayout>
+
+<style>
+  .layers {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .layers li {
+    position: relative;
+    display: grid;
+    gap: 8px;
+    align-content: start;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .layer-num {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    background: var(--brand-soft);
+    color: var(--brand);
+    font-family: var(--font-mono);
+    font-weight: 700;
+  }
+
+  .layers h2 {
+    font-size: 1.12rem;
+  }
+
+  .layers p {
+    color: var(--text-2);
+    font-size: 0.94rem;
+  }
+
+  .explainer {
+    margin-top: 40px;
+  }
+
+  .explainer-note {
+    margin-top: 10px;
+    color: var(--text-3);
+    font-size: 0.85rem;
+  }
+
+  .install {
+    margin-top: 64px;
+  }
+
+  .install > h2,
+  .faq > h2 {
+    font-size: 1.6rem;
+    margin-bottom: 18px;
+  }
+
+  .install-grid {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr 1fr;
+    gap: 16px;
+  }
+
+  .install-card {
+    display: grid;
+    gap: 12px;
+    align-content: start;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    min-width: 0;
+  }
+
+  .install-card h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.05rem;
+  }
+
+  .install-card h3 :global(svg) {
+    width: 20px;
+    height: 20px;
+    color: var(--brand);
+  }
+
+  .install-card p,
+  .install-card li {
+    color: var(--text-2);
+    font-size: 0.94rem;
+  }
+
+  .install-card ul {
+    margin: 0;
+    padding-left: 1.2em;
+    display: grid;
+    gap: 6px;
+  }
+
+  .install-card code {
+    font-size: 0.86em;
+    padding: 0.1em 0.35em;
+    border-radius: 5px;
+    background: var(--code-inline);
+    word-break: break-word;
+  }
+
+  .small {
+    font-size: 0.86rem !important;
+    color: var(--text-3) !important;
+  }
+
+  .faq {
+    margin-top: 64px;
+    max-width: 820px;
+  }
+
+  .faq details {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .faq summary {
+    padding: 16px 4px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .faq details p {
+    padding: 0 4px 18px;
+    color: var(--text-2);
+  }
+
+  .credit {
+    margin-top: 48px;
+    color: var(--text-3);
+  }
+
+  @media (max-width: 960px) {
+    .layers,
+    .install-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

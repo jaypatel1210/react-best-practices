@@ -1,0 +1,156 @@
+---
+title: "A memo component still re-renders on every parent render"
+description: "React.memo skips a render only when every prop is equal. Inline objects, arrow functions and JSX children are new each render, so stabilize them or drop memo."
+skill: react-memoization
+kind: performance
+symptom: "A component wrapped in memo shows up in every Profiler commit, even though nothing it displays has changed."
+cause: "memo compares each prop with Object.is, and an inline object, arrow function or JSX child gets created fresh each time the parent renders, so the check always fails."
+fix: "Give every prop a stable identity: hoist constants, wrap callbacks in useCallback, memoize elements, or pass data instead of JSX."
+tags: [React.memo, useCallback, useMemo, children, re-renders]
+react: "18 and 19"
+order: 1
+source: skills/react-memoization/examples/broken-memo-and-fixes.md
+published: 2026-10-01
+related: [list-rows-all-rerender, handler-sees-old-state, wrapper-state-rerenders-children]
+featured: true
+---
+
+import BrokenMemoDemo from '@/components/demos/BrokenMemoDemo';
+
+A sales dashboard has a filter sidebar, an orders table and a `RevenueChart` that draws a year of daily revenue on a canvas. The chart takes about 30 ms to render. The filters only affect the orders table, yet every click in the sidebar makes the page hitch.
+
+Someone wrapped the chart in `React.memo` to stop that. Nothing changed. The Profiler still shows `RevenueChart` rendering on every filter click, and now there's a props comparison on top.
+
+`memo` isn't broken here. It does exactly what it promises, and the props it receives are new on every render.
+
+## Reproduce it
+
+<BrokenMemoDemo client:visible />
+
+With the issue, press **Refresh the dashboard** a few times. The chart is wrapped in `memo`, yet its render count goes up with every click, because the parent hands it a new `style` object, a new `onSelect` arrow and new `children` each time. Switch to the fix and click again. The refresh count still goes up, and the chart doesn't re-render at all.
+
+## Why it happens
+
+Here's the dashboard. Each marked line creates a new value on every render:
+
+```tsx title="Dashboard.tsx" bad error="14-15,17"
+const RevenueChart = memo(function RevenueChart(props: RevenueChartProps) {
+  // Draws a year of daily revenue on a canvas: about 30 ms per render.
+});
+
+function Dashboard({ report }: { report: Report }) {
+  const [filters, setFilters] = useState<OrderFilters>(DEFAULT_FILTERS);
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
+
+  return (
+    <div className="dashboard">
+      <FilterSidebar value={filters} onChange={setFilters} />
+      <RevenueChart
+        points={report.revenueByDay}
+        style={{ height: 320 }}
+        onSelect={(point) => setSelectedDay(point.date)}
+      >
+        <ChartLegend series={report.series} />
+      </RevenueChart>
+      <OrdersTable filters={filters} day={selectedDay} />
+    </div>
+  );
+}
+```
+
+Here's what `memo` does: when the **parent** re-renders, React compares each new prop with the previous one using `Object.is`. If every prop is equal, React skips the component and everything below it. If even one differs, the component renders as if `memo` weren't there.
+
+`Object.is` compares objects and functions by reference, not by content. So:
+
+- `style={{ height: 320 }}` builds a new object on every render, and it's never equal to the previous one, even though both say `height: 320`.
+- `onSelect={(point) => …}` creates a new function on every render.
+- `<ChartLegend series={report.series} />` creates a new element object on every render. JSX between the tags arrives as the `children` prop, and React compares it like any other prop.
+
+Every filter change re-renders `Dashboard`, three props fail the check, and the 30 ms render runs anyway. Only `points` passes, because it comes from `report`, which didn't change.
+
+## The fix
+
+Give each prop an identity that changes only when its content does:
+
+```tsx title="Dashboard.tsx" good add="1,7-10,17-18,20"
+const CHART_STYLE: React.CSSProperties = { height: 320 };
+
+function Dashboard({ report }: { report: Report }) {
+  const [filters, setFilters] = useState<OrderFilters>(DEFAULT_FILTERS);
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
+
+  const handleSelect = useCallback((point: ChartPoint) => {
+    setSelectedDay(point.date);
+  }, []);
+  const legend = useMemo(() => <ChartLegend series={report.series} />, [report.series]);
+
+  return (
+    <div className="dashboard">
+      <FilterSidebar value={filters} onChange={setFilters} />
+      <RevenueChart
+        points={report.revenueByDay}
+        style={CHART_STYLE}
+        onSelect={handleSelect}
+      >
+        {legend}
+      </RevenueChart>
+      <OrdersTable filters={filters} day={selectedDay} />
+    </div>
+  );
+}
+```
+
+- **The style never changes**, so it moves to module scope. A constant needs no hook.
+- **The callback only calls a state setter**, and React keeps setters stable, so `useCallback` with an empty dependency list returns the same function on every render.
+- **The legend element is memoized** on the one value it reads. It becomes a new element only when `report.series` changes, which is exactly when the chart should re-render.
+
+Now a filter change re-renders `Dashboard`, `FilterSidebar` and `OrdersTable`. React compares the chart's four props, finds them all equal, and skips the chart and its subtree.
+
+## Why the fix works
+
+`memo` is all or nothing. It skips a render only when *every* prop passes, so a single unstable prop wastes both the comparison and the render. Stabilizing three props out of four helps no more than stabilizing none.
+
+That's also why the `useCallback` and `useMemo` here earn their place: each one feeds a comparison that benefits from it. The same hooks around a value passed to a `<div>`, or to a component without `memo`, would prevent nothing.
+
+Before you memoize, check two cheaper options:
+
+- **Move the state instead.** If the filters could live inside `FilterSidebar`, or in a provider that renders `children`, the chart's parent wouldn't re-render at all and none of this would be needed. Here `OrdersTable` needs the filters too, so the state stays in `Dashboard`.
+- **Pass data instead of elements.** A `legendSeries={report.series}` prop that the chart renders itself is stable without `useMemo`, and the chart's API gets simpler.
+
+If the project uses React Compiler, a compiled `Dashboard` caches these values and the chart's element automatically, so you don't write any of this by hand. See <FixLink slug="manual-memo-fights-compiler" />.
+
+## How to confirm the fix
+
+1. Open React DevTools, go to **Profiler**, and in its settings enable **Record why each component rendered while profiling**.
+2. Record while you change one filter.
+3. Select `RevenueChart` in the commit. Before the fix it's colored, and the reason reads "Props changed: (style, onSelect, children)". After the fix it's gray: it didn't render.
+
+For a quick check, add `console.count('RevenueChart render')` to the chart for a moment. One log per filter change means `memo` is still failing. Remove the log before you commit.
+
+## How to spot this in review
+
+The check fails for any prop that's rebuilt during render. When a `memo` component won't skip, look for these:
+
+| Prop | Fix |
+|---|---|
+| `points={data.map(…)}` or `.filter(…)` | `useMemo` the derived array on its real inputs |
+| `options={[…]}` or `config={{…}}` that never change | A module-level constant |
+| `{...props}` spread from a parent | Pass explicit, primitive props |
+| An object or function returned by a custom hook | Make the hook return stable values, so every caller benefits |
+| A default parameter such as `items = []` | A module-level `const NO_ITEMS: Item[] = []` |
+
+Nesting `memo` doesn't help either. In `<MemoPanel><MemoChart /></MemoPanel>`, the outer panel receives a new `children` element on every render, so it never skips. Memoize the element instead.
+
+Two cases look like broken `memo` but have nothing to do with props: a `memo` component still re-renders when its own state changes, and when a context it reads changes.
+
+## Watch out for
+
+Suppose the chart's click handler needs the current filters: `(point) => openDrilldown(point, filters)`. Writing `useCallback(…, [filters])` creates a new function every time the filters change, which is exactly when you want the chart to skip. The handler needs the latest filters when it's *called*, not when it's created, so give it a stable identity that reads the latest value:
+
+```tsx title="Dashboard.tsx"
+const handleSelect = useLatestCallback((point: ChartPoint) => openDrilldown(point, filters));
+```
+
+`useLatestCallback` returns a function whose identity never changes and which always calls the most recent closure. It ships as a tested hook in the <SkillLink name="react-refs-closures" /> skill.
+
+Don't solve this with a custom comparison such as `memo(RevenueChart, (prev, next) => prev.points === next.points)`. It ignores `onSelect`, so the chart keeps the first callback it received, and clicks act on the first render's filters. That's a stale closure: see <FixLink slug="handler-sees-old-state" />.

@@ -1,0 +1,63 @@
+---
+/**
+ * Wrap two or more code blocks (usually `bad` then `good`) to show them as tabs.
+ * Without JavaScript the blocks simply stack, each with its own label.
+ */
+interface Props {
+  label?: string;
+}
+const { label = 'Compare the issue and the fix' } = Astro.props;
+---
+
+<div class="compare" data-compare>
+  <div class="compare-tabs" role="tablist" aria-label={label}></div>
+  <slot />
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-compare]').forEach((compare, compareIndex) => {
+    const figures = Array.from(compare.querySelectorAll<HTMLElement>(':scope > figure.code'));
+    const tabs = compare.querySelector<HTMLElement>('.compare-tabs');
+    if (figures.length < 2 || !tabs) return;
+
+    const buttons = figures.map((figure, i) => {
+      const id = `cmp-${compareIndex}-${i}`;
+      figure.id = `${id}-panel`;
+      figure.setAttribute('role', 'tabpanel');
+      figure.setAttribute('aria-labelledby', `${id}-tab`);
+      const variant = figure.dataset.variant;
+      const name =
+        variant === 'issue' ? 'Issue' : variant === 'fix' ? 'Fix' : figure.querySelector('.code-title')?.textContent;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.id = `${id}-tab`;
+      button.setAttribute('role', 'tab');
+      button.setAttribute('aria-controls', figure.id);
+      if (variant) button.dataset.variant = variant;
+      button.textContent = name || `Version ${i + 1}`;
+      tabs.append(button);
+      return button;
+    });
+
+    function select(index: number, focus = false) {
+      buttons.forEach((button, i) => {
+        const selected = i === index;
+        button.setAttribute('aria-selected', String(selected));
+        button.tabIndex = selected ? 0 : -1;
+        figures[i].hidden = !selected;
+      });
+      if (focus) buttons[index].focus();
+    }
+
+    buttons.forEach((button, i) => {
+      button.addEventListener('click', () => select(i));
+      button.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowRight') select((i + 1) % buttons.length, true);
+        if (event.key === 'ArrowLeft') select((i - 1 + buttons.length) % buttons.length, true);
+      });
+    });
+
+    select(0);
+    compare.dataset.ready = 'true';
+  });
+</script>

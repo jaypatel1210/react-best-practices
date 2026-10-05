@@ -1,0 +1,179 @@
+---
+title: "A modal shows up under the header, even with z-index: 9999"
+description: "A modal rendered inside a transformed or clipped container can't rise above a sticky header, whatever its z-index. Render it through a portal or a native dialog."
+skill: react-layout-portals
+kind: bug
+symptom: "An export dialog opens squeezed into its container, cut off at the edges and under the sticky header once the page scrolls, and raising its z-index to 9999 changes nothing."
+cause: "An ancestor's transform makes it the containing block and a stacking context, so the dialog's position and z-index only apply inside that ancestor, which sits below the header."
+fix: "Render the dialog through createPortal into a container at the end of the body, or open a native dialog with showModal() so the browser puts it in the top layer."
+tags: [createPortal, z-index, stacking context, modals, position fixed]
+react: "All versions"
+order: 1
+source: skills/react-layout-portals/examples/portals-and-overlays.md
+published: 2026-10-01
+related: [portal-clicks-reach-parent, tooltip-flickers-into-place, long-page-slow-first-render]
+featured: true
+---
+
+import StackingContextDemo from '@/components/demos/StackingContextDemo';
+
+An analytics app has a sticky top bar with `z-index: 10` and a sidebar that slides the main content sideways with a `transform`. Deep inside the content, a report card has an **Export** button that opens a modal styled the usual way: `position: fixed`, `inset: 0`, `z-index: 9999`.
+
+The modal opens in the wrong place. It's centered on the content area instead of the screen, cut off at the content's edges, and once the page is scrolled, the header covers its top. Someone raises the z-index to 99999. Nothing changes, because the number was never the problem.
+
+## Reproduce it
+
+<StackingContextDemo client:visible />
+
+With the issue, open the dialog: it's squeezed into the card and cut off at the card's edges. Scroll inside the mini app and the header slides over it. Switch to the fix and open it again: the same dialog, with the same CSS, covers the whole frame, header included. The demo's frame stands in for the browser window, so nothing escapes onto this page.
+
+## Why it happens
+
+Here's the layout. The sidebar animation puts a `transform` on `<main>`, and `<main>` scrolls its own content:
+
+```tsx title="AppFrame.tsx" bad error="11"
+function AppFrame({ children }: { children: React.ReactNode }) {
+  const [isNavOpen, setIsNavOpen] = useState(true);
+  const shift = `translateX(${isNavOpen ? 0 : -240}px)`;
+
+  return (
+    <>
+      <header className="topbar">
+        <button onClick={() => setIsNavOpen((open) => !open)}>Menu</button>
+      </header>
+      <aside className="nav" style={{ transform: shift }} />
+      <main className="content" style={{ transform: shift }}>
+        {children}
+      </main>
+    </>
+  );
+}
+```
+
+```css title="app.css" bad mark="1-2" error="3"
+.topbar { position: sticky; top: 0; z-index: 10; }
+.content { overflow: auto; }
+.modal { position: fixed; inset: 0; z-index: 9999; }
+```
+
+```tsx title="ExportButton.tsx" bad mark="6"
+function ExportButton() {
+  const [isOpen, setIsOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setIsOpen(true)}>Export</button>
+      {isOpen && <ExportModal onClose={() => setIsOpen(false)} />}
+    </>
+  );
+}
+```
+
+Three CSS rules explain the result, and each one is a trap of its own:
+
+1. **`position: fixed` is relative to the viewport only when no ancestor captures it.** A `transform`, `filter`, `backdrop-filter`, `perspective`, `contain: layout` or `paint`, `content-visibility: auto`, or a `will-change` naming one of those makes that ancestor the containing block. The modal's `inset: 0` now means "fill `<main>`", which is why it centers on the content instead of the screen.
+2. **Overflow clips descendants whose containing block is inside it.** `<main>` is both the containing block and the scroll container, so its `overflow: auto` cuts the modal off at its edges.
+3. **`z-index` only competes within one stacking context.** The `transform` also makes `<main>` a stacking context, painted at level 0 among its siblings, below the header's `z-index: 10`. The modal's 9999 ranks it among `<main>`'s own descendants and nowhere else.
+
+Think of stacking contexts as folders. Elements are sorted inside their folder, and then each folder is sorted as one unit against its siblings. No number written on a sheet of paper lifts it above the folder it's in. The only way out is to move the sheet into a different folder.
+
+Removing the `transform` would fix this layout, until the next animation, hover effect or `will-change` adds one somewhere above the modal. Overlays need to stop depending on their ancestors.
+
+## The fix
+
+Render the modal through a portal, so its DOM leaves `<main>` entirely:
+
+```tsx title="ExportModal.tsx" good add="1,4,17"
+import { createPortal } from 'react-dom';
+
+function ExportModal({ onClose }: { onClose: () => void }) {
+  return createPortal(
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-title"
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="export-title">Export report</h2>
+        <ExportForm onDone={onClose} />
+      </div>
+    </div>,
+    document.body,
+  );
+}
+```
+
+```css title="app.css" good
+.modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; }
+```
+
+The modal's DOM now sits at the end of `<body>`, outside every transformed, clipped or stacked ancestor. Its containing block is the viewport again, nothing clips it, and it competes in the root stacking context, where `z-index: 100` is plenty to clear the header's 10. Keep a short, named scale (header, overlays, toasts) instead of escalating numbers.
+
+From React's point of view, nothing moved. `ExportModal` is still a child of `ExportButton`: it reads the same context, re-renders with its parent and unmounts with it.
+
+`document.body` is read only when the modal renders, which happens after a click, so this is safe with server rendering. If an overlay can be open on the first render, from a URL parameter for example, create the portal only after mount, because `document` doesn't exist on the server.
+
+### Or let the browser do it with `<dialog>`
+
+A `<dialog>` opened with `showModal()` goes into the browser's top layer, which sits above every stacking context and ignores ancestors' `overflow` and `transform`. It also makes the rest of the page inert and closes on <kbd>Esc</kbd>. Its DOM stays next to its React parent, so no portal is needed:
+
+```tsx title="ExportDialog.tsx" good
+function ExportDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+  }, [open]);
+
+  return (
+    <dialog ref={ref} onClose={onClose} aria-labelledby="export-title">
+      <h2 id="export-title">Export report</h2>
+      <ExportForm onDone={onClose} />
+    </dialog>
+  );
+}
+```
+
+A modal `<dialog>` is widely available. You still own the open and close animations and returning focus to the trigger. If the project already has a dialog primitive (Radix, React Aria, Headless UI, MUI), use it: it handles focus trapping, scroll locking and <kbd>Esc</kbd>, and it already portals or uses the top layer.
+
+## Why the fix works
+
+CSS follows the DOM tree, and React follows the component tree. A portal changes the first and leaves the second alone, which is exactly what an overlay needs. Positioning, clipping and stacking are decided by where the DOM lives, while state, context and events keep working as if the modal never moved.
+
+What you don't need:
+
+- **A bigger z-index.** No value can escape a parent stacking context.
+- **Removing the transform.** It fixes this layout and breaks on the next one.
+- **Moving the button.** An overlay's position shouldn't depend on where its trigger happens to live.
+
+## How to confirm the fix
+
+1. Open the modal, select it in the Elements panel and check its parent. It should be `<body>`, or your `#overlay-root`, not an element inside `<main>`.
+2. To confirm the diagnosis, select the old modal and walk up its ancestors in the Computed pane, looking for `transform`, `filter`, `will-change`, `contain`, `overflow`, and `position` with `z-index`. Unticking the culprit makes the modal jump into place.
+3. Repeat the original steps: collapse the sidebar, scroll the page, open the modal. It should be centered on the screen, above the header.
+4. Lock it in with a test. Testing Library queries `document.body`, so it finds portaled content:
+
+```tsx title="ExportButton.test.tsx"
+test('the export dialog renders outside the main content', async () => {
+  const user = userEvent.setup();
+  render(
+    <AppFrame>
+      <ExportButton />
+    </AppFrame>,
+  );
+  await user.click(screen.getByRole('button', { name: 'Export' }));
+  expect(screen.getByRole('main')).not.toContainElement(screen.getByRole('dialog'));
+});
+```
+
+## Watch out for
+
+- **Events still follow the React tree.** Clicks inside the portaled modal bubble to the `onClick` handlers of `ExportButton`'s ancestors. That's why the dialog stops propagation, and it's the subject of <FixLink slug="portal-clicks-reach-parent" />.
+- **Styles scoped to the old location stop matching.** `.report-card .modal` no longer applies, and CSS variables set on `.report-card` aren't inherited. Give overlays their own classes and define design tokens on `:root`.
+- **A `<form>` doesn't span the portal.** A submit button inside the modal can't submit a form that wraps the trigger, so put the form inside the modal.
+- **Other properties set the same trap.** `filter`, `backdrop-filter` and `will-change: transform` capture fixed descendants too, and so does `content-visibility: auto`, which you might add to speed up a long page (<FixLink slug="long-page-slow-first-render" />).
+- **Focus.** Move focus into the modal, trap it there, return it to the trigger on close, and close on <kbd>Esc</kbd>.

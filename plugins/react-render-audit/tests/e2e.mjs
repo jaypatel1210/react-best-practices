@@ -119,7 +119,7 @@ async function crossCheckWebVitals(browser) {
   const { page, close } = await openPage(browser, { source: `${inPageSource('vitals')}\n${webVitals}\n${listen}` });
   const network = new NetworkLog(page);
   try {
-    await navigate(page, `${LAB}/?variant=broken&cost=60`);
+    await navigate(page, `${LAB}/?variant=broken&cost=150`);
     await settle(page, network, { quietMs: 300 });
     await evaluate(page, '__RA_VITALS__.end()');
     let ours = 0;

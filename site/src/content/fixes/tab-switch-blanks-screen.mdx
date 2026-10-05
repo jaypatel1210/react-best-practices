@@ -1,0 +1,134 @@
+---
+title: "Switching tabs blanks the screen behind a spinner"
+description: "A tab switch that suspends swaps the panel you were reading for a Suspense fallback. Switch tabs in a transition, so React keeps the old panel until the new one is ready."
+skill: react-responsiveness
+kind: performance
+symptom: "Clicking a tab you haven't opened yet replaces the panel you were reading with a skeleton or spinner, even when the data arrives a moment later."
+cause: "The tab change is an urgent update, so when the new panel suspends, React has to show the nearest Suspense fallback instead of waiting."
+fix: "Update the rendered tab inside startTransition, keep a separate urgent state for the tab bar's selection, and use isPending for a quiet busy style."
+tags: [useTransition, Suspense, startTransition, tabs, isPending]
+react: "18 and 19"
+order: 3
+source: skills/react-responsiveness/examples/transitions-and-suspense.md
+published: 2026-10-01
+related: [screen-blanks-between-items, every-route-ships-upfront, typing-lags-heavy-list]
+featured: false
+---
+
+A sales report viewer has three tabs: Summary, Regions and Products. Each panel loads its own data through Suspense, with a query hook such as `useSuspenseQuery`. You're halfway through the Summary numbers when you click **Regions**. The summary vanishes, a grey skeleton fills the panel for a few hundred milliseconds, and then Regions appears.
+
+On a fast connection it's a flash of grey for no reason. On a slow one, you lose your place and stare at placeholder bars, when the summary could have stayed on screen until Regions was ready.
+
+## Why it happens
+
+The tab state is set directly from the tab bar:
+
+```tsx title="ReportViewer.tsx" bad error="5"
+function ReportViewer({ reportId }: { reportId: string }) {
+  const [tab, setTab] = useState<ReportTab>('summary');
+  return (
+    <>
+      <TabBar value={tab} onChange={setTab} />
+      <Suspense fallback={<PanelSkeleton />}>
+        <ReportPanel reportId={reportId} tab={tab} />
+      </Suspense>
+    </>
+  );
+}
+```
+
+When `ReportPanel` renders with `tab="regions"` for the first time, the Regions data isn't cached yet, so the component **suspends**: it tells React it can't render until a promise settles. What React does next depends on the kind of update:
+
+- **An urgent update has to commit now.** A click is urgent, so React can't leave the old screen in place. It hides the suspended content and shows the nearest Suspense boundary's fallback, here `PanelSkeleton`.
+- **A transition can wait.** If the same update is marked as a transition, React keeps the content that's already on screen and finishes the new tree in the background until the data arrives.
+
+The skeleton isn't a loading state you asked for. It's React keeping its promise to show *something* for an urgent update.
+
+## The fix
+
+Run the tab change in a transition:
+
+```tsx title="ReportViewer.tsx" good add="3,6-7,11"
+function ReportViewer({ reportId }: { reportId: string }) {
+  const [tab, setTab] = useState<ReportTab>('summary');
+  const [isPending, startTransition] = useTransition();
+  return (
+    <>
+      <TabBar value={tab} onChange={(next) => startTransition(() => setTab(next))} />
+      <div className="report-panel" aria-busy={isPending}>
+        <Suspense fallback={<PanelSkeleton />}>
+          <ReportPanel reportId={reportId} tab={tab} />
+        </Suspense>
+      </div>
+    </>
+  );
+}
+```
+
+The Summary panel now stays on screen while Regions loads, and `isPending` is `true` meanwhile, so the panel can show a quiet busy style.
+
+That creates a second problem: the tab bar looks stuck. `tab` doesn't change until the transition finishes, so the clicked tab doesn't highlight for those few hundred milliseconds. Keep an urgent state for what the user selected, and a transition state for what's rendered:
+
+```tsx title="ReportViewer.tsx" good add="2-4,6-9,13-14,16,18"
+function ReportViewer({ reportId }: { reportId: string }) {
+  const [selectedTab, setSelectedTab] = useState<ReportTab>('summary'); // urgent: the tab bar
+  const [renderedTab, setRenderedTab] = useState<ReportTab>('summary'); // transition: the panel
+  const [isPending, startTransition] = useTransition();
+
+  const selectTab = (next: ReportTab) => {
+    setSelectedTab(next);
+    startTransition(() => setRenderedTab(next));
+  };
+
+  return (
+    <>
+      <TabBar value={selectedTab} onChange={selectTab} />
+      <div className="report-panel" aria-busy={isPending}>
+        <Suspense fallback={<PanelSkeleton />}>
+          <ReportPanel reportId={reportId} tab={renderedTab} />
+        </Suspense>
+      </div>
+    </>
+  );
+}
+```
+
+```css title="report-panel.css"
+.report-panel[aria-busy='true'] {
+  opacity: 0.6;
+  transition: opacity 200ms ease 150ms; /* the delay skips the dimming when data is quick */
+}
+```
+
+The tab highlights at once, the old panel dims slightly, and the new panel replaces it when its data is ready.
+
+## Why the fix works
+
+`startTransition` marks an update as non-urgent. For Suspense, that changes the rule: when an update inside a transition suspends, React keeps showing content that's already visible, with `isPending` set, instead of replacing it with a fallback. It's the same split as a controlled input in front of an expensive list. The control updates urgently, and the expensive consumer is allowed to lag.
+
+A few details follow from the rule:
+
+- **First loads still show the skeleton.** A boundary that has never shown content has nothing to keep, so it shows its fallback even inside a transition. That's what you want on the first visit.
+- **Routers already do this.** Most routers run navigations as transitions, which is why moving between pages keeps the old page up. Tabs, steppers and wizards you build yourself need the same treatment.
+- **React 19 accepts async functions** in `startTransition`. A state update that comes after an `await` inside one needs its own `startTransition` wrapper to stay part of the transition.
+
+You don't need to cache the previous panel's data by hand or add an `isLoading` flag that keeps old content. The transition already keeps the old UI.
+
+## How to confirm the fix
+
+1. In the Network panel, set throttling to a slow profile and reload, so no tab's data is cached.
+2. Read the Summary, then click **Regions**. Before the fix, the skeleton replaces the summary. After it, the summary stays, dimmed, and Regions replaces it when it's ready.
+3. Click a third tab while the second is loading. The highlight should move immediately and the panel should go straight to the last tab you picked.
+4. In a test, render the viewer with a never-resolving data promise for Regions, click the tab, and assert that the summary text is still in the document and the panel has `aria-busy="true"`.
+
+## Watch out for
+
+- **A `key` that changes per tab.** A `key` on the Suspense boundary, or on a component that contains it, creates a new boundary for each tab, and a new boundary shows its fallback even in a transition. Sometimes that's right: one customer's report is different content from another's. For tabs of the same report, leave the key off.
+- **`flushSync` around the update.** It forces a synchronous render, which can push already-visible content back to the fallback.
+- **A controlled input as the tab control.** If the tabs are driven by a search box or a select, keep the control's own value urgent and put only the panel's state in the transition. A controlled input updated in a transition lags and can drop characters.
+
+## When this isn't enough
+
+If a tab's data takes seconds, keeping a stale panel up for that long is confusing too. Start the request earlier: prefetch the tab's data when the pointer enters or focuses the tab, so it's often cached by the time of the click. The same idea applies to code, in <FixLink slug="every-route-ships-upfront" />.
+
+Going back to a tab you already opened shouldn't reload it at all. On React 19.2+, `<Activity mode="hidden">` keeps a hidden panel's state and DOM while it's offscreen, and cleans up its effects until it's visible again.

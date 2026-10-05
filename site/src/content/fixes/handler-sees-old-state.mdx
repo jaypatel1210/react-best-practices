@@ -1,0 +1,175 @@
+---
+title: "A socket handler or memoized callback keeps using old state"
+description: "Callbacks registered once, or held by a memo child, keep the values from the render that created them. Use useEffectEvent on React 19.2+ or a latest-ref callback."
+skill: react-refs-closures
+kind: bug
+symptom: "Changing a filter has no effect on live socket messages, or a memoized form section submits the values from when the page loaded."
+cause: "A function that's kept, by a subscription registered once or by a memo child whose comparator ignores callbacks, keeps the props and state of the render that created it."
+fix: "Read the latest values without re-subscribing: useEffectEvent inside effects on React 19.2+, or a stable latest-ref callback such as useLatestCallback for props and older versions."
+tags: [stale closures, useEffectEvent, useCallback, memo, WebSocket]
+react: "18 and 19"
+order: 4
+source: skills/react-refs-closures/examples/stale-closures.md
+published: 2026-10-01
+related: [interval-counter-stuck-at-one, memo-component-still-rerenders, debounce-fires-every-keystroke]
+featured: false
+---
+
+An operations dashboard streams new orders over a WebSocket and shows only those above a minimum total. The filter defaults to $100. A manager lowers it to $10, and nothing changes: small orders still don't appear, although the input clearly says 10. Reloading the page with the new default works.
+
+On another screen, a contract form puts an expensive signature pad next to a name field. The pad is memoized so typing stays fast. The first contract submitted from it arrives with an empty name.
+
+Both bugs have the same cause, and the same two-part fix.
+
+## Why it happens
+
+Here's the live feed:
+
+```tsx title="LiveOrders.tsx" bad error="7,10"
+function LiveOrders({ minTotal }: { minTotal: number }) {
+  const [orders, setOrders] = useState<Order[]>([]);
+
+  useEffect(() => {
+    const socket = connectOrders();
+    socket.on('order', (order: Order) => {
+      if (order.total >= minTotal) setOrders((prev) => [order, ...prev]); // minTotal from the first render
+    });
+    return () => socket.close();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return <OrderList orders={orders} />;
+}
+```
+
+And the contract form:
+
+```tsx title="ContractForm.tsx" bad error="5,13"
+const SignatureCanvas = memo(
+  function SignatureCanvas({ penColor, onDone }: SignatureCanvasProps) {
+    return <SignaturePad penColor={penColor} onFinish={onDone} />; // expensive to render
+  },
+  (prev, next) => prev.penColor === next.penColor, // "ignore onDone, it always changes"
+);
+
+function ContractForm() {
+  const [fullName, setFullName] = useState('');
+  return (
+    <>
+      <input value={fullName} onChange={(e) => setFullName(e.target.value)} />
+      <SignatureCanvas penColor="navy" onDone={() => submitContract({ fullName })} />
+    </>
+  );
+}
+```
+
+Every render creates new functions, and each one captures the props and state of that render. That's fine for functions that are thrown away after the render, which most are. It breaks for a function that's **kept**, because it keeps reading the values from when it was created. A function gets kept when it's:
+
+- registered once as a listener or subscription, like the socket handler;
+- held by a `memo` child whose comparator ignores it, like `onDone`;
+- cached by `useCallback` or `useMemo` with an incomplete dependency list;
+- stored in a ref once, as in `useRef(handler)`, which uses its argument only on the first render;
+- baked into a debounced or throttled wrapper.
+
+The socket handler was registered in the first render's effect, when `minTotal` was 100, and the empty dependency list means it's never replaced. The suppression comment silenced the linter's warning about exactly this.
+
+The signature pad's comparator says "re-render only when `penColor` changes", so the pad never receives a new `onDone`. It holds the first one, created when `fullName` was an empty string, and that's the name it submits.
+
+The obvious repairs make things worse in other ways. Adding `minTotal` to the dependencies fixes the staleness, but closes and reopens the socket on every filter change, dropping messages in between. For the form, `useCallback(() => submitContract({ fullName }), [fullName])` without the custom comparator is correct, but it changes on every keystroke and re-renders the pad each time, which is what `memo` was supposed to prevent.
+
+What both need is a function that **stays the same** while **reading the latest values**.
+
+## The fix
+
+### For logic called from an effect: `useEffectEvent` (React 19.2+)
+
+```tsx title="LiveOrders.tsx" good add="3-5,9,11"
+function LiveOrders({ minTotal }: { minTotal: number }) {
+  const [orders, setOrders] = useState<Order[]>([]);
+  const onOrder = useEffectEvent((order: Order) => {
+    if (order.total >= minTotal) setOrders((prev) => [order, ...prev]); // always the latest minTotal
+  });
+
+  useEffect(() => {
+    const socket = connectOrders();
+    socket.on('order', (order: Order) => onOrder(order)); // called from code the effect set up
+    return () => socket.close();
+  }, []); // Effect Events are deliberately left out of the dependency list
+
+  return <OrderList orders={orders} />;
+}
+```
+
+An Effect Event always sees the latest props and state, and it isn't a dependency, so the effect connects once. Call it only from inside effects, including callbacks those effects register, such as this socket handler. Don't pass it to child components or call it during render; the hooks lint rules flag both.
+
+### On earlier versions, or for props: the latest-ref pattern
+
+`useLatestCallback`, one of the repository's <SiteLink to="/utilities/">tested utilities</SiteLink>, returns a function whose identity never changes but which always calls the newest version of your callback. On React 18 and React 19.0 or 19.1, use it for the socket:
+
+```tsx title="LiveOrders.tsx" good add="1-3,7,9"
+const onOrder = useLatestCallback((order: Order) => {
+  if (order.total >= minTotal) setOrders((prev) => [order, ...prev]);
+});
+
+useEffect(() => {
+  const socket = connectOrders();
+  socket.on('order', onOrder);
+  return () => socket.close();
+}, [onOrder]); // a stable identity, so the effect runs once
+```
+
+It's also the right tool on any version for the form, because an Effect Event can't be passed as a prop:
+
+```tsx title="ContractForm.tsx" good add="3,7,11"
+const SignatureCanvas = memo(function SignatureCanvas({ penColor, onDone }: SignatureCanvasProps) {
+  return <SignaturePad penColor={penColor} onFinish={onDone} />;
+}); // no custom comparator
+
+function ContractForm() {
+  const [fullName, setFullName] = useState('');
+  const onDone = useLatestCallback(() => submitContract({ fullName }));
+  return (
+    <>
+      <input value={fullName} onChange={(e) => setFullName(e.target.value)} />
+      <SignatureCanvas penColor="navy" onDone={onDone} />
+    </>
+  );
+}
+```
+
+Typing still doesn't re-render the pad, because every prop it receives is stable, and `onDone` always submits the current name.
+
+## Why the fix works
+
+The core of the latest-ref pattern is three lines:
+
+```tsx title="use-latest-callback.ts"
+const latest = useRef(callback);
+useInsertionEffect(() => {
+  latest.current = callback; // refreshed after every commit, before other effects run
+});
+const [stable] = useState(() => (...args: Args) => latest.current(...args)); // created once
+```
+
+The stable function captures the ref *object*, which never changes, and reads `.current` only when it's called. After every commit, the ref points at the callback from the newest render, so a call from a socket, a timer or a child always runs current code. React documents `useInsertionEffect` for CSS-in-JS libraries. Here it only refreshes a plain ref early, so that layout effects and effects in the same commit, including children's, already see the new callback. Don't call the stable function during render, because it may still hold the previous render's callback at that point.
+
+Before reaching for either tool, check the simpler fixes in order: a complete dependency list, then a functional update when the callback needs only the previous state (`setOrders((prev) => …)` here already does that), then moving the logic into an event handler if it belongs to an interaction. Effect Events and latest refs are for the cases those don't cover.
+
+## How to confirm the fix
+
+1. **One connection.** In the Network panel, filter by **WS** and change the filter a few times. There should be a single socket for the whole session, not a new one per change.
+2. **The new filter applies.** Lower the minimum and watch smaller orders start to appear in the feed.
+3. **A test for the feed.** With a fake `connectOrders`, render `<LiveOrders minTotal={100} />`, re-render it with `minTotal={10}`, emit an order with a total of 50, and expect it in the list, with `connectOrders` called once.
+4. **The submitted name.** Type a name, sign, and check that the request payload contains the current name.
+
+## How to spot this in review
+
+- `// eslint-disable-next-line react-hooks/exhaustive-deps` next to an effect or callback that reads props or state.
+- A custom `memo` comparator that skips function props.
+- `useRef(someFunction)`, or a debounced wrapper created once from a function that reads state.
+- Bug reports that say "it uses the old value", "it only works after a reload" or "it keeps the first value".
+
+## Watch out for
+
+Values read after `await` in an event handler are a related trap. The handler keeps running inside the closure of the render that started it, so if the user edits a field while a request is pending, the code after `await` still sees the old value. Decide which one you want. For submissions, the values at the time of the click are usually right, so capture them in local constants at the top of the handler to make that explicit. If you need the latest values, read them through a latest-value ref, and use functional updates for state that may have changed in the meantime.
+
+The same stale-closure mechanism breaks a debounce created once from a function that reads state. <FixLink slug="debounce-fires-every-keystroke" /> shows how the tested debounce hook avoids it.

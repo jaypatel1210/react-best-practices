@@ -1,0 +1,161 @@
+---
+title: "Every row in a list re-renders when one row changes"
+description: "Starring or selecting one row re-renders the whole list. Wrap rows in memo, pass stable handlers that take an ID, and give rows primitive props like isSelected."
+skill: react-memoization
+kind: performance
+symptom: "Clicking the star on one row makes every row in the list re-render, and the click feels slow on long lists."
+cause: "The list owns the state, its rows aren't memoized, and each row gets new inline callbacks plus props that change for every row at once."
+fix: "Wrap the row in memo, pass one stable handler that takes the row's ID, and pass primitive props such as isStarred and isSelected."
+tags: [React.memo, useCallback, lists, keys, re-renders]
+react: "18 and 19"
+order: 3
+source: skills/react-memoization/examples/memoized-lists.md
+published: 2026-10-01
+related: [memo-component-still-rerenders, index-keys-mix-up-row-state, huge-table-slow-to-scroll]
+featured: false
+---
+
+import MemoListDemo from '@/components/demos/MemoListDemo';
+
+An inbox renders 500 messages. Each row has a star button, the sender, a subject and a snippet. Clicking a star should feel instant, but there's a visible delay before it fills in, and it's worse on a phone.
+
+The Profiler shows why: one click re-renders all 500 rows. Each row is cheap, about 0.1 ms, but 500 of them add up to around 50 ms for a single star.
+
+## Reproduce it
+
+<MemoListDemo client:visible />
+
+With the issue, star any row and watch the render counters. All 40 rows flash and count up, although only one star changed. Switch to the fix and star a row again: only that row re-renders.
+
+## Why it happens
+
+```tsx title="Inbox.tsx" bad error="21-23" warn="30"
+function Inbox({ messages }: { messages: Message[] }) {
+  const [starred, setStarred] = useState<ReadonlySet<string>>(() => new Set());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  function toggleStar(id: string) {
+    setStarred((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  return (
+    <ul className="inbox">
+      {messages.map((m) => (
+        <MessageRow
+          key={m.id}
+          message={m}
+          isStarred={starred.has(m.id)}
+          selectedId={selectedId}
+          onToggleStar={() => toggleStar(m.id)}
+          onSelect={() => setSelectedId(m.id)}
+        />
+      ))}
+    </ul>
+  );
+}
+
+function MessageRow({ message, isStarred, selectedId, onToggleStar, onSelect }: MessageRowProps) {
+  // ...renders the row
+}
+```
+
+Three things stack up:
+
+1. **Nothing stops the re-render.** Starring calls `setStarred`, so `Inbox` re-renders, and re-rendering a component re-renders every component it renders. `MessageRow` isn't wrapped in `memo`, so React doesn't even look at its props.
+2. **Adding `memo` alone wouldn't help.** `() => toggleStar(m.id)` and `() => setSelectedId(m.id)` create two new functions for every row on every render. A `memo` row would compare its props, find new functions, and render anyway.
+3. **Some props change for every row.** When the selection moves, `selectedId` is different for all 500 rows, even though only two rows look different.
+
+## The fix
+
+Make the row skippable, then make sure its props change only when *that row* changes:
+
+```tsx title="Inbox.tsx" good add="5,12,21-23,30"
+function Inbox({ messages }: { messages: Message[] }) {
+  const [starred, setStarred] = useState<ReadonlySet<string>>(() => new Set());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const toggleStar = useCallback((id: string) => {
+    setStarred((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  return (
+    <ul className="inbox">
+      {messages.map((m) => (
+        <MessageRow
+          key={m.id}
+          message={m}
+          isStarred={starred.has(m.id)}
+          isSelected={m.id === selectedId}
+          onToggleStar={toggleStar}
+          onSelect={setSelectedId}
+        />
+      ))}
+    </ul>
+  );
+}
+
+const MessageRow = memo(function MessageRow({
+  message,
+  isStarred,
+  isSelected,
+  onToggleStar,
+  onSelect,
+}: MessageRowProps) {
+  return (
+    <li className={isSelected ? 'row row--selected' : 'row'}>
+      <button aria-pressed={isStarred} aria-label="Star" onClick={() => onToggleStar(message.id)}>
+        ★
+      </button>
+      <button className="row-open" onClick={() => onSelect(message.id)}>
+        {message.subject}
+      </button>
+    </li>
+  );
+});
+```
+
+What changed:
+
+- **`memo(MessageRow)`** lets React skip a row when all its props are equal.
+- **One handler for all rows.** Each handler takes the row's ID as an argument, so every row receives the same function. `toggleStar` reads the previous set through a functional update, so it needs no dependencies. `setSelectedId` is a state setter, which React already keeps stable.
+- **Primitive props.** `isStarred` and `isSelected` are booleans computed per row. Starring flips `isStarred` for one row. Moving the selection flips `isSelected` for two: the old row and the new one.
+
+`message={m}` was already fine. It stays the same object as long as that message doesn't change.
+
+## Why the fix works
+
+`memo` turns a row's render into a props comparison, and the comparison succeeds only when every prop keeps its identity. The fix moves everything that differs per row into the arguments of a shared handler, and turns list-wide state into a per-row answer. When you star a message, 499 rows compare equal and are skipped, and one row renders.
+
+The inline arrows *inside* `MessageRow` are fine. They go to DOM elements, which don't compare props, and they're recreated only when that row renders.
+
+Keys do a different job. `key={m.id}` tells React which instance belongs to which message, so a row's props really are unchanged after an insert or a sort. Keys don't skip renders; `memo` does. Together they keep lists fast. With `key={index}`, an insert at the top shifts every message onto a different instance, and every row re-renders: see <FixLink slug="index-keys-mix-up-row-state" />.
+
+## How to confirm the fix
+
+1. Open React DevTools, go to **Profiler**, and record while you star one message.
+2. Before the fix, the commit lists `Inbox` and all 500 `MessageRow` renders, and the ranked chart is a wall of rows.
+3. After the fix, it lists `Inbox` and one `MessageRow`. The other rows are gray.
+
+With **Highlight updates when components render** enabled in the DevTools settings, a single row should flash.
+
+## Watch out for
+
+- **Refetches that rebuild every object.** A fetch or `JSON.parse` returns new objects for every message, even unchanged ones, so every `memo` row re-renders after a refetch. TanStack Query keeps unchanged parts of the data identical by default (structural sharing). Without a library, merge by ID and keep the previous object when nothing in it changed.
+- **Updates that copy every item.** Replace only the item that changed: `messages.map((m) => (m.id === id ? { ...m, read: true } : m))` keeps every other object identical, so their rows skip.
+- **Handlers that need changing state.** If a row handler must read state, adding that state to `useCallback`'s dependencies hands every row a new function whenever it changes. Use a stable callback that reads the latest value instead: the latest-ref pattern in <SkillLink name="react-refs-closures" />.
+
+If the project uses React Compiler, don't add `memo` by hand; see <FixLink slug="manual-memo-fights-compiler" />. Primitive row props and handlers that take an ID still help there, because they decide which rows' inputs actually change.
+
+## When this isn't enough
+
+`memo` makes unchanged rows cheap. It doesn't make 5,000 rows cheap to mount, filter or scroll. When the list is that long, render only the rows on screen: see <FixLink slug="huge-table-slow-to-scroll" />. Memoized rows still matter inside a virtualized list, because scrolling re-renders the list container, and `memo` lets the rows that stay in view skip.

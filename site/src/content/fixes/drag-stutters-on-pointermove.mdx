@@ -1,0 +1,148 @@
+---
+title: "Dragging a slider or playhead stutters and lags behind the pointer"
+description: "Setting state on every pointermove re-renders the whole timeline and moves the playhead with left. Write a transform through a ref once per frame, and commit on release."
+skill: react-responsiveness
+kind: performance
+symptom: "While you drag a playhead or a custom slider, it trails behind the pointer and moves in jerks, and the rest of the timeline seems to redraw on every move."
+cause: "Each pointermove sets state in a parent that renders the waveform and every clip, and the handle moves through left, which costs layout every time."
+fix: "During the drag, write a transform through a ref at most once per frame with useFrameThrottledCallback, then commit the final value to state on pointerup."
+tags: [pointermove, requestAnimationFrame, refs, transform, useFrameThrottledCallback]
+react: "18 and 19"
+order: 4
+source: skills/react-responsiveness/examples/frame-aligned-updates.md
+published: 2026-10-01
+related: [expanding-panel-stutters, column-resize-css-in-js-slow, wrapper-state-rerenders-children]
+featured: false
+---
+
+An audio editor shows a waveform, a few dozen clips and a playhead that you drag to scrub. On a fast desktop it's acceptable. On a laptop running on battery, the playhead trails a centimeter behind the pointer, jumps forward in steps, and catches up only after you stop moving.
+
+The same pattern shows up in custom range sliders, crop handles, split-pane dividers and color pickers: anything that follows the pointer.
+
+## Why it happens
+
+The playhead position is state in the component that renders the whole timeline:
+
+```tsx title="Timeline.tsx" bad error="14,20"
+function Timeline({ clips, duration }: TimelineProps) {
+  const [playheadSec, setPlayheadSec] = useState(0);
+  const trackRef = useRef<HTMLDivElement>(null);
+
+  const secondsAt = (clientX: number) => {
+    const rect = trackRef.current!.getBoundingClientRect();
+    return clamp(((clientX - rect.left) / rect.width) * duration, 0, duration);
+  };
+
+  return (
+    <div
+      ref={trackRef}
+      className="timeline"
+      onPointerMove={(e) => e.buttons === 1 && setPlayheadSec(secondsAt(e.clientX))}
+    >
+      <Waveform />
+      {clips.map((clip) => (
+        <Clip key={clip.id} clip={clip} />
+      ))}
+      <div className="playhead" style={{ left: `${(playheadSec / duration) * 100}%` }} />
+    </div>
+  );
+}
+```
+
+Every pointer move pays for two things:
+
+1. **A React render of the whole timeline.** The state change re-renders `Timeline`, and with it the waveform and every clip, although none of them changed.
+2. **Layout for the handle.** `left` is a layout property. Changing it makes the browser recompute layout and repaint, while `transform` can move an element without either.
+
+A frame lasts 16.7 ms at 60 Hz. If rendering the waveform and the clips takes 25 ms, every move blows the frame budget. Frames drop, the pointer gets ahead, and the next event jumps the playhead to catch up.
+
+Browsers already deliver `pointermove` about once per frame, so the problem isn't how many events arrive. It's how much each one costs.
+
+## The fix
+
+Move the playhead outside React while the drag is in progress, and commit the final position once, on release:
+
+```tsx title="Timeline.tsx" good mark="8-12,20,33-37"
+import { useFrameThrottledCallback } from './use-frame-throttled-callback';
+
+function Timeline({ clips, duration, positionSec, onSeek }: TimelineProps) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const layerRef = useRef<HTMLDivElement>(null);
+  const dragSec = useRef(positionSec);
+
+  const movePlayhead = useFrameThrottledCallback((clientX: number) => {
+    const rect = trackRef.current!.getBoundingClientRect(); // one read per frame
+    dragSec.current = clamp(((clientX - rect.left) / rect.width) * duration, 0, duration);
+    layerRef.current!.style.transform = `translateX(${(dragSec.current / duration) * 100}%)`; // one write
+  });
+
+  return (
+    <div ref={trackRef} className="timeline">
+      <Waveform />
+      {clips.map((clip) => (
+        <Clip key={clip.id} clip={clip} />
+      ))}
+      <div ref={layerRef} className="playhead-layer" style={{ transform: `translateX(${(positionSec / duration) * 100}%)` }}>
+        <div
+          className="playhead"
+          role="slider"
+          aria-label="Playhead"
+          aria-valuemin={0}
+          aria-valuemax={duration}
+          aria-valuenow={positionSec}
+          tabIndex={0}
+          onPointerDown={(e) => {
+            dragSec.current = positionSec;
+            e.currentTarget.setPointerCapture(e.pointerId);
+          }}
+          onPointerMove={(e) => e.currentTarget.hasPointerCapture(e.pointerId) && movePlayhead(e.clientX)}
+          onPointerUp={() => {
+            movePlayhead.flush(); // apply the last position first
+            onSeek(dragSec.current); // one state update, owned by the player
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowLeft') onSeek(Math.max(0, positionSec - 1));
+            if (e.key === 'ArrowRight') onSeek(Math.min(duration, positionSec + 1));
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+```
+
+```css title="timeline.css"
+.timeline { position: relative; }
+.playhead-layer { position: absolute; inset: 0; pointer-events: none; } /* full width: translateX(%) is a fraction of the track */
+.playhead { width: 2px; height: 100%; pointer-events: auto; touch-action: none; }
+```
+
+What changed:
+
+- **No React render during the drag.** The playhead's full-width layer moves through `transform`, and the waveform and clips aren't touched.
+- **At most one update per frame.** `useFrameThrottledCallback` from the skill's <SiteLink to="/utilities/">tested utilities</SiteLink> runs the latest call once, right before the next paint. It receives `clientX`, not the event, because React clears `event.currentTarget` once the handler returns.
+- **One read, then one write.** Reading `getBoundingClientRect()` before writing `transform` means the browser never has to compute layout in the middle of the frame.
+- **Pointer capture.** `setPointerCapture` keeps pointer events coming to the handle when the pointer leaves the thin playhead.
+- **One commit on release.** `flush()` applies the last position, and `onSeek` hands it to the player, so playback, the time readout and undo history still come from state.
+
+## Why the fix works
+
+The positions in the middle of a drag are visuals, not data. Nothing else in the app needs to know the playhead was at 41.27 seconds for one frame, so they don't need to go through React. State is for the value the rest of the app depends on, and that value changes once, at the end.
+
+React still owns the committed position. `positionSec` comes from the player, and the render writes the same `transform` the drag writes, so the DOM and the state agree again as soon as `onSeek` re-renders the timeline. Keyboard users get the same result through the arrow-key handler, which calls `onSeek` directly.
+
+Throttling to the frame also pays off when several sources update the same thing. A minimap that redraws on scroll, wheel and resize can register one frame-throttled `redraw` for all three, and it redraws at most once per frame, right before paint.
+
+## How to confirm the fix
+
+1. In the Performance panel, set CPU throttling to 4× and record a two-second drag.
+2. Before the fix, each pointer move shows a React render of the timeline and a layout, and the Frames track shows dropped frames. After it, each frame has one short animation-frame callback and no React render, then a single commit on release.
+3. With React DevTools' **Highlight updates when components render** turned on, nothing flashes during the drag, and the timeline flashes once when you let go.
+4. Open the Rendering drawer and turn on **Paint flashing**. If the track repaints on every frame, add `will-change: transform` to `.playhead-layer` so it gets its own compositor layer.
+
+## Watch out for
+
+- **Touch drags that scroll the page.** Without `touch-action: none` on the handle, the browser treats a touch drag as a scroll and sends `pointercancel`. Handle `pointercancel` too, by committing or restoring the last position.
+- **State that moves during a drag.** If playback keeps updating `positionSec` while the user drags, each re-render writes the playhead's `transform` and fights the drag. Pause those updates while scrubbing.
+- **Animation frames in background tabs.** Browsers pause `requestAnimationFrame` in hidden tabs, so don't use frame throttling for timers or work that isn't visual.
+- **A live readout next to the handle.** If the time label must follow the drag, write it through a ref in the same callback, or give it a small component of its own, instead of putting the drag position back into the timeline's state.

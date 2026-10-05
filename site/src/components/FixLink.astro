@@ -1,0 +1,16 @@
+---
+/** A link to another fix by slug, so MDX content never hard-codes the base path. */
+import { getEntry } from 'astro:content';
+import { fixUrl } from '../lib/urls';
+
+interface Props {
+  slug: string;
+}
+
+const { slug } = Astro.props;
+const entry = await getEntry('fixes', slug);
+if (!entry) throw new Error(`<FixLink slug="${slug}"> points to a fix that doesn't exist.`);
+const hasText = Astro.slots.has('default');
+---
+
+<a href={fixUrl(slug)}>{hasText ? <slot /> : entry.data.title}</a>

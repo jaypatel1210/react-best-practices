@@ -1,0 +1,168 @@
+---
+title: "A debounced search still fires on every keystroke"
+description: "Calling debounce() in the render body makes a new debouncer, with its own timer, on every render. Create it once per component and have it call the latest callback."
+skill: react-refs-closures
+kind: bug
+symptom: "Typing a word in a search box sends one request per keystroke, each a few hundred milliseconds late, even though the handler is wrapped in debounce."
+cause: "The debounced function is created in the render body, so every re-render from a keystroke makes a new debouncer with its own timer, and every one of them fires."
+fix: "Create the debouncer once per component instance with a stable wrapper that calls the latest callback, keep the input's own state update immediate, and cancel on unmount."
+tags: [debounce, useDebouncedCallback, search, stale closures, AbortController]
+react: "18 and 19"
+order: 2
+source: skills/react-refs-closures/examples/debounce-and-throttle.md
+published: 2026-10-01
+related: [search-shows-stale-results, handler-sees-old-state, typing-lags-heavy-list]
+featured: true
+---
+
+import DebounceDemo from '@/components/demos/DebounceDemo';
+
+A travel site has a city search. To spare the API, the request is wrapped in `debounce` with a 400 ms delay, so it should go out once, after the user stops typing.
+
+The Network panel says otherwise. Typing "paris" sends five requests: `p`, `pa`, `par`, `pari` and `paris`, each one 400 ms after its keystroke. The debounce delays every request and collapses none of them.
+
+## Reproduce it
+
+<DebounceDemo client:visible />
+
+With **debounce() in render** selected, type a few words at a normal speed, then stop. The requests lane mirrors the keystrokes lane, shifted 400 ms to the right, and the log fills with one `GET /search` per keystroke, each carrying the text as it was at that moment. Switch to **useDebouncedCallback** and type again. The keystroke marks pile up while the requests lane stays empty, then a single request appears 400 ms after your last key, with the full text.
+
+## Why it happens
+
+```tsx title="CitySearch.tsx" bad error="3"
+function CitySearch() {
+  const [query, setQuery] = useState('');
+  const search = debounce((q: string) => fetchCities(q), 400); // a new debouncer on every render
+
+  return (
+    <input
+      value={query}
+      onChange={(e) => {
+        setQuery(e.target.value);
+        search(e.target.value);
+      }}
+    />
+  );
+}
+```
+
+A debouncer is a closure that holds a timer. Each call clears the pending timer and starts a new one, so only the last call in a burst survives the pause. That only works if every call in the burst reaches **the same** debouncer.
+
+Here, they don't. Each keystroke calls `setQuery`, which re-renders `CitySearch`. The render runs `debounce(...)` again and creates a new debouncer with a fresh, empty timer, and the next keystroke's `onChange` calls that new one. Every debouncer sees exactly one call, so every one of them fires:
+
+```text title="Typing paris with debounce() in the render body"
+"p"      → debouncer from render 1 → fetch("p")      400 ms later
+"pa"     → debouncer from render 2 → fetch("pa")     400 ms later
+"par"    → debouncer from render 3 → fetch("par")    400 ms later
+"pari"   → debouncer from render 4 → fetch("pari")   400 ms later
+"paris"  → debouncer from render 5 → fetch("paris")  400 ms later
+```
+
+The result is a delay, not a debounce. And because nothing cancels the older requests, their responses can arrive out of order.
+
+Two tempting fixes fail too:
+
+- **`useMemo(() => debounce(...), [query])`, or `useCallback` with state in its dependencies**, recreates the debouncer whenever `query` changes, which is on every keystroke. Same result.
+- **`useRef(debounce(() => fetchCities(query), 400))`** keeps one debouncer, but its function closed over the first render's `query`, so it searches for an empty string forever. (`useRef` also evaluates its argument on every render and throws it away.)
+
+What you need is a debouncer that's created **once**, but that calls a function that's **current**.
+
+## The fix
+
+The repository's `useDebouncedCallback` hook, one of its <SiteLink to="/utilities/">tested utilities</SiteLink>, does both. This version also cancels requests that a newer search supersedes:
+
+```tsx title="CitySearch.tsx" good add="9-10,23,28,35-36"
+import { useDebouncedCallback } from './hooks/use-debounced-callback';
+
+function CitySearch() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<City[]>([]);
+  const [error, setError] = useState<Error | null>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+
+  const search = useDebouncedCallback(async (q: string) => {
+    controllerRef.current?.abort(); // drop the previous in-flight request
+    if (!q.trim()) {
+      setResults([]);
+      return;
+    }
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    try {
+      const res = await fetch(`/api/cities?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+      if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+      setResults(await res.json());
+      setError(null);
+    } catch (err) {
+      if (controller.signal.aborted) return; // superseded by a newer search, not an error
+      setError(err as Error);
+    }
+  }, 400);
+
+  useEffect(() => () => controllerRef.current?.abort(), []); // abort an in-flight request on unmount
+
+  return (
+    <>
+      <input
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value); // immediate: the input stays responsive
+          search(e.target.value); // debounced: one request after typing pauses
+        }}
+      />
+      {error ? <p role="alert">{error.message}</p> : <CityList cities={results} />}
+    </>
+  );
+}
+```
+
+`useDebouncedCallback(fn, delayMs, { flushOnUnmount })` returns a function that never changes identity, with `.cancel()`, `.flush()` and `.isPending()` methods. It's typed, has no dependencies, and is tested on React 18 and 19, including a test for exactly this typing scenario.
+
+If the project already uses lodash or es-toolkit, wrap its `debounce` in the same pattern:
+
+```tsx title="useLibraryDebounce.ts" good
+function useLibraryDebounce<Args extends unknown[]>(fn: (...args: Args) => void, ms: number) {
+  const latest = useLatestCallback(fn); // a stable function that calls the newest fn
+  const [debounced] = useState(() => debounce((...args: Args) => latest(...args), ms)); // created once
+  useEffect(() => () => debounced.cancel(), [debounced]); // cancelled on unmount
+  return debounced;
+}
+```
+
+This minimal version ignores changes to `ms` after mount. The tested hook handles that.
+
+## Why the fix works
+
+A debounce that works in React needs three properties:
+
+1. **It's created once per component instance.** A `useState` initializer runs only on the first render of each instance. `useMemo` isn't a substitute: it's a performance hint, and React may discard its cache.
+2. **It calls the latest callback.** The debouncer holds a stable wrapper that reads the newest callback from a ref when the timer fires, so the request uses the current props and state. Recreating the debouncer when its dependencies change would reset its timer and bring the bug back.
+3. **It cleans up.** Pending calls are cancelled on unmount, so a request doesn't fire for a component that's gone. For autosave, flush instead, so the last edit isn't lost.
+
+Debouncing and cancellation solve different problems. The debounce reduces how many requests go out. The `AbortController` makes sure a slow, older response can't overwrite a newer one. You need both; <FixLink slug="search-shows-stale-results" /> covers the second in depth.
+
+## How to confirm the fix
+
+1. Open the Network panel, filter by `/api/cities`, and type "paris" at a normal speed. You should see one request, for `q=paris`, about 400 ms after the last key.
+2. Type, pause, then type more. You should see one request per pause, and an earlier in-flight request marked as canceled when a new one starts.
+3. In a unit test with fake timers, fire five change events 50 ms apart, advance the clock by 400 ms, and assert one call with the final text. The repository's own tests for `useDebouncedCallback` do exactly this.
+
+## Watch out for
+
+- **Don't debounce the input's own state.** If `setQuery` itself is debounced, the controlled input keeps receiving its old value and drops characters while you type. Update the input immediately and debounce only the expensive side effect.
+- **Autosave wants a throttle, not a debounce.** Someone who types without pausing would never trigger a debounced save. `useThrottledCallback`, from the same tested utilities, runs at most once per interval with a trailing call carrying the latest text, and `{ flushOnUnmount: true }` saves the pending edit when the user navigates away.
+- **Slow rendering isn't a network problem.** If typing lags because a big list filters on every keystroke, debouncing hides the lag behind a delay. A deferred value is the better tool: see <FixLink slug="typing-lags-heavy-list" />.
+- **With TanStack Query or SWR, debounce the value instead.** Derive a debounced query key and let the library handle cancellation and caching:
+
+```tsx title="useDebouncedValue.ts" good
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id); // each change resets the timer
+  }, [value, delayMs]);
+  return debounced;
+}
+```
+
+This one is correct without any refs, because the effect's cleanup clears the previous timer on every change, so only the last value survives the pause.

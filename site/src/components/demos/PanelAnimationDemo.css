@@ -1,0 +1,140 @@
+/* PanelAnimationDemo: an order summary accordion. */
+
+.pa-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.pa-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--brand);
+}
+
+.pa-pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 0.8rem;
+  color: var(--text-3);
+}
+
+.pa-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pa-stages li {
+  padding: 1px 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--text-3);
+}
+
+.pa-stages li[data-on='true'] {
+  border: 1px solid var(--demo-accent);
+  color: var(--demo-accent);
+  font-weight: 700;
+}
+
+.pa-note {
+  color: var(--text-3);
+  font-size: 0.85rem;
+}
+
+.pa-accordion {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.pa-section + .pa-section {
+  border-top: 1px solid var(--border);
+}
+
+.pa-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 11px 14px;
+  border: 0;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pa-trigger:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+.pa-chevron {
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--text-3);
+  border-bottom: 2px solid var(--text-3);
+  rotate: 45deg;
+  transition: rotate 200ms ease;
+}
+
+.pa-trigger[aria-expanded='true'] .pa-chevron {
+  rotate: -135deg;
+}
+
+.pa-body {
+  padding: 4px 14px 12px;
+  color: var(--text-2);
+  font-size: 0.9rem;
+}
+
+.pa-body p + p {
+  margin-top: 2px;
+}
+
+/* The issue: a height transition, which needs layout and paint on every frame. */
+.pa-height {
+  overflow: hidden;
+  transition: height 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* The fix: the box opens at once; the content moves with transform and opacity only. */
+.pa-reveal {
+  overflow: hidden;
+}
+
+.pa-reveal[data-open='true'] > .pa-body {
+  animation: pa-reveal-in 420ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes pa-reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(-28px);
+  }
+}
+
+.pa-total {
+  display: flex;
+  justify-content: space-between;
+  padding: 11px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.9rem;
+}

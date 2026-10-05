@@ -1,0 +1,103 @@
+---
+title: "Toggling a wrapper or a loading state wipes a component's state"
+description: "Swapping a subtree for a spinner, or switching the element that wraps it, unmounts everything inside and discards its state. Keep the tree's shape stable instead."
+skill: react-reconciliation
+kind: bug
+symptom: "A draft, an open dropdown or a search box resets whenever a background refetch runs or a layout breakpoint flips."
+cause: "The component returns a spinner in place of the content, or wraps the content in a different element type, so React unmounts the subtree and mounts a new one."
+fix: "Keep stateful content mounted under a stable parent: show loading next to it, and change a wrapper's behavior with props or CSS instead of its type."
+tags: [remounts, loading states, conditional rendering, component state, reconciliation]
+react: "All versions"
+order: 4
+source: skills/react-reconciliation/examples/reset-and-preserve-state.md
+published: 2026-10-01
+related: [screen-blanks-between-items, form-keeps-previous-items-text, input-loses-focus-every-keystroke]
+featured: false
+---
+
+A reporting app has an editor for the weekly summary. You write for ten minutes, switch to another browser tab to check a number, and come back to find the draft gone. Nobody pressed anything. The data library refetched the report when the window regained focus, and the editor showed a spinner while it did.
+
+On the same page, the toolbar's search box clears whenever the window crosses 900 px, and any open dropdown in it closes. Two different features, one cause.
+
+## Why it happens
+
+Here's the editor:
+
+```tsx title="ReportEditor.tsx" bad error="3"
+function ReportEditor({ reportId }: { reportId: string }) {
+  const { data, isFetching } = useReport(reportId);
+  if (isFetching || !data) return <Spinner />;
+  return <Editor report={data} />;
+}
+```
+
+And the toolbar:
+
+```tsx title="Toolbar.tsx" bad error="3-4"
+function Toolbar({ isCompact, children }: { isCompact: boolean; children: React.ReactNode }) {
+  return isCompact
+    ? <OverflowMenu>{children}</OverflowMenu>
+    : <div className="toolbar">{children}</div>;
+}
+```
+
+React keeps a component alive only while the same type sits in the same position with the same key. That rule applies at every level of the tree, and a component's position includes its parent. When an element's type changes, React unmounts it **and everything inside it**, then mounts the new element and all its children from scratch.
+
+- **The loading swap.** When a background refetch starts, `isFetching` turns true, and `ReportEditor` returns a `Spinner` where the `Editor` was. Different type, so React unmounts the editor and discards its state: the draft, the cursor position, the undo history. When the refetch ends, a brand-new `Editor` mounts with the server's copy of the report.
+- **The conditional wrapper.** When `isCompact` flips, `children` moves from inside an `OverflowMenu` to inside a `div`. The children are the same elements, but their parent changed type, so they unmount and mount again. React never looks for a match under a different parent. The search input clears, dropdowns close, and their effects run again.
+
+The editor bug looks random because of when it fires. If `useReport` wraps TanStack Query or SWR, both refetch when the window regains focus by default, so the draft disappears whenever someone comes back to the tab.
+
+## The fix
+
+Keep stateful content mounted, under a parent whose type doesn't change.
+
+For loading, replace the content only while there's nothing to show yet. During a background refetch, keep the editor mounted and show progress next to it:
+
+```tsx title="ReportEditor.tsx" good add="3-9"
+function ReportEditor({ reportId }: { reportId: string }) {
+  const { data, isFetching } = useReport(reportId);
+  if (!data) return <Spinner />;
+  return (
+    <>
+      {isFetching && <InlineRefreshIndicator />}
+      <Editor report={data} />
+    </>
+  );
+}
+```
+
+The first render still shows the spinner, because there's no report yet. After that, the editor keeps its place. The indicator's conditional holds its own slot even when it renders nothing, so the indicator coming and going never shifts the editor's position.
+
+For the toolbar, render one wrapper and change how it looks:
+
+```tsx title="Toolbar.tsx" good add="2"
+function Toolbar({ isCompact, children }: { isCompact: boolean; children: React.ReactNode }) {
+  return <div className={isCompact ? 'toolbar toolbar--compact' : 'toolbar'}>{children}</div>;
+}
+```
+
+If the compact layout really needs the overflow menu's behavior, keep the type stable and switch the behavior with a prop: `<OverflowMenu collapsed={isCompact}>{children}</OverflowMenu>`. When neither option works, lift the state the children need, such as the search text, above the toggle, so a remount loses nothing important.
+
+## Why the fix works
+
+Both fixes keep the tree's **shape** stable. The editor and the toolbar's children keep the same type, position and key from render to render, so React updates them in place instead of rebuilding them. What changes now is a prop, a class name or a sibling, and none of those affect identity.
+
+The same rule covers a few more cases that are easy to miss:
+
+- **Optional wrappers.** `disabled ? <Tooltip text="Saving is off"><SaveButton /></Tooltip> : <SaveButton />` remounts the button whenever `disabled` flips. Render the tooltip every time and switch it off with a prop.
+- **A changed root tag.** Switching a subtree's root from `div` to `section`, or from a Fragment to a `div`, remounts everything below it.
+- **Hiding by unmounting.** `{tab === 'notes' && <NotesPanel />}` discards the panel's state on every tab switch. To keep it, hide the panel with CSS or the `hidden` attribute. On React 19.2+, `<Activity mode={tab === 'notes' ? 'visible' : 'hidden'}>` also keeps its state and DOM, and cleans up its effects while it's hidden.
+
+## How to confirm the fix
+
+1. Type into the editor, switch to another browser tab, and come back. The draft should still be there after the refetch.
+2. Log mounts in `Editor` for a moment, with a `useEffect` that logs in its setup and in its cleanup. Before the fix, every refetch logs an unmount and a mount. After it, nothing logs while you work.
+3. In the React DevTools Profiler, with **Record why each component rendered while profiling** enabled, a remounted component reports "This is the first time the component rendered." After the fix, `Editor` reports an ordinary update during a refetch.
+4. Resize the window across the breakpoint with text in the search box and a dropdown open. Both should survive.
+
+## Watch out for
+
+Keep full swaps for the cases that need them: the initial load, an error that replaces the content, and switching to a different item, where a reset is the point. For that last case, see <FixLink slug="form-keeps-previous-items-text" />.
+
+Two loading patterns look similar but have their own fixes. If the whole view drops to a spinner every time you open the next item, keep the previous item on screen while the next one loads: see <FixLink slug="screen-blanks-between-items" />. If a Suspense fallback replaces the content on every tab switch, make the switch a transition: see <FixLink slug="tab-switch-blanks-screen" />.

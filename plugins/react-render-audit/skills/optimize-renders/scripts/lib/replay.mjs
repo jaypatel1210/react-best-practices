@@ -2,7 +2,10 @@
 // cross-origin data requests (fetch and XHR to its APIs); every later run, of either build, is
 // served those responses instantly. Backend latency and changing data stop adding noise, and both
 // builds render the same data. Requests to the app's own dev server always go through, because
-// they are part of the code being compared. Nothing recorded is written to disk.
+// they are part of the code being compared. Analytics and telemetry beacons go straight through,
+// uncounted: every one is unique, and they aren't the app's data. Nothing recorded is written to
+// disk.
+import { DEFAULT_IGNORED_REQUESTS } from './page.mjs';
 
 const RESOURCE_TYPES = ['XHR', 'Fetch'];
 const VOLATILE_PARAMS = new Set(['_', 't', 'ts', 'timestamp', 'cb', 'cachebust', 'cacheBust', 'nocache']);
@@ -67,6 +70,8 @@ export function replayHeaders(headers, { recordedOrigin, pageOrigin }) {
   return out;
 }
 
+const isTelemetry = (url) => DEFAULT_IGNORED_REQUESTS.some((pattern) => !pattern.startsWith('/') && url.includes(pattern));
+
 function originOf(url) {
   try {
     return new URL(url).origin;
@@ -109,21 +114,24 @@ export class NetworkReplay {
 
   /**
    * Records (until freeze()) or replays in `page`, a page whose app is served from `appOrigin`.
-   * Call before navigating. Returns live counters for the run.
+   * `appOrigins` lists every app server in the comparison: a request to any of them is code under
+   * test (one side's env may point its API at the other's server), so it's never recorded or
+   * replayed. Call before navigating. Returns live counters for the run.
    */
-  async attach(page, { appOrigin }) {
+  async attach(page, { appOrigin, appOrigins = [] }) {
     const mode = this.frozen ? 'replay' : 'record';
     const counters = { mode, recorded: 0, served: 0, passed: 0, misses: [] };
     const cursors = new Map();
+    const own = new Set([appOrigin, ...appOrigins].filter(Boolean));
     if (mode === 'record') this.recordedOrigin = appOrigin;
     page.on('Fetch.requestPaused', (event) => {
-      this.#handle(page, event, { mode, appOrigin, counters, cursors }).catch(() => {
+      this.#handle(page, event, { mode, own, appOrigin, counters, cursors }).catch(() => {
         page.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => {});
       });
     });
     // Recording looks at every data request; replaying intercepts only the recorded API origins,
     // so requests to the app's own server never wait on interception.
-    const urlPatterns = mode === 'record' ? ['*'] : [...new Set([...this.recordings.keys()].map((key) => originOf(key.split(' ')[1])).filter(Boolean))].map((origin) => `${origin}/*`);
+    const urlPatterns = mode === 'record' ? ['*'] : [...new Set([...this.recordings.keys()].map((key) => originOf(key.split(' ')[1])).filter((origin) => origin && !own.has(origin)))].map((origin) => `${origin}/*`);
     const patterns = [];
     for (const urlPattern of urlPatterns) {
       for (const resourceType of RESOURCE_TYPES) patterns.push({ urlPattern, resourceType, requestStage: mode === 'record' ? 'Response' : 'Request' });
@@ -132,10 +140,10 @@ export class NetworkReplay {
     return counters;
   }
 
-  async #handle(page, event, { mode, appOrigin, counters, cursors }) {
+  async #handle(page, event, { mode, own, appOrigin, counters, cursors }) {
     const { requestId, request } = event;
     const origin = originOf(request.url);
-    const passThrough = !origin || origin === appOrigin || !/^https?:/.test(request.url);
+    const passThrough = !origin || own.has(origin) || !/^https?:/.test(request.url) || isTelemetry(request.url);
     if (passThrough) {
       await page.send('Fetch.continueRequest', { requestId });
       return;

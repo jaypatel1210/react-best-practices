@@ -1,0 +1,120 @@
+---
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import { repoUrl } from '@/config';
+import { UTILITIES } from '@/data/utilities';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getSkillTitles } from '@/lib/content';
+import { readRepoFile } from '@/lib/repo';
+import { breadcrumbs, itemList } from '@/lib/seo';
+import { utilityUrl } from '@/lib/urls';
+
+const skillTitles = await getSkillTitles();
+const lineCount = (file: string) => readRepoFile(file).trimEnd().split('\n').length;
+
+const title = 'Tested React hooks and helpers you can copy';
+const description =
+  'Seven small, dependency-free TypeScript utilities: debounce, throttle, latest callback, frame throttle, yielding, IntersectionObserver and an error boundary.';
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Utilities', path: '/utilities/' },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  itemList(
+    'Tested React utilities',
+    UTILITIES.map((u) => ({ name: u.name, path: `/utilities/${u.slug}/` })),
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={title} description={description} og="utilities" schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        Some fixes need a little code that’s easy to get subtly wrong: a debounce that survives re-renders, a
+        callback that’s stable but never stale. The skills ship these as small files with tests. Copy one into your
+        project, or let Claude use it for you.
+      </p>
+      <ul class="facts">
+        <li>No dependencies</li>
+        <li>Typed with TypeScript</li>
+        <li>Tested against React 18 and 19</li>
+        <li>Clean under the React Compiler lint rules</li>
+      </ul>
+    </header>
+
+    <div class="grid grid-2">
+      {
+        UTILITIES.map((u) => (
+          <article class="card card-link util-card">
+            <span class="skill-id">{u.file.split('/').pop()}</span>
+            <h2>
+              <a href={utilityUrl(u.slug)}>{u.name}</a>
+            </h2>
+            <p>{u.summary}</p>
+            <p class="meta">
+              <span class="badge badge-skill">{skillTitles[u.skill] ?? u.skill}</span>
+              <span class="badge badge-muted">{lineCount(u.file)} lines</span>
+            </p>
+          </article>
+        ))
+      }
+    </div>
+
+    <p class="util-note">
+      The tests live in <a href={repoUrl('tests', 'tree')} rel="noopener"><code>tests/</code></a> and run with Vitest and
+      Testing Library. Every change to a utility needs a test.
+    </p>
+  </div>
+</BaseLayout>
+
+<style>
+  .facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+  }
+
+  .facts li {
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: var(--fix-soft);
+    color: var(--fix);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  .util-card h2 {
+    font-family: var(--font-mono);
+    font-size: 1.15rem;
+    letter-spacing: -0.01em;
+  }
+
+  .util-card h2 a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .util-card h2 a::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+  }
+
+  .util-card .skill-id {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+
+  .util-note {
+    margin-top: 32px;
+    color: var(--text-2);
+  }
+</style>

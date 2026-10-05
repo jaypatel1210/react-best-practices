@@ -1,0 +1,232 @@
+---
+import { getEntry } from 'astro:content';
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import CodeBlock from '@/components/CodeBlock.astro';
+import FixCard from '@/components/FixCard.astro';
+import InstallBlock from '@/components/InstallBlock.astro';
+import { repoUrl } from '@/config';
+import { UTILITIES, type Utility } from '@/data/utilities';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { getSkillTitles, type Fix } from '@/lib/content';
+import { readRepoFile } from '@/lib/repo';
+import { breadcrumbs, sourceCode } from '@/lib/seo';
+import { skillUrl, utilityUrl } from '@/lib/urls';
+
+export function getStaticPaths() {
+  return UTILITIES.map((utility) => ({ params: { slug: utility.slug }, props: { utility } }));
+}
+
+interface Props {
+  utility: Utility;
+}
+
+const { utility } = Astro.props;
+const source = readRepoFile(utility.file);
+const fileName = utility.file.split('/').pop()!;
+const lang = fileName.endsWith('.tsx') ? 'tsx' : 'ts';
+const skillTitles = await getSkillTitles();
+const related = (await Promise.all(utility.related.map((slug) => getEntry('fixes', slug)))).filter(
+  (entry): entry is Fix => Boolean(entry),
+);
+const others = UTILITIES.filter((u) => u.slug !== utility.slug);
+
+const path = `/utilities/${utility.slug}/`;
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'Utilities', path: '/utilities/' },
+  { name: utility.name, path },
+];
+const schema = [
+  breadcrumbs(crumbs, Astro.site),
+  sourceCode(
+    { path, name: utility.name, description: utility.description, repoPath: utility.file },
+    Astro.site,
+  ),
+];
+---
+
+<BaseLayout title={utility.title} description={utility.description} og={`utilities/${utility.slug}`} schema={schema}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <div class="cluster">
+        <a class="badge badge-skill" href={skillUrl(utility.skill)}>{utility.skill}</a>
+        <span class="badge badge-muted">No dependencies</span>
+        <span class="badge badge-muted">React 18 and 19</span>
+      </div>
+      <h1 class="util-title">{utility.name}</h1>
+      <p class="lede">{utility.summary}</p>
+      <p class="exports">
+        Exports: {utility.exports.map((name, i) => <>{i > 0 && ', '}<code>{name}</code></>)}
+      </p>
+    </header>
+
+    <div class="util-layout">
+      <div class="prose util-main">
+        <h2>Usage</h2>
+        {utility.usage.map((u) => <CodeBlock code={u.code} lang="tsx" title={u.title} />)}
+
+        <h2>Use it when</h2>
+        <ul>
+          {utility.useWhen.map((item) => <li>{item}</li>)}
+        </ul>
+
+        <h2>What it guarantees</h2>
+        <ul>
+          {utility.guarantees.map((item) => <li>{item}</li>)}
+        </ul>
+
+        <h2>Source</h2>
+        <p>
+          The complete file. Copy it into your project as is, or read it on GitHub with its{' '}
+          <a href={repoUrl(utility.test)} rel="noopener">test suite</a>.
+        </p>
+        <CodeBlock code={source} lang={lang} title={fileName} />
+      </div>
+
+      <aside class="util-side">
+        <div class="side-card">
+          <h2>Files</h2>
+          <ul class="files">
+            <li><a href={repoUrl(utility.file)} rel="noopener"><code>{utility.file}</code></a></li>
+            <li><a href={repoUrl(utility.test)} rel="noopener"><code>{utility.test}</code></a></li>
+          </ul>
+        </div>
+        <div class="side-card">
+          <h2>Other utilities</h2>
+          <ul class="files">
+            {others.map((u) => <li><a href={utilityUrl(u.slug)}>{u.name}</a></li>)}
+          </ul>
+        </div>
+      </aside>
+    </div>
+
+    {
+      related.length > 0 && (
+        <section class="related" aria-labelledby="related-title">
+          <h2 id="related-title">Fixes that use it</h2>
+          <div class="grid grid-3">
+            {related.map((fix) => (
+              <FixCard fix={fix} skillTitle={skillTitles[fix.data.skill]} />
+            ))}
+          </div>
+        </section>
+      )
+    }
+
+    <section class="util-install" aria-labelledby="install-title">
+      <div>
+        <h2 id="install-title">Or let Claude reach for it</h2>
+        <p>
+          With the skills installed, Claude uses these files when a fix calls for them, and adapts them to your
+          codebase’s conventions.
+        </p>
+      </div>
+      <InstallBlock compact />
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .util-title {
+    font-family: var(--font-mono);
+    letter-spacing: -0.03em;
+    font-size: clamp(1.5rem, 4vw, 2.5rem);
+    /* Hook names are one long word; let them wrap on narrow screens. */
+    overflow-wrap: anywhere;
+  }
+
+  .exports {
+    color: var(--text-3);
+    font-size: 0.9rem;
+  }
+
+  .util-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 48px;
+    align-items: start;
+  }
+
+  .util-main {
+    max-width: none;
+  }
+
+  .util-main > h2:first-child {
+    margin-top: 0;
+  }
+
+  .util-side {
+    position: sticky;
+    top: calc(var(--header-h) + 20px);
+    display: grid;
+    gap: 16px;
+  }
+
+  .side-card {
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .side-card h2 {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin-bottom: 12px;
+  }
+
+  .files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+    font-size: 0.86rem;
+    word-break: break-word;
+  }
+
+  .related {
+    margin-top: 56px;
+  }
+
+  .related h2 {
+    font-size: 1.5rem;
+    margin-bottom: 18px;
+  }
+
+  .util-install {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: 24px;
+    align-items: center;
+    margin-top: 56px;
+    padding: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+
+  .util-install h2 {
+    font-size: 1.35rem;
+    margin-bottom: 8px;
+  }
+
+  .util-install p {
+    color: var(--text-2);
+  }
+
+  @media (max-width: 1000px) {
+    .util-layout,
+    .util-install {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .util-side {
+      position: static;
+    }
+  }
+</style>

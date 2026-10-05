@@ -1,0 +1,31 @@
+---
+import type { Fix } from '../lib/content';
+import { KIND_LABEL } from '../lib/content';
+import { fixUrl } from '../lib/urls';
+
+interface Props {
+  fix: Fix;
+  skillTitle?: string;
+  headingLevel?: 'h2' | 'h3';
+}
+
+const { fix, skillTitle, headingLevel = 'h3' } = Astro.props;
+const { title, symptom, fix: fixLine, kind, skill, tags } = fix.data;
+const Heading = headingLevel;
+---
+
+<article
+  class="card card-link fix-card"
+  data-fix
+  data-kind={kind}
+  data-skill={skill}
+  data-search={`${title} ${symptom} ${fixLine} ${tags.join(' ')} ${skill}`.toLowerCase()}
+>
+  <div class="cluster">
+    <span class="badge badge-dot" data-kind={kind}>{KIND_LABEL[kind]}</span>
+    {skillTitle && <span class="badge badge-skill">{skillTitle}</span>}
+  </div>
+  <Heading><a href={fixUrl(fix.id)}>{title}</a></Heading>
+  <p class="symptom">{symptom}</p>
+  <p class="fixline"><strong>Fix</strong><span>{fixLine}</span></p>
+</article>

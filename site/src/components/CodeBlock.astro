@@ -1,0 +1,26 @@
+---
+/** Highlights a code string the same way Markdown code fences are highlighted. */
+import { Code } from 'astro:components';
+import { CODE_THEMES, codeTransformers } from '../lib/shiki.mjs';
+
+interface Props {
+  code: string;
+  lang: string;
+  title?: string;
+  variant?: 'bad' | 'good';
+  /** Extra fence meta, e.g. 'mark="3"'. */
+  meta?: string;
+}
+
+const { code, lang, title, variant, meta } = Astro.props;
+const fenceMeta = [title ? `title="${title}"` : '', variant ?? '', meta ?? ''].filter(Boolean).join(' ');
+---
+
+<Code
+  code={code.replace(/\n+$/, '')}
+  lang={lang as never}
+  themes={CODE_THEMES}
+  defaultColor={false}
+  meta={fenceMeta || undefined}
+  transformers={codeTransformers()}
+/>

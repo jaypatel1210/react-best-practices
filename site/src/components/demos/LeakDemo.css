@@ -1,0 +1,25 @@
+/* LeakDemo: the panel readout and the open/closed status. */
+
+.lkd-value {
+  color: var(--text-2);
+}
+
+.lkd-value b {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.lkd-status {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-3);
+}
+
+.lkd-closed {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  color: var(--text-3);
+  font-size: 0.88rem;
+}

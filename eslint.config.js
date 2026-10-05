@@ -5,7 +5,8 @@ import tseslint from 'typescript-eslint';
 // including the React Compiler-derived rules in `recommended`, so the assets are safe to copy
 // into compiled codebases.
 export default tseslint.config(
-  { ignores: ['node_modules/**', 'eval-workspace/**', 'evals/**'] },
+  // The website has its own checks (`bun run check` in site/).
+  { ignores: ['node_modules/**', 'eval-workspace/**', 'evals/**', 'site/**'] },
   {
     files: ['skills/**/assets/**/*.{ts,tsx}', 'tests/**/*.{ts,tsx}'],
     extends: [tseslint.configs.recommended],

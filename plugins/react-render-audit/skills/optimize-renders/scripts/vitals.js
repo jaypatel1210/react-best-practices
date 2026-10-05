@@ -251,6 +251,15 @@
     return { index, name, start, commits: 0, renderMs: 0, lastCommitAt: 0 };
   }
 
+  // Each step appears by name in DevTools' Timings track when a trace is opened.
+  function markStep(current, endAt) {
+    try {
+      if (typeof performance.measure === 'function') performance.measure(`render-audit ${current.index}: ${current.name}`, { start: current.start, end: endAt });
+    } catch (error) {
+      recordError('measure', error);
+    }
+  }
+
   function interactionsIn(start, end) {
     const byId = new Map();
     for (const entry of events) {
@@ -290,6 +299,7 @@
     step = null;
     if (!current) return null;
     const endAt = now();
+    markStep(current, endAt);
     const within = (t) => t >= current.start && t <= endAt;
 
     const interactions = interactionsIn(current.start, endAt);

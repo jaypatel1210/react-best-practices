@@ -1,0 +1,114 @@
+---
+import Breadcrumbs from '@/components/Breadcrumbs.astro';
+import { repoUrl, SITE } from '@/config';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { breadcrumbs } from '@/lib/seo';
+import { url } from '@/lib/urls';
+
+const title = 'About this project';
+const description =
+  'Why this site exists, how the fixes are written and checked, who maintains it, and how to contribute. Open source under the MIT license.';
+const crumbs = [
+  { name: 'Home', path: '/' },
+  { name: 'About', path: '/about/' },
+];
+---
+
+<BaseLayout title={title} description={description} og="about" schema={[breadcrumbs(crumbs, Astro.site)]}>
+  <div class="container">
+    <header class="page-head">
+      <Breadcrumbs items={crumbs} />
+      <h1>{title}</h1>
+      <p class="lede">
+        React is easy to start and surprisingly easy to slow down or subtly break. This project collects the issues
+        experienced React engineers keep fixing, and teaches the reasoning behind each fix, both to people and to Claude.
+      </p>
+    </header>
+
+    <div class="prose about">
+      <h2>Two ways to use the same knowledge</h2>
+      <p>
+        The project started as <a href={repoUrl('skills', 'tree')} rel="noopener">fifteen Agent Skills</a>: folders of
+        instructions, worked examples and tested code that Claude loads when a task calls for them. This site turns every
+        rule in those skills into a page a person can read: what you see, why React behaves that way, the fix, and how to
+        confirm it.
+      </p>
+      <p>
+        If you use Claude Code, <a href={url('/how-it-works/')}>install the skills</a> and Claude applies the fixes in your
+        code. If you don’t, the site stands on its own.
+      </p>
+
+      <h2>How the fixes are written</h2>
+      <ul>
+        <li>
+          <strong>Symptom first.</strong> Each page is titled with what you’d see or search for, not with the name of the
+          solution.
+        </li>
+        <li>
+          <strong>Explained with a small mental model.</strong> Re-renders start from state changes; identity is type,
+          position and key; every closure sees one render. The same dozen facts explain almost every fix.
+        </li>
+        <li>
+          <strong>Structural fixes before patches.</strong> Moving state, passing children and fixing keys come before
+          <code>memo</code>, <code>z-index: 9999</code> or a <code>setTimeout</code>.
+        </li>
+        <li>
+          <strong>Verifiable.</strong> Every fix says how to confirm it: a Profiler recording, a Performance trace or a
+          test.
+        </li>
+        <li>
+          <strong>Traceable.</strong> Every page links to the skill file it’s drawn from, and the demos import the same
+          tested code the skills ship.
+        </li>
+      </ul>
+
+      <h2>Versions</h2>
+      <p>
+        The advice targets React 18 and 19, including React 19.2 and the React Compiler, and works with Next.js, Vite,
+        Remix, React Router and React Native (except the DOM-specific parts). Pages name the version when an API needs a
+        specific one.
+      </p>
+
+      <h2>Privacy</h2>
+      <p>
+        No analytics, no cookies, no tracking. Your browser stores two things locally: your light or dark theme choice,
+        and your ticks on the <a href={url('/checklist/')}>review checklist</a>. Neither leaves your device.
+      </p>
+
+      <h2>Who maintains it</h2>
+      <p>
+        <a href={SITE.author.url} rel="noopener">{SITE.author.name}</a> builds and maintains the skills and this site. Found
+        a mistake, or a React issue that deserves a page? <a href={`${SITE.repo.url}/issues`} rel="noopener">Open an issue</a>
+        or send a pull request: each fix is one MDX file in <code>site/src/content/fixes</code>, and the
+        <a href={repoUrl('site/README.md')} rel="noopener">authoring guide</a> explains the format.
+      </p>
+
+      <h2>License</h2>
+      <p>
+        The skills, the code and this site’s content are released under the <a href={repoUrl('LICENSE')} rel="noopener"
+          >MIT license</a
+        >. You can use, copy, modify and redistribute them, including commercially, as long as the copyright notice and
+        license text are kept.
+      </p>
+      <p class="disclaimer">
+        React is a trademark of Meta Platforms, Inc. This project is independent and isn’t affiliated with or endorsed by
+        Meta or the React team. Claude is a product of Anthropic.
+      </p>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .about {
+    max-width: 72ch;
+  }
+
+  .about h2:first-child {
+    margin-top: 0.5em;
+  }
+
+  .disclaimer {
+    color: var(--text-3);
+    font-size: 0.92rem;
+  }
+</style>
