@@ -11,7 +11,9 @@
  *   long frames   Long Animation Frames (over 50 ms), with the scripts that ran in the worst one
  *   frame pacing  requestAnimationFrame timestamps while the step runs, for dropped frames
  *   React         commits and render time (actualDuration, development builds) from a minimal
- *                 DevTools hook that does constant work per commit
+ *                 DevTools hook that does constant work per commit; the first commit of each
+ *                 root (the initial render or hydration) is also counted on its own, so later
+ *                 commits are the re-render work
  *
  * Everything is read through window.__RA_VITALS__. Nothing in here may throw into the app.
  */
@@ -185,6 +187,7 @@
 
   const HOOK = '__REACT_DEVTOOLS_GLOBAL_HOOK__';
   const renderers = [];
+  const roots = typeof WeakSet === 'function' ? new WeakSet() : null;
   let lastCommitAt = 0;
   let totalCommits = 0;
   let step = null;
@@ -230,11 +233,14 @@
     try {
       const fiber = root && root.current;
       const ms = fiber && typeof fiber.actualDuration === 'number' ? fiber.actualDuration : 0;
+      const first = !!roots && !!root && typeof root === 'object' && !roots.has(root);
+      if (first) roots.add(root);
       lastCommitAt = now();
       totalCommits++;
       if (step) {
         step.commits++;
         step.renderMs += ms;
+        if (first) step.firstRenderMs += ms;
         step.lastCommitAt = lastCommitAt;
       }
     } catch (error) {
@@ -248,7 +254,16 @@
   // Steps
 
   function newStep(index, name, start) {
-    return { index, name, start, commits: 0, renderMs: 0, lastCommitAt: 0 };
+    return { index, name, start, commits: 0, renderMs: 0, firstRenderMs: 0, lastCommitAt: 0 };
+  }
+
+  // Each step appears by name in DevTools' Timings track when a trace is opened.
+  function markStep(current, endAt) {
+    try {
+      if (typeof performance.measure === 'function') performance.measure(`render-audit ${current.index}: ${current.name}`, { start: current.start, end: endAt });
+    } catch (error) {
+      recordError('measure', error);
+    }
   }
 
   function interactionsIn(start, end) {
@@ -290,6 +305,7 @@
     step = null;
     if (!current) return null;
     const endAt = now();
+    markStep(current, endAt);
     const within = (t) => t >= current.start && t <= endAt;
 
     const interactions = interactionsIn(current.start, endAt);
@@ -324,7 +340,7 @@
         scripts: worstFrame ? worstFrame.scripts : [],
       },
       frames: pacing(times, activeEnd),
-      react: { commits: current.commits, renderMs: round(current.renderMs) },
+      react: { commits: current.commits, renderMs: round(current.renderMs), firstRenderMs: round(current.firstRenderMs) },
     };
   }
 

@@ -181,6 +181,60 @@ describe('analysis', () => {
     const memo = found.find((hotspot) => hotspot.kind === 'memo-broken');
     expect(memo).toMatchObject({ component: 'Row', fixIn: 'Page', skill: 'react-memoization' });
     expect(memo.evidence[0]).toContain('onSelect (new function ×20)');
+    // Without render timing (a production build) nothing is judged.
+    expect(found.every((hotspot) => hotspot.worth === null)).toBe(true);
+  });
+
+  // The same flow with render times: the cascade wastes 40 ms in step 1, and a ticker that copies
+  // a prop into state in an effect costs a fraction of a millisecond.
+  const timedRun = {
+    documents: [{ types: [...types, { id: 3, name: 'Ticker', file: '/app/src/Ticker.tsx', line: 1, memo: false }] }],
+    steps: [
+      { ...run.steps[0], stats: stats({ renders: 12, mounts: 12, renderMs: 30, mountMs: 25, components: [{ id: 0, renders: 1, mounts: 1, selfMs: 5, mountMs: 5 }, { id: 1, renders: 10, mounts: 10, instances: 10, selfMs: 20, mountMs: 20 }] }) },
+      {
+        ...run.steps[1],
+        stats: stats({
+          commits: 3,
+          renders: 26,
+          wasted: 22,
+          renderMs: 60,
+          wastedMs: 40,
+          components: [
+            { id: 0, renders: 2, reasons: { state: 2 }, hooks: { 'useState #1': { count: 2, sample: '"" → "a"' } }, selfMs: 4, updateMs: 4, updateTreeMs: 60 },
+            { id: 1, renders: 20, wasted: 20, instances: 10, reasons: { propsUnstable: 20 }, props: { onSelect: { changed: 0, fn: 20, sameContent: 0, element: 0 } }, owners: { 0: 20 }, causedBy: { 0: 20 }, selfMs: 38, updateMs: 38, updateTreeMs: 38, wastedMs: 38, wastedTreeMs: 38 },
+            { id: 2, renders: 2, wasted: 2, reasons: { parent: 2 }, owners: { 0: 2 }, causedBy: { 0: 2 }, selfMs: 2, updateMs: 2, updateTreeMs: 2, wastedMs: 2, wastedTreeMs: 2 },
+            { id: 3, renders: 2, reasons: { props: 1, state: 1 }, hooks: { 'useState #1': { count: 1, sample: '"0 items" → "1 items"' } }, cascades: 1, selfMs: 0.4, updateMs: 0.4, updateTreeMs: 0.4 },
+          ],
+          sources: [{ id: 0, triggers: 2, renders: 24, wasted: 22, mounts: 0, ms: 44, wastedMs: 40 }],
+        }),
+      },
+    ],
+  };
+  const slowTyping = [
+    { index: 0, name: 'load', slow: false },
+    { index: 1, name: 'type in search', slow: true, renderBound: true, worst: { profile: 'mobile', reactMs: 120 } },
+  ];
+
+  it('ranks hotspots by the render time they would save in the slow steps', () => {
+    const aggregated = aggregate({ runs: [timedRun, timedRun, timedRun] }, { scope: ['/app/src'], repoRoot: '/app' });
+    expect(aggregated.steps[1]).toMatchObject({ renderMs: 60, wastedMs: 40 });
+    // The triage measured 120 ms of React time in this step on mobile, twice what the tracker run saw.
+    const found = hotspots(aggregated, { scopeConfigured: true, triage: slowTyping });
+    const [first, second] = found;
+    expect(first).toMatchObject({ kind: 'cascade', worth: true, saves: { step: 1, name: 'type in search', profile: 'mobile', ms: 80, measuredMs: 40 } });
+    expect(first.evidence[0]).toBe('costs about 80 ms of render work in “type in search” on mobile (scaled from the 40 ms measured with the tracker)');
+    expect(second).toMatchObject({ kind: 'memo-broken', worth: true, saves: { ms: 76 } });
+    const ticker = found.find((hotspot) => hotspot.kind === 'effect-cascade');
+    expect(ticker).toMatchObject({ component: 'Ticker', worth: false, saves: { ms: 0.4 } });
+    expect(ticker.whyNot).toBe('it would save at most 0.4 ms of render work in “type in search” on mobile, less than a frame');
+    expect(found.indexOf(ticker)).toBeGreaterThan(found.indexOf(second));
+
+    // Without a triage every step counts, at the measured time.
+    const untriaged = hotspots(aggregated, { scopeConfigured: true });
+    expect(untriaged[0]).toMatchObject({ kind: 'cascade', worth: true, saves: { ms: 40, profile: null } });
+    // When the triage found nothing slow, nothing is worth fixing.
+    const calm = hotspots(aggregated, { scopeConfigured: true, triage: slowTyping.map((step) => ({ ...step, slow: false })) });
+    expect(calm.every((hotspot) => hotspot.worth === false && hotspot.whyNot === 'no step is slow')).toBe(true);
   });
 });
 

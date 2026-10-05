@@ -7,6 +7,8 @@
 // the mobile profile; per profile and scenario, record the app's API responses in a first run and
 // replay them to every later run; warm up both sides; run a same-vs-same (A/A) check whose noise
 // decides the number of pairs; run the pairs as AB, BA, AB, ...; save one Chrome trace per side.
+// A quick run (the per-fix proof) skips the A/A check and the traces and judges the steps the fix
+// targets.
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -19,7 +21,7 @@ import { calibrate, chromeMajor, profile as profileOf } from './profiles.mjs';
 import { NetworkReplay } from './replay.mjs';
 import { stepLabel } from './scenario.mjs';
 import { startServer } from './servers.mjs';
-import { FRAME_MS, impactOf, median, pairedDiff, plannedPairs, quantileCI, rating, ratingLabel, verdict } from './stats.mjs';
+import { FRAME_MS, INSTANT_MS, cautious, impactOf, median, pairedDiff, plannedPairs, quantileCI, rating, ratingLabel, verdict } from './stats.mjs';
 import { round, table, writeJson } from './util.mjs';
 
 export const PROTOCOL_VERSION = 1;
@@ -160,7 +162,7 @@ async function runOnce(browser, ctx) {
   try {
     await page.send('Performance.enable', { timeDomain: 'timeTicks' });
     if (cpuRate > 1) await page.send('Emulation.setCPUThrottlingRate', { rate: cpuRate });
-    const replayed = replay ? await replay.attach(page, { appOrigin: new URL(baseUrl).origin }) : null;
+    const replayed = replay ? await replay.attach(page, { appOrigin: new URL(baseUrl).origin, appOrigins: ctx.appOrigins }) : null;
     if (traceFile) await startTrace(page);
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -204,6 +206,7 @@ async function runOnce(browser, ctx) {
         dropped: data.frames ? data.frames.dropped : 0,
         smoothness: data.frames ? data.frames.smoothness : null,
         reactMs: data.react ? data.react.renderMs : 0,
+        reactInitialMs: data.react ? data.react.firstRenderMs || 0 : 0,
         commits: data.react ? data.react.commits : 0,
         mainThread: metricDelta(before, after, 'TaskDuration'),
         script: metricDelta(before, after, 'ScriptDuration'),
@@ -267,7 +270,7 @@ function breakdown(runs, index) {
 }
 
 const FLOW_KEYS = ['inp', 'mainThread', 'tbt', 'longFrames', 'dropped', 'reactMs', 'commits'];
-const STEP_KEYS = ['mainThread', 'tbt', 'longFrames', 'dropped', 'reactMs', 'commits', 'script', 'layout', 'style'];
+const STEP_KEYS = ['mainThread', 'tbt', 'longFrames', 'longestFrame', 'dropped', 'reactMs', 'reactInitialMs', 'commits', 'script', 'layout', 'style'];
 
 /** Paired analysis of A and B runs (runsA[i] and runsB[i] ran back to back). */
 export function analyzePairs(runsA, runsB) {
@@ -294,8 +297,28 @@ export function analyzePairs(runsA, runsB) {
     flow[key] = pairedDiff(flowsA.map((item) => item[key]), flowsB.map((item) => item[key]));
   }
   if (flow.inp) flow.rating = { a: rating('INP', flow.inp.a), b: rating('INP', flow.inp.b) };
-  flow.impact = impactOf(flow);
+  flow.impact = flowImpact(steps);
   return { steps, flow };
+}
+
+const LEVEL_ORDER = { none: 0, low: 1, medium: 2, high: 3 };
+
+/**
+ * The whole flow's impact is its most important step's: impact describes moments a user feels,
+ * and a total over the flow doesn't map to one. Steps at that level pulling in opposite
+ * directions make it 'mixed'. The flow's totals are still reported, as numbers.
+ */
+export function flowImpact(steps) {
+  if (steps.some((step) => step.impact.judged === false)) return { level: 'none', direction: 'same', reasons: [], judged: false };
+  const top = Math.max(0, ...steps.map((step) => LEVEL_ORDER[step.impact.level]));
+  if (!top) return { level: 'none', direction: 'same', reasons: [] };
+  const atTop = steps.filter((step) => LEVEL_ORDER[step.impact.level] === top);
+  const directions = new Set(atTop.map((step) => step.impact.direction));
+  return {
+    level: atTop[0].impact.level,
+    direction: directions.size > 1 ? 'mixed' : atTop[0].impact.direction,
+    reasons: atTop.map((step) => `${step.name}: ${step.impact.reasons[0]}`),
+  };
 }
 
 function medianWithCI(values) {
@@ -325,24 +348,40 @@ export function analyzeSingle(runs) {
   return { steps, flow };
 }
 
+// The smallest change in each A/A metric that the impact rules would report as medium (response
+// and main-thread time: one frame) or high (blocking time: 100 ms).
+const AA_MATERIAL = { mainThread: FRAME_MS, inp: FRAME_MS, tbt: INSTANT_MS };
+
+/**
+ * Judges a same-vs-same check. It fails only on a difference big enough to turn into a false
+ * medium or high impact, on the cautious end of the interval. Smaller systematic differences are
+ * real but harmless. With too few pairs for a 95% interval it only estimates the noise.
+ */
+export function aaJudgement(aa) {
+  if (!aa) return null;
+  const keys = ['mainThread', 'inp', 'tbt'].filter((key) => aa[key]);
+  const judged = keys.length > 0 && keys.every((key) => aa[key].exact !== false);
+  const material = keys.filter((key) => verdict(aa[key]) !== 'same' && cautious(aa[key]) >= AA_MATERIAL[key]);
+  return { judged, ok: !judged || material.length === 0, material };
+}
+
 /**
  * Same-vs-same check. Pairs are labeled like real A/B pairs (which run counts as "A" alternates),
- * so an order effect cancels out here as it does there. It passes or fails only with enough pairs
- * for a 95% interval; with fewer it just estimates the noise.
+ * so an order effect cancels out here as it does there.
  */
 export function aaSummary(pairs) {
   const xs = pairs.map(([first, second], i) => flowOf(i % 2 === 0 ? first : second));
   const ys = pairs.map(([first, second], i) => flowOf(i % 2 === 0 ? second : first));
   const out = { pairs: pairs.length };
-  let judged = true;
   for (const key of ['mainThread', 'inp', 'tbt']) {
     if (key === 'inp' && xs[0].inp === null) continue;
     const diff = pairedDiff(xs.map((item) => item[key]), ys.map((item) => item[key]));
-    if (!diff.exact) judged = false;
     out[key] = { ...diff, verdict: verdict(diff), diffs: xs.map((item, i) => (item[key] === null ? null : round(ys[i][key] - item[key], 1))) };
   }
-  out.judged = judged;
-  out.ok = !judged || ['mainThread', 'inp', 'tbt'].every((key) => !out[key] || out[key].verdict === 'same');
+  const judgement = aaJudgement(out);
+  out.judged = judgement.judged;
+  out.ok = judgement.ok;
+  out.material = judgement.material;
   return out;
 }
 
@@ -355,11 +394,71 @@ async function runWithRetry(run, describe, log) {
   }
 }
 
+const KEEP_LEVELS = new Set(['medium', 'high']);
+const EXIT = { faster: 0, slower: 4, 'no-gain': 5 };
+
+/** Whether a scenario step is one of `targets` (step indices like "2", or step names). */
+export function isTarget(step, targets) {
+  return targets.some((target) => String(target) === String(step.index) || target === step.name);
+}
+
+/**
+ * The per-fix decision on the steps a fix targets: 'faster' when at least one of them got faster
+ * by a frame or more (medium or high impact) and nothing got slower; 'slower' when a target got
+ * measurably slower, or another step got slower by a frame or more; 'no-gain' otherwise, which
+ * includes gains smaller than a frame, since users don't notice those. Exit codes 0, 4 and 5.
+ */
+export function targetDecision(result, targets) {
+  const steps = targets.map(String);
+  const lines = [];
+  let faster = false;
+  let slower = false;
+  for (const item of result.results) {
+    for (const step of item.analysis.steps) {
+      const target = isTarget(step, steps);
+      const impact = step.impact;
+      const where = `${item.profile} · ${step.index}. ${step.name}`;
+      if (!target) {
+        if (impact.direction === 'worse' && KEEP_LEVELS.has(impact.level)) {
+          slower = true;
+          lines.push(`${where} (not a target): slower, ${impact.level}: ${impact.reasons.join('; ')}`);
+        }
+        continue;
+      }
+      if (impact.judged === false) {
+        lines.push(`${where}: not judged (too few pairs for a 95% interval)`);
+      } else if (impact.direction === 'worse') {
+        slower = true;
+        lines.push(`${where}: slower, ${impact.level}: ${impact.reasons.join('; ')}`);
+      } else if (impact.direction === 'better' && KEEP_LEVELS.has(impact.level)) {
+        faster = true;
+        lines.push(`${where}: faster, ${impact.level}: ${impact.reasons.join('; ')}`);
+      } else if (impact.direction === 'better') {
+        lines.push(`${where}: faster by less than a frame, which users won't notice`);
+      } else {
+        const metric = step.interactive ? step.inp : step.mainThread;
+        lines.push(`${where}: no measurable change (${step.interactive ? `${responseMs(metric.a)} → ${responseMs(metric.b)}` : `${ms(metric.a)} → ${ms(metric.b)} main thread`})`);
+      }
+    }
+  }
+  const decision = slower ? 'slower' : faster ? 'faster' : 'no-gain';
+  return { steps, decision, exitCode: EXIT[decision], lines };
+}
+
+/** One line for the per-fix decision. */
+export function targetText(target) {
+  if (!target) return '';
+  if (target.decision === 'faster') return 'KEEP: a targeted step got faster by at least a frame, and nothing got slower.';
+  if (target.decision === 'slower') return 'SLOWER: revert this fix.';
+  return 'NO GAIN: no targeted step got faster by a frame or more; revert this fix.';
+}
+
 /**
  * Runs the benchmark. Options:
  *   outDir, scenarios (from loadScenario), profiles ['mobile', 'desktop'],
  *   a: { label, url, command?, cwd?, ref? }, b: same or null (profile mode),
  *   pairs ('auto' or a number), minPairs, maxPairs, aaPairs, warmup, replay, trace, cpuMobile,
+ *   kind ('full', 'proof' or 'triage'), target (steps a per-fix proof judges),
  *   quietMs, maxSettleMs, cookies, headers, ignoreRequests, headless, chromeArgs, serverTimeoutS, log
  */
 export async function bench(options) {
@@ -377,6 +476,8 @@ export async function bench(options) {
     replay: useReplay = true,
     trace = true,
     cpuMobile = null,
+    kind = 'full',
+    target = null,
     quietMs = 500,
     maxSettleMs = 10000,
     headless = true,
@@ -398,13 +499,14 @@ export async function bench(options) {
       b: b ? { label: b.label || 'B', url: b.url, ref: b.ref || null, sha: b.sha || null, command: b.command || null } : null,
     },
     mode: b ? 'compare' : 'profile',
-    settings: { profiles, pairs, minPairs, maxPairs, aaPairs, warmup, replay: useReplay, trace, quietMs, maxSettleMs },
+    settings: { kind, profiles, pairs, minPairs, maxPairs, aaPairs, warmup, replay: useReplay, trace, quietMs, maxSettleMs },
     environment: null,
     calibration: null,
     results: [],
   };
   const shared = {
     source: inPageSource('vitals'),
+    appOrigins: [a, b].filter(Boolean).map((side) => new URL(side.url).origin),
     quietMs,
     maxSettleMs,
     cookies: options.cookies,
@@ -484,7 +586,7 @@ export async function bench(options) {
                 aa.length && item.aa.inp ? plannedPairs(item.aa.inp.diffs, FRAME_MS, { min: minPairs, max: maxPairs }) : minPairs,
               );
             }
-            if (item.aa) log(`${tag}: A/A check ${!item.aa.judged ? 'estimated the noise' : item.aa.ok ? 'found no difference, as expected' : 'found a difference between identical runs: this machine is noisy right now'}; running ${count} pairs`);
+            if (item.aa) log(`${tag}: A/A check ${!item.aa.judged ? 'estimated the noise' : item.aa.ok ? 'found no meaningful difference, as expected' : 'found a meaningful difference between identical runs: this machine is noisy right now'}; running ${count} pairs`);
             for (let i = 0; i < count; i++) {
               // Alternate the order so drift and warm caches affect both sides alike.
               let runA;
@@ -526,7 +628,22 @@ export async function bench(options) {
     for (const server of servers.reverse()) await server.stop().catch(() => {});
   }
   result.finishedAt = new Date().toISOString();
+  if (target && target.length && b) result.target = targetDecision(result, target);
   writeJson(join(outDir, 'bench.json'), result);
+  return result;
+}
+
+/**
+ * Recomputes every analysis from the raw runs in a saved result, so reports always apply the
+ * current statistics (the runs are the evidence; verdicts are derived from them).
+ */
+export function refreshAnalysis(result) {
+  for (const item of result.results || []) {
+    if (!item.runs || !item.runs.a || !item.runs.a.length) continue;
+    item.analysis = item.runs.b && item.runs.b.length ? analyzePairs(item.runs.a, item.runs.b) : analyzeSingle(item.runs.a);
+    if (item.aa) Object.assign(item.aa, aaJudgement(item.aa));
+  }
+  if (result.target && result.mode === 'compare') result.target = targetDecision(result, result.target.steps);
   return result;
 }
 
@@ -582,8 +699,10 @@ function relativeText(diff) {
 
 const IMPACT_WORD = { high: 'high', medium: 'medium', low: 'low', none: '—' };
 function impactText(impact) {
+  if (impact && impact.judged === false) return 'not judged (too few pairs)';
   if (!impact || impact.level === 'none') return 'no measurable change';
-  return `${impact.direction === 'worse' ? 'SLOWER, ' : ''}${IMPACT_WORD[impact.level]}`;
+  const prefix = impact.direction === 'worse' ? 'SLOWER, ' : impact.direction === 'mixed' ? 'MIXED, ' : '';
+  return `${prefix}${IMPACT_WORD[impact.level]}`;
 }
 
 /** Rows for one result's comparison table: what to show per step, plus the whole flow. */
@@ -626,11 +745,14 @@ function profileTitle(item) {
   return `${item.profile} (${vp.width}×${vp.height}${vp.deviceScaleFactor !== 1 ? ` @${vp.deviceScaleFactor}x` : ''}, CPU ${item.cpuRate}×)`;
 }
 
-function aaText(item) {
-  if (!item.aa) return 'no A/A check';
+const AA_METRIC = { mainThread: 'main-thread time', inp: 'response time', tbt: 'blocking time' };
+export function aaText(item) {
+  const judgement = aaJudgement(item.aa);
+  if (!judgement) return 'no A/A check';
   const noise = item.aa.mainThread ? ` (main thread differed by ${ms(item.aa.mainThread.low)} to ${ms(item.aa.mainThread.high)} between identical runs)` : '';
-  if (!item.aa.judged) return `A/A noise estimate from ${item.aa.pairs} pairs${noise}`;
-  return item.aa.ok ? `A/A check passed${noise}` : `A/A check FAILED: identical runs differed${noise}; treat small differences with caution`;
+  if (!judgement.judged) return `A/A noise estimate from ${item.aa.pairs} pairs${noise}`;
+  if (judgement.ok) return `A/A check passed${noise}`;
+  return `A/A check FAILED: identical runs differed in ${judgement.material.map((key) => AA_METRIC[key]).join(' and ')}${noise}; treat small differences with caution`;
 }
 
 /** Plain-text summary for the terminal. */
@@ -659,6 +781,7 @@ export function formatBench(result) {
       continue;
     }
     lines.push(`  ${aaText(item)}`);
+    if (item.pairs < 6) lines.push(`  ${item.pairs} pairs are too few for a 95% interval (at least 6 are needed), so nothing below is judged.`);
     const rows = [['#', 'step', 'measured', 'A → B', 'change (95% CI)', 'rating', 'impact']];
     for (const row of comparisonRows(item)) {
       rows.push([row.index, row.name, row.metric, `${row.beforeText} → ${row.afterText}`, row.change, row.rating, impactText(row.impact)]);
@@ -669,6 +792,11 @@ export function formatBench(result) {
       if (step.impact.level !== 'none') lines.push(`  ${step.index}. ${step.name}: ${step.impact.reasons.join('; ')}`);
     }
     if (item.replay && item.replay.requests) lines.push(`  Network: ${item.replay.distinct} API request(s) recorded once and replayed (${item.replay.served} served, ${item.replay.passed} not in the recording)`);
+  }
+  if (result.target) {
+    lines.push('', `Targeted step(s): ${result.target.steps.join(', ')}${result.settings && result.settings.kind === 'proof' ? ' (quick check: no A/A, no traces)' : ''}`);
+    for (const line of result.target.lines) lines.push(`  ${line}`);
+    lines.push(targetText(result.target));
   }
   return lines.join('\n');
 }
@@ -691,9 +819,10 @@ export function benchMarkdown(result) {
     }
     md.push('| # | Step | Measured | A → B | Change (95% CI) | Rating | Impact |', '|---:|---|---|---|---|---|---|');
     for (const row of comparisonRows(item)) {
-      md.push(`| ${row.index} | ${row.name.replace(/\|/g, '\\|')} | ${row.metric} | ${row.beforeText} → ${row.afterText} | ${row.change} | ${row.rating} | ${row.impact.level === 'none' ? 'no measurable change' : `**${impactText(row.impact)}**`} |`);
+      md.push(`| ${row.index} | ${row.name.replace(/\|/g, '\\|')} | ${row.metric} | ${row.beforeText} → ${row.afterText} | ${row.change} | ${row.rating} | ${row.impact.level === 'none' ? impactText(row.impact) : `**${impactText(row.impact)}**`} |`);
     }
-    md.push('', `**Whole flow:** ${flowLine(item)} — ${impactText(item.analysis.flow.impact)}.`, '', `_${aaText(item)}._`, '');
+    const flowImpactNote = item.analysis.flow.impact.reasons && item.analysis.flow.impact.reasons.length ? ` (${item.analysis.flow.impact.reasons.join('; ')})` : '';
+    md.push('', `**Whole flow:** ${flowLine(item)} — ${impactText(item.analysis.flow.impact)}${flowImpactNote}.`, '', `_${aaText(item)}._`, '');
   }
   return md.join('\n');
 }
@@ -725,7 +854,11 @@ export function speedHeadline(result) {
       pieces.push(`main-thread time ${verdict(flow.mainThread) === 'better' ? 'fell' : 'rose'} ${pct(Math.abs(flow.mainThread.relative)).replace(/^[+−]/, '')} (${ms(flow.mainThread.a)} → ${ms(flow.mainThread.b)}; 95% CI ${pct(flow.mainThread.relativeLow)} to ${pct(flow.mainThread.relativeHigh)})`);
     }
     if (verdict(flow.tbt) === 'better' && flow.tbt.a >= 50) pieces.push(`blocking time ${ms(flow.tbt.a)} → ${ms(flow.tbt.b)}`);
-    parts.push(pieces.length ? `On ${item.profile} (${item.scenario}), ${pieces.join(', ')}.` : `On ${item.profile} (${item.scenario}), no measurable change in timing.`);
+    // Steps that changed, when the totals alone don't tell the story.
+    const changed = item.analysis.steps.filter((step) => step.impact.level !== 'none');
+    const stepText = changed.map((step) => `${step.name} ${step.impact.direction === 'worse' ? 'is slower' : 'is faster'} (${step.impact.reasons[0]})`).join('; ');
+    if (pieces.length) parts.push(`On ${item.profile} (${item.scenario}), ${pieces.join(', ')}.${stepText ? ` By step: ${stepText}.` : ''}`);
+    else parts.push(`On ${item.profile} (${item.scenario}), ${stepText ? `the whole flow shows no measurable change; ${stepText}` : 'no measurable change in timing'}.`);
   }
   return parts.join(' ');
 }

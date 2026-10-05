@@ -1,8 +1,8 @@
 # Fix playbook
 
-Each hotspot `analyze` reports has a `kind`, a `fix in` location and a safety class. This file maps every kind to the rule in the react-* skills, the usual fix, how to keep the page behaving exactly the same, and what tends to go wrong. Read the named skill for the full reasoning and more examples.
+Each hotspot `analyze` reports has a `kind`, a `fix in` location, a safety class, and the render time a fix would save in a slow step. Work only on the ones marked worth fixing: a hotspot that saves less than a frame where users wait isn't worth a change, however many renders it shows. This file maps every kind to the rule in the react-* skills, the usual fix, how to keep the page behaving exactly the same, and what tends to go wrong. Read the named skill for the full reasoning and more examples.
 
-The compare step checks visible text, the accessibility tree, the DOM, data requests and console errors after every scenario step. Write fixes that leave all five identical.
+The compare step checks visible text, the accessibility tree, the DOM, data requests and console errors after every scenario step. Write fixes that leave all five identical. The per-fix proof then decides whether the fix stays: the slow step it targets must get faster by at least a frame.
 
 ## Contents
 
@@ -111,7 +111,7 @@ The compare step checks visible text, the accessibility tree, the DOM, data requ
 
 **Evidence:** a component takes more than 16 ms per render (development build) during an interaction, and its renders are legitimate (props or state really changed).
 
-**Fix options:** `useDeferredValue` for the value the heavy part reads, with that part wrapped in `memo` so React can skip or interrupt it; `startTransition` around the non-urgent update; `useMemo` around a costly computation; chunking long loops. Ask first: deferral changes what users see in between (the old results stay visible briefly), and the compare step may flag those intermediate states.
+**Fix options:** `useDeferredValue` for the value the heavy part reads, with that part wrapped in `memo` so React can skip or interrupt it; `startTransition` around the non-urgent update; `useMemo` around a costly computation; chunking long loops. Ask first: deferral changes what users see in between (the old results stay visible briefly), and the compare step may flag those intermediate states. Deferral adds a render, so compare shows more render work; the per-fix proof decides.
 
 <a id="others"></a>
 ## 9. large-list (`suggest`), continuous (`ask`), compiler-skipped (`auto`)
@@ -126,6 +126,7 @@ The compare step checks visible text, the accessibility tree, the DOM, data requ
 - [ ] The change is the smallest one that removes the measured cause, in the file `analyze` pointed to.
 - [ ] No new `eslint-disable`, `@ts-ignore` or `any`; exhaustive-deps passes.
 - [ ] Type check, lint (changed files) and related tests pass.
-- [ ] `compare` says PASS: behavior identical at every step, renders down.
-- [ ] Only your files are staged; the commit message names the hotspot and the numbers.
-- [ ] The change log has the entry (`ra changes add`).
+- [ ] `compare` says PASS: behavior identical at every step.
+- [ ] The per-fix proof (`ra bench --quick`) exited 0: a slow step got faster by at least a frame, and nothing got slower.
+- [ ] Only your files are staged; the commit message names the hotspot and the proof's numbers.
+- [ ] The change log has the entry, with `--proof` (`ra changes add`).

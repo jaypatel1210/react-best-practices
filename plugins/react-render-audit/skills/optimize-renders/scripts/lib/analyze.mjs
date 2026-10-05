@@ -1,13 +1,17 @@
 // Turns measured runs into a diagnosis: per-step totals (median of runs), per-component render
-// counts and reasons, and ranked hotspots, each mapped to a react-* skill, a fix and a safety
-// class (auto: behavior-preserving; ask: changes timing or state lifetime; suggest: changes DOM).
+// counts, reasons and render time, and ranked hotspots, each mapped to a react-* skill, a fix and a
+// safety class (auto: behavior-preserving; ask: changes timing or state lifetime; suggest: changes
+// DOM). Hotspots are ranked by the render time they cost in the steps the triage found slow, and
+// the ones that would save less than a frame are marked as not worth fixing.
 import { existsSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { classifyFile } from './sourcemap.mjs';
+import { FRAME_MS } from './stats.mjs';
+import { readTriage, triageSteps } from './triage.mjs';
 import { median, readJson, round, table, writeJson } from './util.mjs';
 
 const REASONS = ['state', 'context', 'props', 'contextUnstable', 'propsUnstable', 'parent', 'self'];
-const NUMERIC = ['renders', 'mounts', 'unmounts', 'remounts', 'identityChurn', 'wasted', 'selfMs', 'cascades'];
+const NUMERIC = ['renders', 'mounts', 'unmounts', 'remounts', 'identityChurn', 'wasted', 'selfMs', 'mountMs', 'updateMs', 'updateTreeMs', 'wastedMs', 'wastedTreeMs', 'cascades'];
 const MAX_FIELDS = ['maxSelfMs', 'instances', 'maxPerCommit'];
 
 export function loadRuns(dir) {
@@ -77,6 +81,8 @@ export function aggregate(data, { scope = [], repoRoot } = {}) {
         mounts: stats.mounts,
         cascades: stats.cascadeCommits,
         renderMs: stats.renderMs,
+        mountMs: stats.mountMs || 0,
+        wastedMs: stats.wastedMs || 0,
         longFrameMs: (stats.longFrames && stats.longFrames.maxMs) || 0,
         blockingMs: (stats.longFrames && stats.longFrames.blockingMs) || 0,
         interactionMs: (stats.interactions && stats.interactions.maxMs) || 0,
@@ -128,11 +134,13 @@ export function aggregate(data, { scope = [], repoRoot } = {}) {
           entry = { perRun: [] };
           slot.sources.set(key, entry);
         }
-        const acc = entry.perRun[r] || (entry.perRun[r] = { triggers: 0, renders: 0, wasted: 0, mounts: 0 });
+        const acc = entry.perRun[r] || (entry.perRun[r] = { triggers: 0, renders: 0, wasted: 0, mounts: 0, ms: 0, wastedMs: 0 });
         acc.triggers += source.triggers;
         acc.renders += source.renders;
         acc.wasted += source.wasted;
         acc.mounts += source.mounts;
+        acc.ms += source.ms || 0;
+        acc.wastedMs += source.wastedMs || 0;
       }
     }
   });
@@ -166,7 +174,15 @@ export function aggregate(data, { scope = [], repoRoot } = {}) {
     }
     const sources = [];
     for (const [key, entry] of slot.sources) {
-      sources.push({ key, triggers: med(entry.perRun, (acc) => acc.triggers), renders: med(entry.perRun, (acc) => acc.renders), wasted: med(entry.perRun, (acc) => acc.wasted), mounts: med(entry.perRun, (acc) => acc.mounts) });
+      sources.push({
+        key,
+        triggers: med(entry.perRun, (acc) => acc.triggers),
+        renders: med(entry.perRun, (acc) => acc.renders),
+        wasted: med(entry.perRun, (acc) => acc.wasted),
+        mounts: med(entry.perRun, (acc) => acc.mounts),
+        ms: round(med(entry.perRun, (acc) => acc.ms), 2),
+        wastedMs: round(med(entry.perRun, (acc) => acc.wastedMs), 2),
+      });
     }
     // Renders started by state that lives inside the scope, wherever the re-rendered components live.
     const fromScope = sources.filter((source) => components.get(source.key).category === 'scope');
@@ -185,6 +201,8 @@ export function aggregate(data, { scope = [], repoRoot } = {}) {
       scopeCaused: round(fromScope.reduce((sum, source) => sum + source.renders, 0), 1),
       scopeCausedWasted: round(fromScope.reduce((sum, source) => sum + source.wasted, 0), 1),
       renderMs: round(totalsField('renderMs'), 1),
+      mountMs: round(totalsField('mountMs'), 1),
+      wastedMs: round(totalsField('wastedMs'), 1),
       longFrameMs: round(totalsField('longFrameMs'), 1),
       blockingMs: round(totalsField('blockingMs'), 1),
       interactionMs: round(totalsField('interactionMs'), 1),
@@ -268,10 +286,34 @@ function findByName(info, name) {
 }
 
 /**
+ * The steps a triage found slow, with the factor that turns render time measured with the tracker
+ * (at the audit's CPU slowdown) into render time on the triage's device profile: the ratio of
+ * React time in that step between the two. Steps whose name differs from the triage's are skipped
+ * (the scenario changed since).
+ */
+export function slowStepsOf(steps, triage) {
+  const slow = new Map();
+  for (const entry of triage || []) {
+    if (!entry.slow) continue;
+    const step = steps.find((item) => item.index === entry.index);
+    if (!step || step.name !== entry.name) continue;
+    const reactMs = entry.worst ? entry.worst.reactMs : 0;
+    slow.set(entry.index, { name: entry.name, profile: entry.worst ? entry.worst.profile : null, factor: step.renderMs > 0 && reactMs > 0 ? reactMs / step.renderMs : 1 });
+  }
+  return slow;
+}
+
+/**
  * Ranked hotspots across every step, page load included (re-renders right after the first
  * render, from providers and effects, are as fixable as the ones an interaction causes).
+ *
+ * Each hotspot carries the render time it costs per step (`msByStep`). With a triage (`triage`:
+ * its steps for this scenario), only the slow steps count: `saves` is the most the fix could save
+ * in one of them, on the triage's device profile, and the hotspot is worth fixing when that's at
+ * least a frame. Without a triage every step counts, at the measured time. Without render timing
+ * (a production build) nothing is judged and the ranking falls back to counts.
  */
-export function hotspots(aggregated, { scopeConfigured }) {
+export function hotspots(aggregated, { scopeConfigured, triage = null }) {
   const { steps, components: info } = aggregated;
   const totals = sumComponents(steps);
   // Only the app's own compiled components say React Compiler is on (libraries ship compiled code).
@@ -279,15 +321,63 @@ export function hotspots(aggregated, { scopeConfigured }) {
   const out = [];
   const avgSelf = (total) => (total.renders ? total.selfMs / total.renders : 0);
   const fixable = (component) => component && (component.category === 'scope' || (!scopeConfigured && component.category === 'project'));
+
+  const timed = steps.some((step) => step.renderMs > 0);
+  const slow = triage ? slowStepsOf(steps, triage) : null;
+  const compAt = steps.map((step) => new Map(step.components.map((comp) => [comp.key, comp])));
+  /** { stepIndex: value } of pick(component row) for one component, over the steps it rendered in. */
+  const perStep = (key, pick) => {
+    const map = {};
+    steps.forEach((step, i) => {
+      const comp = compAt[i].get(key);
+      const value = comp ? pick(comp) : 0;
+      if (value > 0) map[step.index] = value;
+    });
+    return map;
+  };
+  const mergeSteps = (maps) => {
+    const merged = {};
+    for (const map of maps) for (const [index, value] of Object.entries(map)) merged[index] = (merged[index] || 0) + value;
+    return merged;
+  };
+  const stepName = (index) => (steps.find((step) => step.index === index) || {}).name;
+  // The step where a fix would save the most, and how much (scaled to the triage's profile).
+  const timeOf = (msByStep) => {
+    let total = 0;
+    let best = null;
+    for (const [key, value] of Object.entries(msByStep)) {
+      const index = Number(key);
+      total += value;
+      const at = slow ? slow.get(index) : { name: stepName(index), profile: null, factor: 1 };
+      if (!at) continue;
+      const estimate = value * at.factor;
+      if (!best || estimate > best.ms) best = { step: index, name: at.name, profile: at.profile, ms: round(estimate, 1), measuredMs: round(value, 2) };
+    }
+    return { total: round(total, 2), best };
+  };
+  const whyNot = (best) => {
+    if (slow && !slow.size) return 'no step is slow';
+    if (!best) return slow ? 'it costs no render time in the slow steps' : 'it costs no measurable render time';
+    return `it would save at most ${best.ms} ms of render work in “${best.name}”${best.profile ? ` on ${best.profile}` : ''}, less than a frame`;
+  };
   const add = (hotspot) => {
     const at = hotspot.at || info.get(hotspot.key);
+    const time = timeOf(hotspot.msByStep || {});
+    const worth = timed ? !!time.best && time.best.ms >= FRAME_MS : null;
+    const about = (value) => (value >= 10 ? Math.round(value) : value);
+    const evidence = timed && time.best ? [`costs about ${about(time.best.ms)} ms of render work in “${time.best.name}”${time.best.profile ? ` on ${time.best.profile} (scaled from the ${about(time.best.measuredMs)} ms measured with the tracker)` : ' (development build, measured)'}`, ...hotspot.evidence] : hotspot.evidence;
     out.push({
       ...hotspot,
+      evidence,
       component: info.get(hotspot.key) ? info.get(hotspot.key).name : hotspot.component,
       file: at ? at.file : null,
       line: at ? at.line : null,
       fixIn: at ? at.name : null,
       inScope: fixable(at),
+      ms: time.total,
+      saves: time.best,
+      worth,
+      whyNot: worth === false ? whyNot(time.best) : null,
       score: round(hotspot.score, 1),
     });
   };
@@ -304,12 +394,14 @@ export function hotspots(aggregated, { scopeConfigured }) {
       const groupKey = `${source.key}|${labels.join(',')}`;
       let group = cascades.get(groupKey);
       if (!group) {
-        group = { key: source.key, hooks: {}, triggers: 0, renders: 0, wasted: 0, steps: [], actions: new Set(), victims: new Map(), victimMs: 0, contextDriven: false };
+        group = { key: source.key, hooks: {}, triggers: 0, renders: 0, wasted: 0, steps: [], actions: new Set(), victims: new Map(), victimMs: 0, msByStep: {}, contextDriven: false };
         cascades.set(groupKey, group);
       }
       group.triggers += source.triggers;
       group.renders += source.renders;
       group.wasted += source.wasted;
+      // Moving the state down saves the renders it wastes: their self time, in this step.
+      if (source.wastedMs) group.msByStep[step.index] = (group.msByStep[step.index] || 0) + source.wastedMs;
       group.steps.push(step.name);
       group.actions.add(step.action);
       if (own) {
@@ -360,6 +452,7 @@ export function hotspots(aggregated, { scopeConfigured }) {
         `most re-rendered: ${victims.slice(0, 5).map(([key, n]) => `${info.get(key) ? info.get(key).name : key} ×${round(n, 1)}`).join(', ')}`,
       ],
       metrics: { triggers: group.triggers, rendersCaused: group.renders, wastedCaused: group.wasted, victimMs: round(group.victimMs, 1) },
+      msByStep: group.msByStep,
       skill: 'react-rerenders',
       rule: coarsen ? 'Know what state your hooks hide (store coarse values)' : 'Move state down / pass the unaffected subtree as children',
       fix: coarsen
@@ -390,6 +483,8 @@ export function hotspots(aggregated, { scopeConfigured }) {
           `${round(total.instances, 1)} instance(s), ~${round(avgSelf(total), 2)} ms each (dev build)`,
         ],
         metrics: { renders: total.renders, wasted: total.wasted, instances: total.instances },
+        // Stable props let memo skip these renders and everything they re-rendered below.
+        msByStep: perStep(total.key, (comp) => (comp.wasted ? comp.wastedTreeMs * Math.min(1, comp.reasons.propsUnstable / comp.wasted) : 0)),
         skill: 'react-memoization',
         rule: 'memo needs every prop to keep its identity',
         fix: `In ${owner ? owner.name : 'the parent'}: ${propFix(total.props)}.`,
@@ -406,6 +501,11 @@ export function hotspots(aggregated, { scopeConfigured }) {
         title: `${component.name} sets state in an effect right after rendering`,
         evidence: [`${round(total.cascades, 1)} extra commit(s) started by ${component.name} immediately after a commit it rendered in`, hooks.length ? `state set: ${hooks.join(', ')}` : ''].filter(Boolean),
         metrics: { cascades: total.cascades, renders: total.renders },
+        // Each extra commit re-renders the component and what's below it once more.
+        msByStep: perStep(total.key, (comp) => {
+          const updates = comp.renders - comp.mounts;
+          return comp.cascades && updates > 0 ? comp.cascades * (comp.updateTreeMs / updates) : 0;
+        }),
         skill: 'react-effects',
         rule: 'Derive during render; you might not need an effect',
         fix: 'Compute the value during render (or in the event handler that causes the change) instead of copying it into state from an effect; reset with a key if it must follow an identity.',
@@ -422,6 +522,8 @@ export function hotspots(aggregated, { scopeConfigured }) {
         title: `${component.name} takes ${round(total.maxSelfMs, 1)} ms to render during interactions`,
         evidence: [`${round(total.renders, 1)} render(s), up to ${round(total.maxSelfMs, 1)} ms each (dev build; production is faster but proportional)`, `steps: ${[...new Set(total.steps)].join('; ')}`],
         metrics: { renders: total.renders, maxSelfMs: total.maxSelfMs },
+        // Deferring takes the necessary renders off the urgent path.
+        msByStep: perStep(total.key, (comp) => Math.max(0, comp.updateMs - comp.wastedMs)),
         skill: 'react-responsiveness',
         rule: 'Keep interactions under 50 ms of main-thread work',
         fix: 'Defer the expensive part with useDeferredValue or startTransition behind a memo() boundary, or memoize the costly computation; keep the input itself urgent.',
@@ -437,6 +539,7 @@ export function hotspots(aggregated, { scopeConfigured }) {
         title: `React Compiler skipped ${component.name}`,
         evidence: [`other components are compiled, ${component.name} is not, and it had ${round(total.wasted, 1)} wasted renders`],
         metrics: { wasted: total.wasted },
+        msByStep: perStep(total.key, (comp) => comp.wastedTreeMs),
         skill: 'react-memoization',
         rule: 'Fix Rules of React violations so the compiler can memoize',
         fix: 'Run the React Compiler lint rules on this file and fix what they report (mutation during render, reading refs during render, conditional hooks).',
@@ -499,6 +602,8 @@ export function hotspots(aggregated, { scopeConfigured }) {
         `steps: ${[...new Set(total.steps)].join('; ')}`,
       ].filter(Boolean),
       metrics: { remounts: total.remounts, identityChurn: total.identityChurn, mounts: total.mounts, subtreeRemounts: followerCount },
+      // The cost of mounting again what didn't need to unmount, root and subtree.
+      msByStep: mergeSteps([total, ...followers].map((item) => perStep(item.key, (comp) => (comp.mounts ? (comp.mountMs / comp.mounts) * (comp.remounts + comp.identityChurn) : 0)))),
       skill: 'react-reconciliation',
       rule: churn ? 'Define components at module scope' : 'Keep keys and tree shape stable',
       fix: churn
@@ -534,6 +639,15 @@ export function hotspots(aggregated, { scopeConfigured }) {
         `consumers: ${context.consumers.sort(([, a], [, b]) => b - a).slice(0, 5).map(([key, n]) => `${info.get(key).name} ×${round(n, 1)}`).join(', ')}`,
       ],
       metrics: { consumerRenders: context.renders },
+      // A stable value lets each consumer skip these renders and what they re-rendered below.
+      msByStep: mergeSteps(
+        context.consumers.map(([key]) =>
+          perStep(key, (comp) => {
+            const unstable = comp.contexts && comp.contexts[context.name] ? comp.contexts[context.name].unstable : 0;
+            return unstable && comp.wasted ? comp.wastedTreeMs * Math.min(1, unstable / comp.wasted) : 0;
+          }),
+        ),
+      ),
       skill: 'react-context',
       rule: 'Memoize context values; split state and actions',
       fix: `In ${context.provider || 'the provider'}: build the value with useMemo and its functions with useCallback; if some consumers only need actions, split them into a separate context.`,
@@ -552,6 +666,7 @@ export function hotspots(aggregated, { scopeConfigured }) {
       title: `${round(total.maxPerCommit, 0)} ${component.name} rows render in a single commit`,
       evidence: [`up to ${round(total.maxPerCommit, 0)} instances rendered together`],
       metrics: { maxPerCommit: total.maxPerCommit },
+      msByStep: perStep(total.key, (comp) => comp.selfMs),
       skill: 'react-large-lists',
       rule: 'Paginate or virtualize long lists',
       fix: 'Virtualize the list (react-window, @tanstack/react-virtual) or paginate; memoize rows with stable props first if most of their renders are wasted.',
@@ -572,6 +687,7 @@ export function hotspots(aggregated, { scopeConfigured }) {
       title: `Renders keep happening after "${step.name}" without input`,
       evidence: [`${step.commits} commits and the page never went quiet; updates came from: ${top.join(', ') || 'unknown'}`],
       metrics: { commits: step.commits },
+      msByStep: { [step.index]: step.renderMs },
       skill: 'react-rerenders',
       rule: 'Isolate high-frequency state (timers, animation, polling) in leaves',
       fix: 'Move timer/animation/polling state into the small component that displays it, or drive animations with CSS or refs instead of state.',
@@ -580,7 +696,10 @@ export function hotspots(aggregated, { scopeConfigured }) {
     });
   }
 
-  out.sort((a, b) => Number(b.inScope) - Number(a.inScope) || b.score - a.score);
+  // In scope first; then what's worth fixing, by the time it would save; then by counts.
+  const worthRank = (hotspot) => (hotspot.worth === true ? 2 : hotspot.worth === null ? 1 : 0);
+  const saving = (hotspot) => (hotspot.saves ? hotspot.saves.ms : 0);
+  out.sort((a, b) => Number(b.inScope) - Number(a.inScope) || worthRank(b) - worthRank(a) || saving(b) - saving(a) || b.score - a.score);
   out.forEach((hotspot, i) => (hotspot.id = `H${i + 1}`));
   return out;
 }
@@ -591,17 +710,24 @@ export function analyzeScenario(config, label, scenario) {
   const dir = join(config.audit, 'runs', label, scenario);
   const data = loadRuns(dir);
   const aggregated = aggregate(data, { scope: config.scope || [], repoRoot: config.repoRoot });
-  const found = hotspots(aggregated, { scopeConfigured: (config.scope || []).length > 0 });
+  const triage = readTriage(config.audit);
+  const triaged = triageSteps(triage, scenario);
+  const found = hotspots(aggregated, { scopeConfigured: (config.scope || []).length > 0, triage: triaged });
   const all = aggregated.steps;
+  const slow = triaged ? slowStepsOf(all, triaged) : null;
+  const timed = all.some((step) => step.renderMs > 0);
   const sum = (field) => round(all.reduce((total, step) => total + (step[field] || 0), 0), 1);
   const byComponent = new Map();
   for (const step of all) {
     for (const comp of step.components) {
-      const entry = byComponent.get(comp.key) || { key: comp.key, renders: 0, wasted: 0, mounts: 0, selfMs: 0, reasons: {} };
+      const entry = byComponent.get(comp.key) || { key: comp.key, renders: 0, wasted: 0, mounts: 0, selfMs: 0, updateMs: 0, wastedMs: 0, mountMs: 0, reasons: {} };
       entry.renders += comp.renders;
       entry.wasted += comp.wasted;
       entry.mounts += comp.mounts;
       entry.selfMs += comp.selfMs;
+      entry.updateMs += comp.updateMs || 0;
+      entry.wastedMs += comp.wastedMs || 0;
+      entry.mountMs += comp.mountMs || 0;
       for (const [reason, n] of Object.entries(comp.reasons)) entry.reasons[reason] = (entry.reasons[reason] || 0) + n;
       byComponent.set(comp.key, entry);
     }
@@ -614,6 +740,16 @@ export function analyzeScenario(config, label, scenario) {
     runs: data.runs.length,
     react: data.runs[0] && data.runs[0].react,
     scope: config.scope || [],
+    timed,
+    triage: triage
+      ? {
+          decision: triaged ? triage.decision : null,
+          build: triage.build,
+          summary: triage.summary,
+          covered: !!triaged,
+          slowSteps: slow ? [...slow.entries()].map(([index, step]) => ({ index, name: step.name, profile: step.profile, factor: round(step.factor, 2) })) : [],
+        }
+      : null,
     totals: {
       renders: sum('renders'),
       scopeRenders: sum('scopeRenders'),
@@ -624,6 +760,8 @@ export function analyzeScenario(config, label, scenario) {
       commits: sum('commits'),
       remounts: sum('remounts'),
       cascades: sum('cascades'),
+      renderMs: sum('renderMs'),
+      wastedMs: sum('wastedMs'),
       longFrameMs: Math.max(0, ...all.map((step) => step.longFrameMs)),
       interactionMs: Math.max(0, ...all.map((step) => step.interactionMs)),
     },
@@ -631,13 +769,14 @@ export function analyzeScenario(config, label, scenario) {
     unstableSteps: unstable.map((step) => ({ name: step.name, min: step.spread.min, max: step.spread.max })),
     steps: aggregated.steps.map(({ components, sources, ...step }) => ({
       ...step,
+      slow: slow ? slow.has(step.index) : null,
       top: components.slice(0, 25),
       sources: sources.slice(0, 10),
     })),
     components: [...aggregated.components.values()],
     byComponent: [...byComponent.values()]
-      .map((entry) => ({ ...entry, renders: round(entry.renders, 1), wasted: round(entry.wasted, 1), mounts: round(entry.mounts, 1), selfMs: round(entry.selfMs, 1) }))
-      .sort((a, b) => b.renders - a.renders),
+      .map((entry) => ({ ...entry, renders: round(entry.renders, 1), wasted: round(entry.wasted, 1), mounts: round(entry.mounts, 1), selfMs: round(entry.selfMs, 1), updateMs: round(entry.updateMs, 1), wastedMs: round(entry.wastedMs, 1), mountMs: round(entry.mountMs, 1) }))
+      .sort((a, b) => (timed ? b.updateMs - a.updateMs : 0) || b.renders - a.renders),
     hotspots: found,
   };
   writeJson(join(dir, 'analysis.json'), result);
@@ -650,17 +789,29 @@ export function analyzeLabel(config, label, { scenario } = {}) {
   return names.map((name) => analyzeScenario(config, label, name));
 }
 
+const DECISION_TEXT = {
+  renders: 'some steps are slow, and re-rendering is a big part of them',
+  'not-renders': 'some steps are slow, but not mainly because of re-rendering',
+  unknown: "some steps are slow; the triage's build didn't show React's render time",
+  'nothing-slow': 'nothing is slow',
+};
+
 export function formatAnalysis(result, { top = 8, appRoot } = {}) {
   const info = new Map(result.components.map((component) => [component.key, component]));
   const where = (file, line) => (file ? `${appRoot ? relative(appRoot, file) : file}${line ? `:${line}` : ''}` : '(file unknown)');
   const lines = [];
   const meta = result.meta || {};
+  const ms = (value) => `${round(value, 1)} ms`;
   lines.push(`Scenario "${result.scenario}" [${result.label}] — ${result.runs} run(s)${meta.warmup ? ` + ${meta.warmup} warm-up` : ''}, ${meta.chrome || 'Chrome'}, React ${(result.react && result.react.version) || '?'}${result.react && result.react.development ? ' (dev build)' : ''}, CPU ${meta.cpu || 1}× on interactions`);
   if (result.scope.length) lines.push(`Scope: ${result.scope.map((dir) => (appRoot ? relative(appRoot, dir) || '.' : dir)).join(', ')}`);
+  const triage = result.triage;
+  if (!result.timed) lines.push('No render timing in these runs (a production build?): hotspots are ranked by counts, and none can be judged worth fixing for speed. Measure a development build.');
+  else if (!triage || !triage.covered) lines.push('No triage for this scenario: every step counts. Run `triage` first, so fixes are ranked by the time they save where users wait.');
+  else lines.push(`Triage: ${DECISION_TEXT[triage.decision]}${triage.slowSteps.length ? ` (slow: ${triage.slowSteps.map((step) => `${step.index}. ${step.name}${step.profile ? ` on ${step.profile}` : ''}`).join('; ')})` : ''}.`);
   lines.push('');
-  const rows = [['#', 'step', 'commits', 'renders', 'wasted', 'from scope', 'remounts', 'longest frame', 'settled']];
+  const rows = [['#', 'step', 'React time', 'in wasted renders', 'commits', 'renders', 'wasted', 'from scope', 'remounts', 'settled', ...(triage && triage.covered ? ['slow'] : [])]];
   for (const step of result.steps) {
-    rows.push([step.index, step.name, step.commits, step.renders, step.wasted, step.scopeCaused || 0, step.remounts || 0, step.longFrameMs ? `${step.longFrameMs} ms` : '—', step.settled ? 'yes' : 'NO']);
+    rows.push([step.index, step.name, result.timed ? ms(step.renderMs) : '—', result.timed ? ms(step.wastedMs || 0) : '—', step.commits, step.renders, step.wasted, step.scopeCaused || 0, step.remounts || 0, step.settled ? 'yes' : 'NO', ...(triage && triage.covered ? [step.slow ? 'SLOW' : ''] : [])]);
   }
   lines.push(table(rows, { indent: '  ' }));
   lines.push(
@@ -670,32 +821,42 @@ export function formatAnalysis(result, { top = 8, appRoot } = {}) {
   );
   lines.push('');
   const t = result.totals;
-  lines.push(`Totals (all steps): ${t.renders} renders, ${t.wasted} wasted, ${t.remounts} remounts, ${t.cascades} effect cascades, ${t.commits} commits${result.scope.length ? `; ${t.scopeCaused} renders (${t.scopeCausedWasted} wasted) were started by state inside the scope` : ''}`);
+  lines.push(`Totals (all steps): ${result.timed ? `${ms(t.renderMs)} of React render time, ${ms(t.wastedMs || 0)} of it in wasted renders; ` : ''}${t.renders} renders, ${t.wasted} wasted, ${t.remounts} remounts, ${t.cascades} effect cascades, ${t.commits} commits${result.scope.length ? `; ${t.scopeCaused} renders (${t.scopeCausedWasted} wasted) were started by state inside the scope` : ''}`);
 
   const most = result.byComponent.filter((entry) => entry.renders > 0).slice(0, 12);
   if (most.length) {
-    lines.push('', 'Most rendered components (all steps):');
-    const compRows = [['component', 'renders', 'wasted', 'main reason', 'self ms', 'where']];
+    lines.push('', result.timed ? 'Where re-render time goes (all steps, development build):' : 'Most rendered components (all steps):');
+    const compRows = [[...(result.timed ? ['component', 're-render ms', 'wasted ms', 'mount ms'] : ['component']), 'renders', 'wasted', 'main reason', 'where']];
     for (const entry of most) {
       const component = info.get(entry.key) || {};
       const reason = Object.entries({ ...entry.reasons, mount: entry.mounts }).sort(([, a], [, b]) => b - a)[0];
-      compRows.push([`${component.name}${component.memo ? ' (memo)' : ''}`, round(entry.renders, 1), round(entry.wasted, 1), reason && reason[1] ? reason[0] : '—', round(entry.selfMs, 1), `${where(component.file, component.line)}${component.category === 'scope' ? '' : ` [${component.category}]`}`]);
+      const name = `${component.name}${component.memo ? ' (memo)' : ''}`;
+      compRows.push([...(result.timed ? [name, round(entry.updateMs, 1), round(entry.wastedMs, 1), round(entry.mountMs, 1)] : [name]), round(entry.renders, 1), round(entry.wasted, 1), reason && reason[1] ? reason[0] : '—', `${where(component.file, component.line)}${component.category === 'scope' ? '' : ` [${component.category}]`}`]);
     }
     lines.push(table(compRows, { indent: '  ' }));
   }
 
   const inScope = result.hotspots.filter((hotspot) => hotspot.inScope);
   const outside = result.hotspots.filter((hotspot) => !hotspot.inScope);
-  lines.push('', inScope.length ? `Hotspots you can fix in scope (ranked):` : 'No hotspots inside the scope.');
-  for (const hotspot of inScope.slice(0, top)) {
+  const worth = inScope.filter((hotspot) => hotspot.worth !== false);
+  const cheap = inScope.filter((hotspot) => hotspot.worth === false);
+  if (!inScope.length) lines.push('', 'No hotspots inside the scope.');
+  else if (!worth.length) lines.push('', 'Nothing inside the scope is worth fixing for speed.');
+  else lines.push('', result.timed ? 'Worth fixing (ranked by the render time each would save in a slow step):' : 'Hotspots you can fix in scope (ranked by counts):');
+  for (const hotspot of worth.slice(0, top)) {
     lines.push(`  ${hotspot.id} [${hotspot.kind}] ${hotspot.title}`);
     lines.push(`     fix in ${hotspot.fixIn || hotspot.component} — ${where(hotspot.file, hotspot.line)}`);
     for (const line of hotspot.evidence) lines.push(`     · ${line}`);
     lines.push(`     → ${hotspot.skill}: ${hotspot.rule}. ${hotspot.fix} [${hotspot.safety}]`);
   }
-  if (inScope.length > top) lines.push(`  … ${inScope.length - top} more in analysis.json`);
+  if (worth.length > top) lines.push(`  … ${worth.length - top} more in analysis.json`);
+  if (cheap.length) {
+    lines.push('', `Not worth fixing for speed (${cheap.length}): ${cheap[0].whyNot === 'no step is slow' ? 'no step is slow' : result.triage && result.triage.covered ? 'each would save less than a frame in the slow steps' : 'each would save less than a frame in any step'}.`);
+    for (const hotspot of cheap.slice(0, 10)) lines.push(`  ${hotspot.id} [${hotspot.kind}] ${hotspot.title} — ${hotspot.saves ? `${hotspot.saves.ms} ms` : 'no render time in the slow steps'}`);
+    if (cheap.length > 10) lines.push(`  … ${cheap.length - 10} more in analysis.json`);
+  }
   if (outside.length) {
-    lines.push('', `Outside the scope (${outside.length}): ${outside.slice(0, 6).map((hotspot) => `${hotspot.id} ${hotspot.kind} in ${hotspot.fixIn || hotspot.component}`).join(', ')}`);
+    lines.push('', `Outside the scope (${outside.length}): ${outside.slice(0, 6).map((hotspot) => `${hotspot.id} ${hotspot.kind} in ${hotspot.fixIn || hotspot.component}${hotspot.worth ? ` (saves ${hotspot.saves.ms} ms)` : ''}`).join(', ')}`);
   }
   lines.push('', `Full detail: runs/${result.label}/${result.scenario}/analysis.json in the audit directory.`);
   return lines.join('\n');

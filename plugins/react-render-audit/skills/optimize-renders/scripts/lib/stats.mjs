@@ -132,7 +132,8 @@ export function pairedDiff(a, b, { confidence = 0.95 } = {}) {
  * opposite): a difference counts only when the whole confidence interval is on one side of zero.
  */
 export function verdict(ci, { lowerIsBetter = true } = {}) {
-  if (!ci || !ci.n || ci.low === null) return 'same';
+  // Too few samples for the requested confidence: nothing can be claimed either way.
+  if (!ci || !ci.n || ci.low === null || ci.exact === false) return 'same';
   if (ci.high < 0) return lowerIsBetter ? 'better' : 'worse';
   if (ci.low > 0) return lowerIsBetter ? 'worse' : 'better';
   return 'same';
@@ -206,7 +207,9 @@ export function quantileDiff(before, after, q = 0.75, { confidence = 0.95 } = {}
  */
 export function impactOf(step) {
   const { inp, mainThread, tbt, longFrames, dropped } = step;
-  const verdicts = [inp, mainThread, tbt, longFrames, dropped].filter(Boolean).map((ci) => verdict(ci));
+  const all = [inp, mainThread, tbt, longFrames, dropped].filter(Boolean);
+  if (all.some((ci) => ci.exact === false)) return { level: 'none', direction: 'same', reasons: [], judged: false };
+  const verdicts = all.map((ci) => verdict(ci));
   const direction = (inp && verdict(inp) !== 'same' && verdict(inp)) || verdicts.find((value) => value !== 'same') || 'same';
   if (direction === 'same') return { level: 'none', direction, reasons: [] };
   const agrees = (ci) => ci && verdict(ci) === direction;

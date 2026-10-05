@@ -93,7 +93,7 @@ There's nothing to invoke. Work normally, and Claude loads the relevant skill fr
 
 To force a skill, name it: "use the react-memoization skill to review this component".
 
-## Cut re-renders in your app: `/optimize-renders`
+## Fix the re-renders that make your app slow: `/optimize-renders`
 
 [`plugins/react-render-audit`](plugins/react-render-audit/) is a second, opt-in plugin in this marketplace. It puts the skills to work on a real codebase:
 
@@ -102,16 +102,14 @@ To force a skill, name it: "use the react-memoization skill to review this compo
 /optimize-renders
 ```
 
-It asks which directories and which user flow to target, then replays the flow in headless Chrome. A tracker injected before React loads counts every component render and why it happened (state, context, unstable props, parent, remounts, effect cascades), with no change to your code.
+It asks which directories and which user flow to target, then times the flow first in headless Chrome, on Lighthouse's mobile and desktop profiles with the CPU calibrated to a mid-tier phone. A step is slow when an interaction takes over 200 ms to respond (measured the way INP is), a frame freezes the page for over 200 ms, or a page load blocks for over 200 ms. If nothing is slow, or re-rendering isn't why, it says so and changes nothing.
 
-It fixes the worst causes in your scope one at a time using these skills. A fix is kept only if:
+Where re-rendering makes a step slow, a tracker injected before React loads records every component render, why it happened (state, context, unstable props, parent, remounts, effect cascades) and what it cost, with no change to your code. It fixes the causes that cost the most time inside your scope, one at a time, using these skills. A fix is kept only if:
 - your type check, lint and tests pass;
 - behavior is identical at every step (text, accessibility tree, DOM, network, console);
-- renders went down.
+- a timing benchmark shows the slow step got faster by at least a frame.
 
-Otherwise the files are restored.
-
-Then it proves the speed-up. The old and new code run side by side on Lighthouse's mobile and desktop profiles, with the CPU calibrated to a mid-tier phone. Each interaction's response time is measured the way INP is, and every change comes with a 95% confidence interval and an impact level.
+Otherwise the files are restored. A final benchmark runs the old and new code side by side, and every change comes with a 95% confidence interval and an impact level.
 
 It ends with a before/after report, and can also:
 - read real-user data (the Chrome UX Report, or your own `web-vitals` data);

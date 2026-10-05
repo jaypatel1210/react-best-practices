@@ -1,13 +1,15 @@
-// Builds the before/after report (self-contained HTML plus Markdown) from an audit directory:
-// the baseline, the final measurement, the change log and the comparisons, plus the timing
-// benchmark and field data when they exist. A benchmark alone also makes a report.
+// Builds the before/after report (self-contained HTML plus Markdown) from an audit directory. Time
+// comes first: the triage (what was slow before anything changed), the final timing benchmark,
+// and each fix with its timing proof. Render counts follow as the explanation of where render
+// work went. A triage or a benchmark alone also makes a report.
 import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { analyzeScenario, scenariosOf } from './analyze.mjs';
-import { benchMarkdown, comparisonRows, flowLine, ms, responseMs, speedHeadline } from './bench.mjs';
+import { aaText, benchMarkdown, comparisonRows, flowLine, ms, refreshAnalysis, responseMs, speedHeadline, targetText } from './bench.mjs';
 import { readChanges } from './changes.mjs';
 import { compareScenario } from './compare.mjs';
 import { ratingLabel } from './stats.mjs';
+import { readTriage, triageMarkdown } from './triage.mjs';
 import { percentChange, readJson, round } from './util.mjs';
 
 const esc = (value) =>
@@ -59,7 +61,15 @@ function bars(rows) {
     .join('');
 }
 
-/** The benchmark to report: the one named, or the newest. Returns { label, dir, data } or null. */
+function benchData(audit, label) {
+  const file = join(audit, 'bench', label, 'bench.json');
+  return existsSync(file) ? refreshAnalysis(readJson(file)) : null;
+}
+
+/**
+ * The benchmark to report: the one named, or the newest full one (triage runs and per-fix proofs
+ * have their own sections). Returns { label, dir, data } or null.
+ */
 function benchOf(audit, requested) {
   const root = join(audit, 'bench');
   if (!existsSync(root)) return null;
@@ -69,8 +79,54 @@ function benchOf(audit, requested) {
     .sort((a, b) => a.time - b.time)
     .map((entry) => entry.name);
   if (requested && !labels.includes(requested)) throw new Error(`--bench ${requested} not found (have: ${labels.join(', ') || 'none'})`);
-  const label = requested || labels[labels.length - 1];
-  return label ? { label, dir: join('bench', label), data: readJson(join(root, label, 'bench.json')) } : null;
+  const full = labels.filter((label) => {
+    const kind = (readJson(join(root, label, 'bench.json')).settings || {}).kind;
+    return !kind || kind === 'full';
+  });
+  const label = requested || full[full.length - 1];
+  return label ? { label, dir: join('bench', label), data: benchData(audit, label) } : null;
+}
+
+const DECISION = {
+  renders: ['bad', 're-rendering makes a slow step slow, so the re-render fixes below target it'],
+  'not-renders': ['muted', 'steps are slow for other reasons than re-rendering, so no re-render fix was tried'],
+  unknown: ['muted', "steps are slow, but this build doesn't show React's render time, so whether re-rendering is why is unknown"],
+  'nothing-slow': ['good', 'nothing is slow, so nothing was changed for speed'],
+};
+function triageHtml(triage) {
+  if (!triage) return [];
+  const html = ['<h2>Is anything slow?</h2>'];
+  html.push(`<p class="verdict">${esc(triage.summary)}</p>`);
+  html.push('<p class="muted">Timed before any change, with no render tracker in the page. A step is slow when an interaction takes more than 200 ms to respond (where INP stops being good), a single frame takes more than 200 ms, or a page load blocks for more than 200 ms (where Total Blocking Time stops being good). Re-render fixes are tried only where re-rendering is a big part of a slow step.</p>');
+  for (const profile of triage.profiles) {
+    const vp = profile.viewport;
+    html.push(`<div class="panel"><h3>${esc(profile.scenario)} · ${esc(profile.profile)} <span class="muted">(${vp.width}×${vp.height}, CPU ${esc(profile.cpuRate)}×, ${esc(profile.runs)} runs, medians)</span></h3>`);
+    html.push('<table class="wide"><thead><tr><th>#</th><th>Step</th><th>Response</th><th>Blocking</th><th>Re-render</th><th>Main thread</th><th>Verdict</th></tr></thead><tbody>');
+    for (const step of profile.steps) {
+      const where = step.slow && step.split.length ? `<br><span class="muted">time goes to ${esc(step.split.map((part) => `${part.label} ${ms(part.ms)}`).join(', '))}</span>` : '';
+      const verdictText = step.slow ? `<span class="${step.renderBound ? 'bad' : 'muted'}">slow${step.renderBound ? ', re-rendering' : step.renderBound === null ? '' : ', not re-rendering'}</span><br><span class="muted">${esc(step.reasons.join(', '))}</span>` : '<span class="ok">ok</span>';
+      html.push(`<tr><td>${esc(step.index)}</td><td>${esc(step.name)}${where}</td><td>${step.response ? `${esc(responseMs(step.response.median))} <span class="muted">${esc(ratingLabel(step.response.rating))}</span>` : '—'}</td><td>${esc(ms(step.blocking))}</td><td>${esc(ms(step.reactUpdates))}</td><td>${esc(ms(step.mainThread))}</td><td>${verdictText}</td></tr>`);
+    }
+    html.push('</tbody></table></div>');
+  }
+  const [cls, text] = DECISION[triage.decision];
+  html.push(`<p class="muted">Decision: <span class="${cls}">${esc(text)}</span>. Raw runs: <code>${esc(join('bench', triage.bench || 'triage', 'bench.json'))}</code>.</p>`);
+  return html;
+}
+
+/** The benchmark whose method the report describes: the full one, or else the triage's. */
+function methodBenchOf(audit, bench, triage) {
+  if (bench) return bench;
+  const data = triage && triage.bench ? benchData(audit, triage.bench) : null;
+  return data ? { label: triage.bench, dir: join('bench', triage.bench), data } : null;
+}
+
+/** The per-fix timing proof recorded with a change, as one line. */
+function proofOf(audit, change) {
+  if (!change.proof) return null;
+  const data = benchData(audit, change.proof);
+  if (!data || !data.target) return null;
+  return { text: targetText(data.target), lines: data.target.lines, decision: data.target.decision };
 }
 
 function fieldOf(audit) {
@@ -84,8 +140,10 @@ function fieldOf(audit) {
 
 const IMPACT_CLASS = { high: 'good', medium: 'good', low: 'muted', none: 'muted' };
 function impactHtml(impact) {
+  if (impact && impact.judged === false) return '<span class="muted">not judged (too few pairs)</span>';
   if (!impact || impact.level === 'none') return '<span class="muted">no measurable change</span>';
   if (impact.direction === 'worse') return `<span class="bad">slower · ${esc(impact.level)}</span>`;
+  if (impact.direction === 'mixed') return `<span class="bad">mixed · ${esc(impact.level)}</span>`;
   return `<span class="${IMPACT_CLASS[impact.level]}">${esc(impact.level)}</span>`;
 }
 
@@ -105,9 +163,13 @@ function speedHtml(bench) {
         html.push(`<tr><td>${esc(row.index)}</td><td>${esc(row.name)}${row.impact.level !== 'none' ? `<br><span class="muted">${esc(row.reasons.join('; '))}</span>` : ''}</td><td>${esc(row.metric)}</td><td><span class="was">${esc(row.beforeText)}</span> → <strong>${esc(row.afterText)}</strong></td><td>${esc(row.change)}${row.relative ? `<br><span class="muted">${esc(row.relative)}</span>` : ''}</td><td>${esc(row.rating)}</td><td>${impactHtml(row.impact)}</td></tr>`);
       }
       html.push('</tbody></table>');
-      html.push(`<p><strong>Whole flow:</strong> ${esc(flowLine(item))} — ${impactHtml(item.analysis.flow.impact)}</p>`);
+      const flowReasons = item.analysis.flow.impact.reasons && item.analysis.flow.impact.reasons.length ? ` <span class="muted">(${esc(item.analysis.flow.impact.reasons.join('; '))})</span>` : '';
+      html.push(`<p><strong>Whole flow:</strong> ${esc(flowLine(item))} — ${impactHtml(item.analysis.flow.impact)}${flowReasons}</p>`);
       const notes = [];
-      if (item.aa) notes.push(!item.aa.judged ? `A/A noise estimate from ${esc(item.aa.pairs)} pairs` : item.aa.ok ? 'A/A check passed (identical runs showed no difference)' : '<span class="bad">A/A check failed: identical runs differed, so small differences deserve caution</span>');
+      if (item.aa) {
+        const text = aaText(item);
+        notes.push(text.startsWith('A/A check FAILED') ? `<span class="bad">${esc(text)}</span>` : esc(text));
+      }
       if (item.replay && item.replay.requests) notes.push(`${esc(item.replay.distinct)} API request(s) recorded once and replayed to both sides`);
       if (item.traces && item.traces.a) notes.push(`Chrome traces: <a href="${esc(join(bench.dir, item.traces.a))}">before</a>${item.traces.b ? ` · <a href="${esc(join(bench.dir, item.traces.b))}">after</a>` : ''} (open in DevTools → Performance → Load profile)`);
       if (notes.length) html.push(`<p class="muted">${notes.join(' · ')}</p>`);
@@ -182,17 +244,18 @@ footer{margin-top:48px;color:var(--muted);font-size:13px}
 @media (max-width:640px){h1{font-size:24px}.bar-row{grid-template-columns:110px 1fr}.bar-num{grid-column:2}}
 `;
 
-function writeSpeedReport(config, bench, field) {
+function writeSpeedReport(config, bench, field, triage) {
   const audit = config.audit;
   const project = (config.detected && config.detected.name) || basename(config.appRoot || audit);
   const date = new Date().toISOString().slice(0, 10);
   const html = [];
   html.push(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Speed benchmark</title><style>${CSS}</style></head><body><main>`);
   html.push(`<p class="eyebrow">React speed benchmark</p><h1>${esc(project)}</h1><p class="meta">${date}</p>`);
-  html.push(...speedHtml(bench), ...fieldHtml(field));
-  html.push(...methodHtml(bench));
+  html.push(...triageHtml(triage), ...speedHtml(bench), ...fieldHtml(field));
+  html.push(...methodHtml(methodBenchOf(audit, bench, triage)));
   html.push(`<footer>Generated by react-render-audit from <code>${esc(audit)}</code>.</footer></main></body></html>`);
   const md = [`# Speed benchmark: ${project}`, '', date, ''];
+  if (triage) md.push(triageMarkdown(triage), '');
   if (bench) md.push(benchMarkdown(bench.data), '');
   const htmlFile = join(audit, 'report.html');
   const mdFile = join(audit, 'report.md');
@@ -209,9 +272,25 @@ function methodHtml(bench) {
   items.push(`Timing benchmark, protocol v${esc(data.protocol)}: ${data.mode === 'compare' ? 'both sides served by fresh development servers and replayed back to back, alternating which goes first; a same-vs-same (A/A) check first measured the noise and set the number of pairs' : 'the app replayed repeatedly'}. Each run uses a fresh browser profile and real (trusted) input.`);
   items.push(`Device profiles as in Lighthouse: mobile is 412×823 at 1.75× density with a phone user agent and the CPU slowed to a mid-tier phone${data.calibration ? ` (this machine's BenchmarkIndex ${esc(data.calibration.hostIndex)}, so ${esc(data.calibration.rate)}× slowdown, measured ${esc(data.calibration.throttledIndex)} against a target of ${esc(data.calibration.target)})` : ''}; desktop is 1350×940 at full speed.`);
   items.push('Response time is the slowest interaction in a step as Event Timing reports it (the way INP is measured), so ratings use the Core Web Vitals bands (good up to 200 ms, poor above 500 ms). Main-thread time is Chrome\'s own task time; blocking time is the part of each task beyond 50 ms.');
-  items.push('Statistics: the median of the paired differences with a sign-test 95% confidence interval (distribution-free, no randomness, so anyone can recompute it from the raw runs). Impact: high when an interaction changes Core Web Vitals band or by 100 ms or more; medium for at least one frame (16.7 ms) or 20% of main-thread time; low below that.');
-  if (data.settings && data.settings.replay) items.push('The first run recorded the app\'s API responses; every later run, on both sides, got the same responses instantly, so backend speed and changing data didn\'t affect the comparison.');
-  items.push(`Development builds on both sides: absolute times are higher than in production, but the comparison is like for like. Environment: ${esc(env.chrome || 'Chrome')}, ${esc(env.cpu || '?')} (${esc(env.cores || '?')} cores), ${esc(env.os || '')}${env.power ? `, ${esc(env.power)}` : ''}${env.ci ? ', CI runner' : ''}.`);
+  const compare = data.mode === 'compare';
+  items.push(
+    compare
+      ? 'Statistics: the median of the paired differences with a sign-test 95% confidence interval (distribution-free, no randomness, so anyone can recompute it from the raw runs). Impact: high when an interaction changes Core Web Vitals band or by 100 ms or more; medium for at least one frame (16.7 ms) or 20% of main-thread time; low below that.'
+      : 'Statistics: each step\'s median with a sign-test 95% confidence interval (distribution-free, no randomness, so anyone can recompute it from the raw runs).',
+  );
+  if (data.settings && data.settings.replay) items.push(`The first run recorded the app's API responses; every later run${compare ? ', on both sides,' : ''} got the same responses instantly, so backend speed and changing data didn't affect the ${compare ? 'comparison' : 'timings'}.`);
+  const environment = `Environment: ${esc(env.chrome || 'Chrome')}, ${esc(env.cpu || '?')} (${esc(env.cores || '?')} cores), ${esc(env.os || '')}${env.power ? `, ${esc(env.power)}` : ''}${env.ci ? ', CI runner' : ''}.`;
+  const builds = data.results.map((item) => item.react).filter(Boolean);
+  const development = builds.length ? builds.every((react) => react.development) : null;
+  const buildText =
+    development === true
+      ? compare
+        ? 'Development builds on both sides: absolute times are higher than in production, but the comparison is like for like.'
+        : 'A development build: absolute times are higher than in production.'
+      : development === false
+        ? `Production build${compare ? 's on both sides' : ''}.`
+        : '';
+  items.push(`${buildText ? `${buildText} ` : ''}${environment}`);
   return [`<h2>How the speed was measured</h2><div class="panel"><ul class="tight">${items.map((item) => `<li>${item}</li>`).join('')}</ul></div>`];
 }
 
@@ -221,9 +300,10 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
   const labels = labelsOf(audit);
   const bench = benchOf(audit, benchLabel);
   const field = fieldOf(audit);
+  const triage = readTriage(audit);
   if (!labels.includes('baseline')) {
-    if (bench || field.length) return writeSpeedReport(config, bench, field);
-    throw new Error(`No baseline in ${audit}/runs. Measure with --label baseline first (or run bench).`);
+    if (bench || field.length || triage) return writeSpeedReport(config, bench, field, triage);
+    throw new Error(`No baseline in ${audit}/runs. Measure with --label baseline first (or run triage or bench).`);
   }
   const final = pickFinal(audit, changes, requested);
   if (final && !labels.includes(final)) throw new Error(`--final ${final} was never measured (have: ${labels.join(', ')})`);
@@ -252,14 +332,17 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
   const react = scenarios[0] ? scenarios[0].baseline.react : null;
   const date = new Date().toISOString().slice(0, 10);
 
-  let headline;
-  const fromScope = scoped ? ` ${B('scopeCaused')} of them were started by state inside the scope.` : '';
-  if (!hasAfter) headline = `Baseline only: ${B('renders')} component renders across the scenario steps, ${B('wasted')} of them wasted.${fromScope} No code was changed; the hotspots below are what to fix first.`;
+  // Time first: the measured speed-up, or what the triage found; render counts explain it.
+  const timed = scenarios.some((item) => item.baseline.timed);
+  const speed = bench && bench.data.mode === 'compare' ? speedHeadline(bench.data) : triage && !hasAfter ? triage.headline || triage.summary : '';
+  let renderText;
+  if (!hasAfter) renderText = `Baseline: ${B('renders')} component renders across the scenario steps, ${B('wasted')} of them wasted${scoped ? ` and ${B('scopeCaused')} started by state inside the scope` : ''}${timed ? `, in ${ms(B('renderMs'))} of React render time` : ''}. No code was changed.`;
   else {
     const before = B(metric);
     const after = A(metric);
-    headline = `Component renders across the scenario steps went from ${before} to ${after} (${percentChange(before, after)}), wasted renders from ${B('wasted')} to ${A('wasted')}, with ${kept.length} kept change${kept.length === 1 ? '' : 's'}. ${changedSteps.length ? `${changedSteps.length} step(s) behaved differently; see below.` : `Behavior was identical at all ${allSteps.length} steps (text, accessibility tree, DOM, network, console).`}`;
+    renderText = `${kept.length} change${kept.length === 1 ? '' : 's'} kept. ${timed ? `React render time went from ${ms(B('renderMs'))} to ${ms(A('renderMs'))}, ` : ''}component renders from ${before} to ${after} (${percentChange(before, after)}), wasted renders from ${B('wasted')} to ${A('wasted')}. ${changedSteps.length ? `${changedSteps.length} step(s) behaved differently; see below.` : `Behavior was identical at all ${allSteps.length} steps (text, accessibility tree, DOM, network, console).`}`;
   }
+  const headline = [speed, renderText].filter(Boolean).join(' ');
 
   const html = [];
   html.push(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Re-render audit</title><style>${CSS}</style></head><body><main>`);
@@ -268,34 +351,41 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
   html.push(`<p class="meta"><code>${esc(appPath)}</code> · ${date} · ${scenarios.length} scenario${scenarios.length === 1 ? '' : 's'}${scoped ? ` · scope: ${config.scope.map((dir) => `<code>${esc(rel(dir))}</code>`).join(', ')}` : ''}</p>`);
   html.push(`<p class="verdict">${esc(headline)}</p>`);
   html.push('<section class="tiles">');
+  if (timed) html.push(tile('React render time', round(B('renderMs'), 0), round(A('renderMs'), 0), { unit: ' ms', hasAfter }));
   html.push(tile('Component renders', B(metric), A(metric), { hasAfter }));
   html.push(tile('Wasted renders', B('wasted'), A('wasted'), { hasAfter }));
   if (scoped) html.push(tile('Started from scope', B('scopeCaused'), A('scopeCaused'), { hasAfter }));
   html.push(tile('Remounts', B('remounts'), A('remounts'), { hasAfter }));
   html.push(tile('Effect cascades', B('cascades'), A('cascades'), { hasAfter }));
   if (!scoped) html.push(tile('React commits', B('commits'), A('commits'), { hasAfter }));
-  html.push(tile('Longest frame', maxOf('longFrameMs', 'before'), maxOf('longFrameMs', 'after'), { unit: ' ms', hasAfter }));
+  // Frame times from the render-count runs carry the tracker's overhead; the triage and the
+  // benchmark have the clean ones. Without React's timers, they're the only timing there is.
+  if (!timed) html.push(tile('Longest frame', maxOf('longFrameMs', 'before'), maxOf('longFrameMs', 'after'), { unit: ' ms', hasAfter }));
   html.push('</section>');
-  html.push(...speedHtml(bench), ...fieldHtml(field));
+  html.push(...triageHtml(triage), ...speedHtml(bench), ...fieldHtml(field));
 
   for (const item of scenarios) {
     const description = item.baseline.meta.description;
     html.push(`<h2>Scenario: ${esc(item.scenario)}</h2>${description ? `<p class="muted">${esc(description)}</p>` : ''}`);
-    html.push('<div class="panel"><table><thead><tr><th>#</th><th>Step</th><th>Renders</th><th>Wasted</th>' + (scoped ? '<th title="Renders started by state inside the scope">From scope</th>' : '') + '<th>Remounts</th><th>Longest frame</th>' + (item.comparison ? '<th>Behavior</th>' : '') + '</tr></thead><tbody>');
+    const stepTimed = item.baseline.timed;
+    html.push('<div class="panel"><table><thead><tr><th>#</th><th>Step</th>' + (stepTimed ? '<th title="React render time, development build, tracker runs">React time</th>' : '') + '<th>Renders</th><th>Wasted</th>' + (scoped ? '<th title="Renders started by state inside the scope">From scope</th>' : '') + '<th>Remounts</th>' + (stepTimed ? '' : '<th>Longest frame</th>') + (item.comparison ? '<th>Behavior</th>' : '') + '</tr></thead><tbody>');
     item.baseline.steps.forEach((step, index) => {
       const a = item.after ? item.after.steps[index] : null;
       const cmp = item.comparison ? item.comparison.steps[index] : null;
       const changed = cmp ? Object.entries(cmp.behavior).filter(([, channel]) => !channel.same).map(([name]) => name) : [];
+      const reactTime = stepTimed ? `<td>${a ? delta(round(step.renderMs, 0), round(a.renderMs, 0), { unit: ' ms' }) : `${esc(round(step.renderMs, 0))} ms`}${step.slow ? ' <span class="bad">slow</span>' : ''}</td>` : '';
+      const frame = stepTimed ? '' : `<td>${a ? delta(step.longFrameMs, a.longFrameMs, { unit: ' ms' }) : step.longFrameMs ? `${esc(step.longFrameMs)} ms` : '—'}</td>`;
       html.push(
-        `<tr><td>${step.index}</td><td>${esc(step.name)}</td><td>${a ? delta(step.renders, a.renders) : esc(step.renders)}</td><td>${a ? delta(step.wasted, a.wasted) : esc(step.wasted)}</td>${scoped ? `<td>${a ? delta(step.scopeCaused || 0, a.scopeCaused || 0) : esc(step.scopeCaused || 0)}</td>` : ''}<td>${a ? delta(step.remounts || 0, a.remounts || 0) : esc(step.remounts || 0)}</td><td>${a ? delta(step.longFrameMs, a.longFrameMs, { unit: ' ms' }) : step.longFrameMs ? `${esc(step.longFrameMs)} ms` : '—'}</td>${cmp ? `<td>${changed.length ? `<span class="fail">changed: ${esc(changed.join(', '))}</span>` : '<span class="ok">same</span>'}</td>` : ''}</tr>`,
+        `<tr><td>${step.index}</td><td>${esc(step.name)}</td>${reactTime}<td>${a ? delta(step.renders, a.renders) : esc(step.renders)}</td><td>${a ? delta(step.wasted, a.wasted) : esc(step.wasted)}</td>${scoped ? `<td>${a ? delta(step.scopeCaused || 0, a.scopeCaused || 0) : esc(step.scopeCaused || 0)}</td>` : ''}<td>${a ? delta(step.remounts || 0, a.remounts || 0) : esc(step.remounts || 0)}</td>${frame}${cmp ? `<td>${changed.length ? `<span class="fail">changed: ${esc(changed.join(', '))}</span>` : '<span class="ok">same</span>'}</td>` : ''}</tr>`,
       );
     });
     html.push('</tbody></table></div>');
 
-    // Components ranked by baseline renders across all steps, wherever they live: a fix in the
-    // scope often removes renders of shared components (design system, libraries).
+    // Components ranked by baseline re-render time (renders without timing) across all steps,
+    // wherever they live: a fix in the scope often saves time in shared components.
     const info = new Map([...item.baseline.components, ...(item.after ? item.after.components : [])].map((component) => [component.key, component]));
-    const afterTotals = new Map((item.after ? item.after.byComponent : []).map((entry) => [entry.key, entry.renders]));
+    const field = item.baseline.timed ? 'updateMs' : 'renders';
+    const afterTotals = new Map((item.after ? item.after.byComponent : []).map((entry) => [entry.key, entry[field]]));
     const rows = item.baseline.byComponent.slice(0, 12).map((entry) => {
       const component = info.get(entry.key) || { name: entry.key };
       const where = component.file ? `${rel(component.file)}:${component.line || ''}` : '';
@@ -303,10 +393,10 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
       if (component.category === 'scope') note = 'in scope';
       else if (component.category === 'external') note = 'library';
       else if (component.file) note = relative(config.repoRoot || config.appRoot, component.file).split(/[\\/]/).slice(0, 2).join('/');
-      return { name: component.name, note, where, before: round(entry.renders, 1), after: item.after ? round(afterTotals.get(entry.key) || 0, 1) : undefined };
+      return { name: component.name, note, where, before: round(entry[field], 1), after: item.after ? round(afterTotals.get(entry.key) || 0, 1) : undefined };
     });
     if (rows.length) {
-      html.push('<div class="panel"><h3>Most rendered components</h3>');
+      html.push(`<div class="panel"><h3>${item.baseline.timed ? 'Where re-render time goes (ms, development build)' : 'Most rendered components'}</h3>`);
       if (item.after) html.push('<div class="legend"><span><i style="background:var(--before)"></i>before</span><span><i style="background:var(--accent)"></i>after</span></div>');
       html.push(bars(rows));
       html.push('</div>');
@@ -350,8 +440,10 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
           .join('; ')
       : '';
     const gates = Object.entries(change.gates || {}).map(([name, result]) => `${name}: ${result}`).join(' · ');
+    const proof = proofOf(audit, change);
     html.push(`<div class="change"><h3><span class="badge ${esc(change.status)}">${esc(change.status)}</span>${esc(change.title)}</h3>`);
     html.push('<ul class="tight">');
+    if (proof) html.push(`<li>Timing proof: <span class="${proof.decision === 'faster' ? 'good' : 'bad'}">${esc(proof.text)}</span><ul class="tight">${proof.lines.map((line) => `<li>${esc(line)}</li>`).join('')}</ul></li>`);
     if (change.component || change.file) html.push(`<li>${change.component ? `<code>${esc(change.component)}</code>` : ''}${change.file ? ` in <code>${esc(rel(change.file))}</code>` : ''}</li>`);
     if (change.skill || change.rule) html.push(`<li>${change.skill ? `<code>${esc(change.skill)}</code>` : ''}${change.rule ? `: ${esc(change.rule)}` : ''}${change.safety ? ` <span class="muted">(${esc(change.safety)})</span>` : ''}</li>`);
     if (impactText) html.push(`<li>${esc(impactText)}</li>`);
@@ -363,9 +455,11 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
     html.push('</div>');
   }
 
-  const remaining = scenarios.flatMap((item) => (item.after || item.baseline).hotspots.filter((hotspot) => hotspot.inScope).map((hotspot) => ({ ...hotspot, scenario: item.scenario })));
+  const inScope = scenarios.flatMap((item) => (item.after || item.baseline).hotspots.filter((hotspot) => hotspot.inScope).map((hotspot) => ({ ...hotspot, scenario: item.scenario })));
+  const remaining = inScope.filter((hotspot) => hotspot.worth !== false);
+  const cheap = inScope.filter((hotspot) => hotspot.worth === false);
   html.push(`<h2>${hasAfter ? 'Remaining opportunities' : 'Hotspots found'}</h2>`);
-  if (!remaining.length) html.push('<p class="muted">Nothing left above the thresholds inside the scope.</p>');
+  if (!remaining.length) html.push(`<p class="muted">${cheap.length ? 'Nothing inside the scope is worth fixing for speed.' : 'Nothing left above the thresholds inside the scope.'}</p>`);
   else {
     html.push('<div class="panel"><table><thead><tr><th>Hotspot</th><th>Fix</th><th>Skill</th><th>Safety</th></tr></thead><tbody>');
     for (const hotspot of remaining.slice(0, 15)) {
@@ -373,14 +467,16 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
     }
     html.push('</tbody></table></div>');
   }
+  if (cheap.length) html.push(`<p class="muted">Not worth fixing for speed, because each would save less than a frame where it matters: ${esc(cheap.slice(0, 12).map((hotspot) => `${hotspot.title} (${hotspot.saves ? `${hotspot.saves.ms} ms` : 'no time in slow steps'})`).join('; '))}${cheap.length > 12 ? '; …' : ''}.</p>`);
 
   html.push('<h2>How this was measured</h2><div class="panel"><ul class="tight">');
   html.push(`<li>Each scenario was replayed ${esc(meta.runs || '?')} time(s) after ${esc(meta.warmup || 0)} warm-up run(s) in headless ${esc(meta.chrome || 'Chrome')}, each run in a fresh browser profile, with real (trusted) mouse and keyboard input. Numbers are medians.</li>`);
   html.push(`<li>React ${esc((react && react.version) || '?')} ${react && react.development ? 'development build' : ''}. A tracker installed before React loads counts one render per component per commit, so StrictMode double-rendering doesn't inflate counts. A render is <em>wasted</em> when the component's props were equal (or only new objects/functions with the same content) and its own state and context didn't change.</li>`);
-  html.push(`<li>CPU slowed ${esc(meta.cpu || 1)}× during interactions. ${bench ? 'Timings in the tables above the speed section come from the render-count runs (tracker attached); the speed section has the clean timings.' : 'Timings here come from a development build with the tracker attached: compare them with each other, not with production. Run the timing benchmark (<code>bench</code>) for clean timings.'}</li>`);
+  html.push(`<li>CPU slowed ${esc(meta.cpu || 1)}× during interactions. Render times in the render tables come from React's own timers in a development build, with the tracker attached; they rank causes against each other. ${bench || triage ? 'The triage and speed sections have the clean timings, measured without the tracker.' : 'Run the timing benchmark (<code>triage</code>, <code>bench</code>) for clean timings.'}</li>`);
+  if (triage) html.push('<li>Hotspots are ranked by the render time they cost in the steps the triage found slow, scaled to the triage\'s device profile by the ratio of React time in that step. Those that would save less than a frame (16.7 ms) are listed as not worth fixing.</li>');
   html.push('<li>Behavior check: after every step, the visible text, accessibility tree, DOM (with generated ids and CSS-in-JS hashes normalized), data requests and console errors are compared with the baseline. Lines that already varied between baseline runs are ignored as noise. It proves equivalence only for the steps in the scenarios.</li>');
   html.push('</ul></div>');
-  html.push(...methodHtml(bench));
+  html.push(...methodHtml(methodBenchOf(audit, bench, triage)));
   html.push(`<footer>Generated by react-render-audit from <code>${esc(audit)}</code>.</footer>`);
   html.push('<script>(function(){try{var t=localStorage.getItem("ra-theme");if(t)document.documentElement.dataset.theme=t;}catch(e){}})();</script>');
   html.push('</main></body></html>');
@@ -389,26 +485,29 @@ export function writeReport(config, { final: requested, bench: benchLabel } = {}
   md.push(`# Re-render audit: ${project}`, '');
   md.push(`${date} · ${scenarios.length} scenario(s)${scoped ? ` · scope: ${config.scope.map((dir) => `\`${rel(dir)}\``).join(', ')}` : ''}`, '');
   md.push(headline, '');
+  if (triage) md.push(triageMarkdown(triage), '');
   md.push('| Metric | Before | After | Change |', '|---|---:|---:|---:|');
-  for (const [label, field] of [[scoped ? 'Renders in scope' : 'Component renders', metric], ['Wasted renders', 'wasted'], ['Remounts', 'remounts'], ['Effect cascades', 'cascades'], ['React commits', 'commits']]) {
+  for (const [label, field] of [...(timed ? [['React render time (ms)', 'renderMs']] : []), [scoped ? 'Renders in scope' : 'Component renders', metric], ['Wasted renders', 'wasted'], ['Remounts', 'remounts'], ['Effect cascades', 'cascades'], ['React commits', 'commits']]) {
     md.push(`| ${label} | ${B(field)} | ${hasAfter ? A(field) : '—'} | ${hasAfter ? percentChange(B(field), A(field)) : '—'} |`);
   }
   md.push('');
   if (bench) md.push(benchMarkdown(bench.data), '');
   for (const item of scenarios) {
     md.push(`## Scenario: ${item.scenario}`, '');
-    md.push('| # | Step | Renders | Wasted | Behavior |', '|---:|---|---:|---:|---|');
+    md.push('| # | Step | React time | Renders | Wasted | Behavior |', '|---:|---|---:|---:|---:|---|');
     item.baseline.steps.forEach((step, index) => {
       const a = item.after ? item.after.steps[index] : null;
       const cmp = item.comparison ? item.comparison.steps[index] : null;
-      md.push(`| ${step.index} | ${step.name.replace(/\|/g, '\\|')} | ${a ? `${step.renders} → ${a.renders}` : step.renders} | ${a ? `${step.wasted} → ${a.wasted}` : step.wasted} | ${cmp ? (cmp.equivalent ? 'same' : '**changed**') : '—'} |`);
+      const reactTime = item.baseline.timed ? `${round(step.renderMs, 0)}${a ? ` → ${round(a.renderMs, 0)}` : ''} ms${step.slow ? ' (slow)' : ''}` : '—';
+      md.push(`| ${step.index} | ${step.name.replace(/\|/g, '\\|')} | ${reactTime} | ${a ? `${step.renders} → ${a.renders}` : step.renders} | ${a ? `${step.wasted} → ${a.wasted}` : step.wasted} | ${cmp ? (cmp.equivalent ? 'same' : '**changed**') : '—'} |`);
     });
     md.push('');
   }
   if (changes.length) {
     md.push('## Changes', '');
     for (const change of changes) {
-      md.push(`- **${change.status}**: ${change.title}${change.skill ? ` (\`${change.skill}\`${change.rule ? `: ${change.rule}` : ''})` : ''}${change.commit ? ` — ${change.commit.slice(0, 9)}` : ''}${change.reason ? `. ${change.reason}` : ''}`);
+      const proof = proofOf(audit, change);
+      md.push(`- **${change.status}**: ${change.title}${change.skill ? ` (\`${change.skill}\`${change.rule ? `: ${change.rule}` : ''})` : ''}${change.commit ? ` — ${change.commit.slice(0, 9)}` : ''}${change.reason ? `. ${change.reason}` : ''}${proof ? `. Timing proof: ${proof.text} ${proof.lines.join('; ')}` : ''}`);
     }
     md.push('');
   }

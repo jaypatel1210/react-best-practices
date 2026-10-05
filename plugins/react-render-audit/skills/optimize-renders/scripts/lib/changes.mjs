@@ -49,6 +49,7 @@ export function addChange(audit, flags) {
     rule: text('rule'),
     safety: safety || undefined,
     measure: text('measure'),
+    proof: text('proof'),
     commit: text('commit'),
     reason: text('reason'),
     gates: parseGates(flags.gates),
@@ -63,7 +64,7 @@ export function formatChanges(audit) {
   const changes = readChanges(audit);
   if (!changes.length) return 'No changes recorded yet.';
   return table([
-    ['#', 'status', 'title', 'skill', 'measure', 'commit'],
-    ...changes.map((change) => [change.id, change.status, change.title, change.skill || '—', change.measure || '—', change.commit ? change.commit.slice(0, 9) : '—']),
+    ['#', 'status', 'title', 'skill', 'measure', 'proof', 'commit'],
+    ...changes.map((change) => [change.id, change.status, change.title, change.skill || '—', change.measure || '—', change.proof || '—', change.commit ? change.commit.slice(0, 9) : '—']),
   ]);
 }

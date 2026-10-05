@@ -42,6 +42,19 @@ Lines that already differed between baseline runs are ignored automatically. If 
 
 `detect` looks for a root script like `dev:<app>` that also builds workspace packages. Set `--root` to the app folder; components from workspace packages resolve to their source files and count as project code. Add those package directories to the scope if they're the target.
 
+## Triage and per-fix proofs
+
+- **Triage says nothing is slow, but users complain.** The triage measures only the scenario's steps, with front-end work alone: API responses are replayed instantly. Check that:
+  - the flow includes the interaction users complain about;
+  - the test data is as large as theirs (20 rows don't show what 2,000 do);
+  - the mobile profile was timed.
+  Slow backends show up in real-user data (`field`), not here.
+- **A step is slow on mobile only.** Expected: the mobile profile runs a mid-tier phone's CPU. Savings are estimated on the profile where the step was slowest, and the proof runs on the profiles where it was slow.
+- **Slow, but "not re-rendering".** The time goes elsewhere. The triage splits each slow step's main-thread time into first render, other script, and style and layout, and lists the scripts in its longest frames. Fewer renders won't fix that; the triage names the skill that might.
+- **The proof shows no gain, though renders went down.** Those renders were cheap. Revert the fix: it's the result the proof exists to catch.
+- **"dependency files changed" after `baseline --sync`.** The copy's installed dependencies are older than the working tree's. Run `baseline --ref HEAD` (it reinstalls only if dependencies changed), then sync again; before the final benchmark, move it back with `baseline --ref <starting commit>`.
+- **"the backup fix-N lists no files in this repository".** The backup label is wrong, or its files live outside the repository the copy was made from. Without them both sides run the same code.
+
 ## Timing benchmark
 
 - **Sandboxed shells.** `bench` and `baseline` need an unsandboxed shell: Chrome, local ports, and `git worktree add` in the user's repository. Pass `--dir` to `baseline` (or keep the default temp folder), and run both commands from the same kind of shell, because `TMPDIR` can differ between them.
@@ -49,6 +62,7 @@ Lines that already differed between baseline runs are ignored automatically. If 
 - **"The server stopped before answering" or "didn't answer".** Read `bench/<label>/server-a.log` (or `-b`). The usual causes:
   - The dev command ignored `{port}`. Check how its script passes the port (`next dev -p`, `vite --port`, `-- --port`).
   - The baseline copy lacks something the working tree has. Only untracked `.env*` files in the repository root and the app folder are linked. Generated files need `baseline --setup "<command>"`, such as code generation.
+- **Next.js: `ENOENT` under `.next/` at startup** (`scandir .next/server/pages`, `.next/static/chunks/app` or `.next/types/...`). Some Next.js setups can't start from a `.next` folder left by a dev server that was stopped. Start each side with a clean one: `--a-cmd "rm -rf .next && <dev command>"` is safe for the baseline, which is a disposable copy. For the user's own checkout, tell them and let them clear it.
 - **The baseline install failed.** Read `baseline-install.log` in the audit folder. Pass `--install "<command>"` for an unusual setup, or `--install none` if the copy already has dependencies.
 - **The baseline can't reach the API (CORS).** Some APIs only allow the usual dev origin, like `http://localhost:3000`. Add `--disable-cors` to `bench`: Chrome then skips CORS checks for both sides alike.
 - **A step fails only on mobile.** The phone layout hides or moves the target. Check with `inspect --profile mobile`, then write a mobile variant of the scenario, or run `--profiles desktop`.

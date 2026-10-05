@@ -1,17 +1,19 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLSThresholds, FCPThresholds, INPThresholds, LCPThresholds, TTFBThresholds } from 'web-vitals';
 import { afterEach, describe, expect, it } from 'vitest';
-import { prepareBaseline, removeBaseline } from '../skills/optimize-renders/scripts/lib/baseline.mjs';
-import { aaSummary, analyzePairs, benchExitCode, benchMarkdown, comparisonRows, flowOf, formatBench, responseMs, responseTime } from '../skills/optimize-renders/scripts/lib/bench.mjs';
+import { backup } from '../skills/optimize-renders/scripts/lib/backup.mjs';
+import { prepareBaseline, removeBaseline, resetBaseline, syncBaseline } from '../skills/optimize-renders/scripts/lib/baseline.mjs';
+import { aaSummary, analyzePairs, analyzeSingle, benchExitCode, benchMarkdown, comparisonRows, flowOf, formatBench, responseMs, responseTime, targetDecision } from '../skills/optimize-renders/scripts/lib/bench.mjs';
 import { ciWorkflow } from '../skills/optimize-renders/scripts/lib/ci.mjs';
 import { aroundDeploy, compareRecords, cruxRequest, parseCruxHistory, parseCruxRecord, parseRecords, splitRecords } from '../skills/optimize-renders/scripts/lib/field.mjs';
 import { MOBILE_TARGET_INDEX, chromeMajor, profile, rateFor } from '../skills/optimize-renders/scripts/lib/profiles.mjs';
 import { NetworkReplay, replayHeaders, requestKey } from '../skills/optimize-renders/scripts/lib/replay.mjs';
 import { writeReport } from '../skills/optimize-renders/scripts/lib/report.mjs';
 import { THRESHOLDS, cautious, impactOf, pairedDiff, plannedPairs, quantile, quantileCI, quantileDiff, rating, verdict } from '../skills/optimize-renders/scripts/lib/stats.mjs';
+import { formatTriage, triageOf } from '../skills/optimize-renders/scripts/lib/triage.mjs';
 
 const temp = [];
 afterEach(() => {
@@ -36,15 +38,46 @@ function run(steps) {
       interaction: step.inp ? { inputDelay: 1, processing: step.inp - 3, presentation: 2, target: 'button[Add]' } : null,
       tbt: step.tbt ?? 0,
       longFrames: step.longFrames ?? 0,
+      longestFrame: step.longestFrame ?? 0,
+      frameScripts: step.frameScripts ?? [],
       dropped: step.dropped ?? 0,
       smoothness: 100,
       reactMs: step.reactMs ?? 0,
+      reactInitialMs: step.reactInitialMs ?? 0,
       commits: 1,
       mainThread: step.mainThread ?? 10,
-      script: 0,
-      layout: 0,
-      style: 0,
+      script: step.script ?? 0,
+      layout: step.layout ?? 0,
+      style: step.style ?? 0,
     })),
+  };
+}
+
+// A benchmark result comparing 8 pairs, as the per-fix proof runs them.
+function compared(stepsA, stepsB) {
+  const runsA = Array.from({ length: 8 }, (_, i) => run(stepsA(i)));
+  const runsB = Array.from({ length: 8 }, (_, i) => run(stepsB(i)));
+  return {
+    mode: 'compare',
+    protocol: 1,
+    settings: { kind: 'proof' },
+    sides: { a: { label: 'without fix-1', url: 'http://localhost:4100' }, b: { label: 'working tree', url: 'http://localhost:4000' } },
+    results: [{ profile: 'mobile', scenario: 'store', viewport: { width: 412, height: 823, deviceScaleFactor: 1.75 }, cpuRate: 4, pairs: 8, aa: null, traces: {}, runs: { a: runsA, b: runsB }, analysis: analyzePairs(runsA, runsB) }],
+  };
+}
+
+// A profile run of the current code: 6 runs, as triage takes them.
+function profiled(stepsOf, { development = true } = {}) {
+  const runs = Array.from({ length: 6 }, (_, i) => run(stepsOf(i)));
+  return {
+    mode: 'profile',
+    protocol: 1,
+    label: 'triage',
+    settings: { kind: 'triage' },
+    sides: { a: { label: 'current code', url: 'http://localhost:3000/', sha: 'c'.repeat(40) }, b: null },
+    environment: { chrome: 'HeadlessChrome/141', cpu: 'Test CPU', cores: 8, os: 'Test OS' },
+    calibration: { hostIndex: 1750, rate: 4, throttledIndex: 440, target: 438 },
+    results: [{ profile: 'mobile', scenario: 'store', viewport: { width: 412, height: 823, deviceScaleFactor: 1.75 }, cpuRate: 4, pairs: 6, react: { version: '19.2.0', development }, traces: {}, runs: { a: runs, b: [] }, analysis: analyzeSingle(runs) }],
   };
 }
 
@@ -82,6 +115,13 @@ describe('statistics', () => {
     expect(verdict(same)).toBe('same');
     expect(cautious(same)).toBe(0);
     expect(verdict(pairedDiff(a, a.map((value) => value + 30)))).toBe('worse');
+  });
+
+  it('claims nothing when there are too few pairs for a 95% interval', () => {
+    const two = pairedDiff([100, 104], [160, 170]);
+    expect(two.exact).toBe(false);
+    expect(verdict(two)).toBe('same');
+    expect(impactOf({ mainThread: two })).toEqual({ level: 'none', direction: 'same', reasons: [], judged: false });
   });
 
   it('plans more pairs for noisier machines, within limits', () => {
@@ -157,6 +197,115 @@ describe('benchmark analysis', () => {
     expect(aa.ok).toBe(true);
     expect(aaSummary(pairs.slice(0, 3))).toMatchObject({ judged: false, ok: true });
   });
+
+  it('fails the A/A check only on a difference big enough to matter', () => {
+    // A small but systematic blocking-time difference (1-37 ms on ~700 ms) is harmless...
+    const small = Array.from({ length: 6 }, (_, i) => {
+      const extra = [1, 18, 37, 8, 10, 2][i];
+      const x = run([{ mainThread: 1800 + i, tbt: 690 }]);
+      const y = run([{ mainThread: 1800 + i, tbt: 690 + extra }]);
+      return i % 2 === 0 ? [x, y] : [y, x];
+    });
+    expect(aaSummary(small)).toMatchObject({ judged: true, ok: true, material: [] });
+    // ...while identical runs differing by 60 ms or more of main-thread time are not.
+    const large = Array.from({ length: 6 }, (_, i) => {
+      const x = run([{ mainThread: 1800 + i }]);
+      const y = run([{ mainThread: 1860 + i * 5 }]);
+      return i % 2 === 0 ? [x, y] : [y, x];
+    });
+    expect(aaSummary(large)).toMatchObject({ judged: true, ok: false, material: ['mainThread'] });
+  });
+});
+
+describe('per-fix decision', () => {
+  const steps = (load, typing, other) => [{ mainThread: load }, { inp: typing, mainThread: typing - 20 }, { inp: 40, mainThread: other }];
+
+  it('keeps a fix only when a targeted step got faster by at least a frame', () => {
+    const faster = compared((i) => steps(300 + i, 320 + i, 30), (i) => steps(300 - i, 150 + i, 30));
+    expect(targetDecision(faster, ['1'])).toMatchObject({ decision: 'faster', exitCode: 0 });
+    expect(targetDecision(faster, ['step 1']).decision).toBe('faster');
+    expect(targetDecision(faster, ['1']).lines[0]).toMatch(/^mobile · 1\. step 1: faster, high: moved from needs improvement to good/);
+    // The step that got faster isn't the one the fix was for.
+    expect(targetDecision(faster, ['2'])).toMatchObject({ decision: 'no-gain', exitCode: 5 });
+    expect(targetDecision(faster, ['2']).lines).toEqual(['mobile · 2. step 2: no measurable change (40 ms → 40 ms)']);
+  });
+
+  it('treats a gain smaller than a frame as no gain, and any slowdown as a reason to revert', () => {
+    const tiny = compared((i) => steps(300, 320 + i, 30), (i) => steps(300, 312 + i, 30));
+    expect(targetDecision(tiny, ['1'])).toMatchObject({ decision: 'no-gain', exitCode: 5 });
+    expect(targetDecision(tiny, ['1']).lines[0]).toContain("less than a frame, which users won't notice");
+    const tradeoff = compared((i) => steps(300, 320 + i, 30 + i), (i) => steps(300, 150 + i, 90 + i));
+    const decision = targetDecision(tradeoff, ['1']);
+    expect(decision).toMatchObject({ decision: 'slower', exitCode: 4 });
+    expect(decision.lines[1]).toMatch(/^mobile · 2\. step 2 \(not a target\): slower, medium: at least 60 ms more main-thread work/);
+    expect(formatBench({ ...tradeoff, target: decision })).toContain('SLOWER: revert this fix.');
+  });
+});
+
+describe('triage', () => {
+  const loadStep = { mainThread: 2900, tbt: 1200, reactMs: 420, reactInitialMs: 385, script: 2000, longFrames: 3, longestFrame: 310 };
+
+  it('finds the slow steps and whether re-rendering is a big part of them', () => {
+    const triage = triageOf(
+      profiled((i) => [
+        loadStep,
+        { inp: 320 + i, mainThread: 380, tbt: 180, reactMs: 250, script: 330, longFrames: 2, longestFrame: 260, frameScripts: [{ source: 'http://localhost:3000/src/Search.jsx?t=1', fn: 'onInput', invoker: 'INPUT#search.oninput', ms: 120 }] },
+        { inp: 40, mainThread: 30, reactMs: 8, script: 20 },
+      ]),
+    );
+    expect(triage.decision).toBe('renders');
+    const [load, typing, add] = triage.profiles[0].steps;
+    expect(load).toMatchObject({ slow: true, renderBound: false, reactInitial: 385, reactUpdates: 35 });
+    expect(load.reasons).toEqual(['blocks the page for 1,200 ms while loading']);
+    expect(load.split[0]).toEqual({ label: 'other script', ms: 1580 });
+    expect(typing).toMatchObject({ slow: true, renderBound: true, reactUpdates: 250 });
+    expect(typing.reasons).toEqual([expect.stringMatching(/^responds in 32\d ms \(needs improvement\)$/), 'freezes the page for 260 ms in one frame']);
+    expect(typing.scripts[0]).toEqual({ fn: 'onInput', file: 'Search.jsx', invoker: 'INPUT#search.oninput', runs: 6, ms: 120 });
+    expect(add.slow).toBe(false);
+    expect(triage.scenarios.store.steps[1]).toMatchObject({ slow: true, renderBound: true, profiles: ['mobile'], worst: { profile: 'mobile', reactMs: 250 } });
+    expect(triage.summary).toMatch(/^2 steps are slow, and re-rendering is a big part of 1 of them: “step 1”/);
+    expect(triage.summary).toContain("Re-render fixes won't help much with “step 0”");
+    expect(triage.summary).toContain('development build');
+    const text = formatTriage(triage);
+    expect(text).toContain('SLOW, re-rendering');
+    expect(text).toContain('long-frame scripts: onInput in Search.jsx [INPUT#search.oninput] 120 ms');
+  });
+
+  it('judges each interaction and frame on its own, not the total of a step', () => {
+    const triage = triageOf(
+      profiled((i) => [
+        { mainThread: 400, tbt: 120 },
+        // Two keystrokes that each respond in a good 176 ms: blocking adds up to 216 ms, but no
+        // single interaction or frame is over the limit.
+        { action: 'type', inp: 176 + i, tbt: 216, longFrames: 2, longestFrame: 172, mainThread: 359, reactMs: 296 },
+        // A scroll that freezes the page for 240 ms in one frame.
+        { action: 'scroll', interactive: false, tbt: 190, longFrames: 1, longestFrame: 240, mainThread: 300, reactMs: 200 },
+      ]),
+    );
+    const [, typing, scroll] = triage.profiles[0].steps;
+    expect(typing.slow).toBe(false);
+    expect(scroll).toMatchObject({ slow: true, renderBound: true, reasons: ['freezes the page for 240 ms in one frame'] });
+    expect(triage.decision).toBe('renders');
+  });
+
+  it('says when nothing is slow, and when steps are slow for other reasons', () => {
+    const fast = triageOf(profiled((i) => [{ mainThread: 400, tbt: 120, reactMs: 90, reactInitialMs: 80 }, { inp: 96 + i, mainThread: 60, reactMs: 20 }]));
+    expect(fast.decision).toBe('nothing-slow');
+    expect(fast.summary).toMatch(/^Nothing in this flow is slow enough to notice: the slowest response is 9\d ms \(good\) on mobile/);
+    const other = triageOf(profiled(() => [{ ...loadStep, reactMs: 500, reactInitialMs: 480, script: 2600 }, { inp: 60, mainThread: 50, reactMs: 10 }]));
+    expect(other.decision).toBe('not-renders');
+    expect(other.summary).toContain('react-responsiveness');
+    expect(other.summary).toContain('Measured on a development build');
+    const flow = () => [{ mainThread: 300 }, { inp: 40, mainThread: 20 }];
+    expect(() => triageOf(compared(flow, flow))).toThrow(/profile run/);
+    // A production build has no React render time: the step is slow, the cause unknown.
+    const production = profiled((i) => [{ mainThread: 300 }, { inp: 260 + i, longestFrame: 250, mainThread: 280, script: 250 }], { development: false });
+    const unknown = triageOf(production);
+    expect(unknown.decision).toBe('unknown');
+    expect(unknown.profiles[0].steps[1]).toMatchObject({ slow: true, renderBound: null, split: [{ label: 'script', ms: 250 }] });
+    expect(unknown.summary).toContain("This build doesn't expose React's render time");
+    expect(formatTriage(unknown)).toContain('SLOW, CAUSE UNKNOWN');
+  });
 });
 
 describe('device profiles', () => {
@@ -227,7 +376,7 @@ describe('network replay', () => {
     replay.freeze();
 
     const player = page();
-    const counters = await replay.attach(player, { appOrigin: 'http://localhost:3000' });
+    const counters = await replay.attach(player, { appOrigin: 'http://localhost:3000', appOrigins: ['http://localhost:3101', 'http://localhost:3000'] });
     expect(player.sent[0][1].patterns.map((pattern) => pattern.urlPattern)).toEqual(['https://api.test/*', 'https://api.test/*']);
     player.fire({ requestId: 'a', request: { ...api, url: 'https://api.test/items?page=1&_=999' } });
     player.fire({ requestId: 'b', request: api });
@@ -237,6 +386,43 @@ describe('network replay', () => {
     const fulfilled = player.sent.filter(([method]) => method === 'Fetch.fulfillRequest').map(([, params]) => Buffer.from(params.body, 'base64').toString());
     expect(fulfilled).toEqual(['{"n":1}', '{"n":2}', '{"n":2}']);
     expect(counters).toMatchObject({ mode: 'replay', served: 3, passed: 1, misses: ['GET https://api.test/other'] });
+  });
+
+  it('lets analytics beacons through without recording them', async () => {
+    const sent = [];
+    let handler;
+    const page = {
+      on: (method, fn) => ((handler = fn), () => {}),
+      send: async (method, params) => (sent.push([method, params]), {}),
+    };
+    const replay = new NetworkReplay();
+    const counters = await replay.attach(page, { appOrigin: 'http://localhost:4000' });
+    handler({ requestId: 'g', request: { method: 'POST', url: 'https://www.google-analytics.com/g/collect?cid=1&_p=2', headers: {} }, responseStatusCode: 204, responseHeaders: [] });
+    handler({ requestId: 'c', request: { method: 'POST', url: 'https://b.clarity.ms/collect', headers: {} }, responseStatusCode: 204, responseHeaders: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(counters.recorded).toBe(0);
+    expect(replay.summary().requests).toBe(0);
+    expect(sent.filter(([method]) => method === 'Fetch.continueRequest')).toHaveLength(2);
+  });
+
+  it('never records requests to either side\'s own server', async () => {
+    const sent = [];
+    let handler;
+    const recorder = {
+      on: (method, fn) => ((handler = fn), () => {}),
+      send: async (method, params) => {
+        sent.push([method, params]);
+        return method === 'Fetch.getResponseBody' ? { body: '{}', base64Encoded: false } : {};
+      },
+    };
+    const replay = new NetworkReplay();
+    // The baseline (port 4100) calls the candidate's server (port 4000) because of a shared env file.
+    const counters = await replay.attach(recorder, { appOrigin: 'http://localhost:4100', appOrigins: ['http://localhost:4100', 'http://localhost:4000'] });
+    handler({ requestId: '1', request: { method: 'GET', url: 'http://localhost:4000/api/session', headers: {} }, responseStatusCode: 200, responseHeaders: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(counters.recorded).toBe(0);
+    expect(sent.filter(([method]) => method === 'Fetch.getResponseBody')).toHaveLength(0);
+    expect(sent.at(-1)).toEqual(['Fetch.continueRequest', { requestId: '1' }]);
   });
 });
 
@@ -363,16 +549,141 @@ describe('baseline checkout', () => {
     expect(lstatSync(join(target, 'app', '.env.local')).isSymbolicLink()).toBe(true);
     expect(lstatSync(join(target, 'app', '.env.example')).isSymbolicLink()).toBe(false);
     const again = await prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), ref: 'HEAD~1', dir: target, install: 'none' });
-    expect(again.reused).toBe(true);
-    await expect(prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), ref: 'HEAD', dir: target, install: 'none' })).rejects.toThrow(/isn't a checkout/);
+    expect(again).toMatchObject({ reused: true, moved: null });
+    // An existing copy moves to another commit instead of being checked out again.
+    const moved = await prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), ref: 'HEAD', dir: target, install: 'none' });
+    expect(moved).toMatchObject({ reused: true, moved: info.sha });
+    expect(readFileSync(join(target, 'app', 'version.txt'), 'utf8')).toBe('second');
+    const other = tempDir();
+    writeFileSync(join(other, 'file.txt'), 'not a checkout');
+    await expect(prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), ref: 'HEAD', dir: other, install: 'none' })).rejects.toThrow(/isn't a checkout of this repository/);
     await expect(prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), dir: join(dir, 'inside'), install: 'none' })).rejects.toThrow(/outside the repository/);
     removeBaseline({ repoRoot: dir, dir: target });
     expect(existsSync(target)).toBe(false);
     expect(readFileSync(join(dir, 'app', '.env.local'), 'utf8')).toBe('SECRET=value');
   });
+
+  it('keeps the app folder inside the copy when the path to the repository has a symlink', async () => {
+    // Like /tmp on macOS: git reports the real path, the app path comes through the link.
+    const dir = repo();
+    const link = join(tempDir(), 'link');
+    symlinkSync(dir, link);
+    const target = join(tempDir(), 'copy');
+    const info = await prepareBaseline({ repoRoot: join(link, 'app'), appRoot: join(link, 'app'), ref: 'HEAD', dir: target, install: 'none' });
+    expect(info.appDir).toBe(join(target, 'app'));
+    expect(info.envLinks).toEqual(['app/.env.local']);
+    expect(lstatSync(join(target, 'app', '.env.local')).isSymbolicLink()).toBe(true);
+    removeBaseline({ repoRoot: dir, dir: target });
+  });
+
+  it('syncs the copy to the working tree without one fix, and resets it', async () => {
+    const dir = repo();
+    const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+    const app = (name) => join(dir, 'app', name);
+    writeFileSync(app('a.js'), 'a1');
+    writeFileSync(app('b.js'), 'b1');
+    writeFileSync(app('old.js'), 'old');
+    git('add', '.');
+    git('commit', '-qm', 'files');
+    const target = join(tempDir(), 'copy');
+    const info = await prepareBaseline({ repoRoot: dir, appRoot: join(dir, 'app'), ref: 'HEAD', dir: target, install: 'none' });
+    // Fix 1 was kept and committed; fix 2 is being proved: backed up, then b.js edited and new.js created.
+    writeFileSync(app('a.js'), 'a2');
+    git('commit', '-qam', 'fix 1');
+    const audit = tempDir();
+    backup(audit, 'fix-2', dir, [app('b.js'), app('new.js')]);
+    writeFileSync(app('b.js'), 'b2');
+    writeFileSync(app('new.js'), 'new');
+    // The user's own change, and the audit folder, which is never copied.
+    rmSync(app('old.js'));
+    mkdirSync(join(dir, 'app', '.render-audit', 'audits', 'x'), { recursive: true });
+    writeFileSync(join(dir, 'app', '.render-audit', 'audits', 'x', 'bench.json'), '{}');
+    const copy = (name) => (existsSync(join(target, 'app', name)) ? readFileSync(join(target, 'app', name), 'utf8') : null);
+
+    const without = syncBaseline(info, { audit, without: 'fix-2' });
+    expect(['a.js', 'b.js', 'new.js', 'old.js'].map(copy)).toEqual(['a2', 'b1', null, null]);
+    expect(without.restored).toEqual(['app/b.js', 'app/new.js']);
+    expect(existsSync(join(target, 'app', '.render-audit'))).toBe(false);
+    const all = syncBaseline({ ...info, synced: without.synced }, { audit });
+    expect(['a.js', 'b.js', 'new.js', 'old.js'].map(copy)).toEqual(['a2', 'b2', 'new', null]);
+    resetBaseline({ ...info, synced: all.synced });
+    expect(['a.js', 'b.js', 'new.js', 'old.js'].map(copy)).toEqual(['a1', 'b1', null, 'old']);
+    expect(lstatSync(join(target, 'app', '.env.local')).isSymbolicLink()).toBe(true);
+    removeBaseline({ repoRoot: dir, dir: target });
+  });
 });
 
 describe('report', () => {
+  // A render measurement (as measure writes it) of the flow the triage timed: step 1 wastes renders.
+  function measured(dir, label, { wastedMs, renders }) {
+    const types = [
+      { id: 0, name: 'Store', file: '/app/src/Store.jsx', line: 3, memo: false },
+      { id: 1, name: 'Card', file: '/app/src/Card.jsx', line: 1, memo: true },
+      { id: 2, name: 'Ticker', file: '/app/src/Ticker.jsx', line: 1, memo: false },
+    ];
+    const stats = (extra) => ({ commits: 1, renders: 0, wasted: 0, mounts: 0, cascadeCommits: 0, renderMs: 0, longFrames: {}, interactions: {}, sources: [], components: [], ...extra });
+    const step = (index, name, action, extra) => ({ index, name, action, doc: 0, settled: true, network: [], console: [], stats: stats(extra) });
+    const out = join(dir, 'runs', label, 'store');
+    mkdirSync(out, { recursive: true });
+    const data = {
+      documents: [{ types }],
+      steps: [
+        step(0, 'step 0', 'goto', { renders: 13, mounts: 13, renderMs: 30, components: [{ id: 0, renders: 1, mounts: 1, selfMs: 2, mountMs: 2 }, { id: 1, renders: 12, mounts: 12, selfMs: 24, mountMs: 24 }] }),
+        step(1, 'step 1', 'type', {
+          commits: 2,
+          renders: renders + 4,
+          wasted: renders,
+          renderMs: wastedMs + 6,
+          wastedMs,
+          components: [
+            { id: 0, renders: 2, reasons: { state: 2 }, hooks: { 'useState #1': { count: 2, sample: '"" → "r"' } }, selfMs: 4, updateMs: 4, updateTreeMs: wastedMs + 4 },
+            { id: 1, renders, wasted: renders, reasons: { propsUnstable: renders }, props: { onAdd: { changed: 0, fn: renders, sameContent: 0, element: 0 } }, owners: { 0: renders }, causedBy: { 0: renders }, selfMs: wastedMs, updateMs: wastedMs, updateTreeMs: wastedMs, wastedMs, wastedTreeMs: wastedMs },
+            { id: 2, renders: 2, reasons: { props: 1, state: 1 }, hooks: { 'useState #1': { count: 1, sample: '"0" → "1"' } }, cascades: 1, selfMs: 0.2, updateMs: 0.2, updateTreeMs: 0.2 },
+          ],
+          sources: renders ? [{ id: 0, triggers: 2, renders: renders + 2, wasted: renders, mounts: 0, ms: wastedMs + 4, wastedMs }] : [],
+        }),
+        step(2, 'step 2', 'click', { renders: 1, renderMs: 1, components: [{ id: 2, renders: 1, reasons: { props: 1 }, selfMs: 0.1, updateMs: 0.1, updateTreeMs: 0.1 }] }),
+      ],
+    };
+    const snap = { steps: [0, 1, 2].map((index) => ({ index, text: `text ${index}`, dom: `<p>${index}</p>`, a11y: `paragraph ${index}` })) };
+    for (const r of [1, 2]) {
+      writeFileSync(join(out, `run-${r}.json`), JSON.stringify({ ...data, react: { version: '19.2.0', development: true } }));
+      writeFileSync(join(out, `run-${r}.snap.json`), JSON.stringify(snap));
+    }
+    writeFileSync(join(out, 'meta.json'), JSON.stringify({ runs: 2, warmup: 1, cpu: 4, chrome: 'HeadlessChrome/141' }));
+  }
+
+  it('leads with what was slow, and shows each kept fix with its timing proof', () => {
+    const audit = tempDir();
+    const typing = (i) => [{ mainThread: 900, tbt: 150, reactMs: 60, reactInitialMs: 50 }, { inp: 320 + i, mainThread: 300, reactMs: 240 }, { inp: 40, mainThread: 30, reactMs: 2 }];
+    const triageRun = profiled(typing);
+    mkdirSync(join(audit, 'bench', 'triage'), { recursive: true });
+    writeFileSync(join(audit, 'bench', 'triage', 'bench.json'), JSON.stringify(triageRun));
+    writeFileSync(join(audit, 'triage.json'), JSON.stringify(triageOf(triageRun)));
+    measured(audit, 'baseline', { wastedMs: 96, renders: 24 });
+    measured(audit, 'after-1', { wastedMs: 0, renders: 0 });
+    const proof = compared((i) => [{ mainThread: 900 }, { inp: 320 + i, mainThread: 300 }, { inp: 40, mainThread: 30 }], (i) => [{ mainThread: 900 }, { inp: 120 + i, mainThread: 100 }, { inp: 40, mainThread: 30 }]);
+    proof.target = targetDecision(proof, ['1']);
+    mkdirSync(join(audit, 'bench', 'proof-1'), { recursive: true });
+    writeFileSync(join(audit, 'bench', 'proof-1', 'bench.json'), JSON.stringify(proof));
+    writeFileSync(join(audit, 'changes.json'), JSON.stringify([{ id: 1, title: 'Stable onAdd for Card', status: 'kept', hotspot: 'H1', measure: 'after-1', proof: 'proof-1', gates: { typecheck: 'pass' } }]));
+
+    const { html, markdown } = writeReport({ audit, appRoot: '/app', repoRoot: '/app', scope: ['/app/src'] }, { final: 'after-1' });
+    const page = readFileSync(html, 'utf8');
+    expect(page).toContain('<h2>Is anything slow?</h2>');
+    expect(page).toContain('1 step is slow, and re-rendering is a big part of it: “step 1”');
+    expect(page).toContain('Timing proof: <span class="good">KEEP');
+    expect(page).toContain('mobile · 1. step 1: faster, high: moved from needs improvement to good');
+    expect(page).toContain('Where re-render time goes (ms, development build)');
+    expect(page).toContain('React render time went from 133 ms to 37 ms');
+    // The ticker's effect costs a fraction of a millisecond: listed, but not as an opportunity.
+    expect(page).toContain('Not worth fixing for speed');
+    expect(page).not.toContain('Measured speed-up');
+    const md = readFileSync(markdown, 'utf8');
+    expect(md).toContain('## Is anything slow?');
+    expect(md).toContain('Timing proof: KEEP');
+  });
+
   it('writes a speed report from a benchmark alone', () => {
     const audit = tempDir();
     const runsA = [];

@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// render-audit: measure which React components re-render during a scripted user flow, rank the
-// causes, verify that a refactor kept behavior identical, prove the speed-up with a timing
-// benchmark, and report before/after.
+// render-audit: time a scripted user flow first to find the steps users would find slow, measure
+// which React components re-render there and what that costs, rank the causes by the time they
+// would save, verify that a refactor kept behavior identical, prove each fix and the result with a
+// timing benchmark, and report before/after.
 // No dependencies: Node 18+ and a local Chrome or Chromium.
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { list, parseViewport, readJson, writeJson } from './lib/util.mjs';
 
-const HELP = `render-audit — find and verify React re-render fixes
+const HELP = `render-audit — find, fix and prove React re-render fixes that make a slow app faster
 
 Usage: node render-audit.mjs <command> [options]
 
@@ -22,15 +23,24 @@ Setup
   wait     --url URL [--timeout S]
                                  Wait until the dev server answers
 
+Time first
+  triage   --audit DIR --scenario FILE [--scenario FILE ...] [--url URL] [--cmd CMD] [--cwd DIR]
+           [--profiles mobile,desktop] [--runs N] [--cpu-mobile N] [--trace] [--json]
+                                 Time the current code (no render tracker) and decide which steps are
+                                 slow and whether re-rendering is a big part of them (writes
+                                 DIR/triage.json; uses the running app at URL, or starts CMD)
+
 Measure
   inspect  --url URL [--root DIR] [--profile mobile|desktop]
                                  React status, renders on load, interactive elements for scenarios
   measure  --audit DIR --scenario FILE --label NAME [--runs N] [--warmup N] [--cpu N] [--headed]
-                                 Replay the scenario and record every render (writes DIR/runs/NAME/)
+                                 Replay the scenario and record every render and its render time
+                                 (writes DIR/runs/NAME/)
   analyze  --audit DIR [--label NAME] [--top N] [--json]
-                                 Rank render hotspots inside the scope and map them to fixes
+                                 Rank render hotspots by the time they cost in the slow steps and map
+                                 them to fixes; marks the ones not worth fixing
   compare  --audit DIR --after NAME [--base baseline] [--prev NAME] [--allow-dom] [--json]
-                                 Check behavior is unchanged and renders went down
+                                 Check behavior is unchanged; shows how render work changed
 
 Fix loop
   backup   --audit DIR --label fix-N FILE...
@@ -41,15 +51,25 @@ Fix loop
 Timing benchmark (speed, not counts)
   baseline --audit DIR --root DIR [--ref REF] [--dir PATH] [--install CMD|none] [--setup CMD] [--no-env]
                                  Check out REF (default HEAD) outside the repository and install it,
-                                 to run as the "before" side (writes DIR/baseline.json)
+                                 to run as the "before" side (writes DIR/baseline.json); an existing
+                                 copy moves to REF and keeps its dependencies unless they changed
+  baseline --sync --audit DIR [--without fix-N]
+                                 Make the copy match your working tree, minus the files fix-N's
+                                 backup saved: "before this fix" for the per-fix proof
+  baseline --reset --audit DIR   Put the copy back at its commit
   baseline --remove --audit DIR  Remove that checkout (or --dir PATH)
   bench    --audit DIR --scenario FILE [--scenario FILE ...] --a URL [--a-cmd CMD] [--a-cwd DIR]
            [--a-label NAME] [--b URL [--b-cmd CMD] [--b-cwd DIR] [--b-label NAME]]
            [--profiles mobile,desktop] [--pairs auto|N] [--max-pairs N] [--aa N] [--cpu-mobile N]
-           [--no-replay] [--no-trace] [--disable-cors] [--label NAME] [--markdown FILE]
-           [--fail-on slower|no-gain] [--json]
+           [--quick] [--target STEP,...] [--no-replay] [--no-trace] [--disable-cors] [--label NAME]
+           [--markdown FILE] [--fail-on slower|no-gain] [--json]
                                  Time B against A (or profile A alone) in alternating runs under
-                                 device profiles; a command may contain {port} (writes DIR/bench/NAME/)
+                                 device profiles; a command may contain {port} (writes DIR/bench/NAME/).
+                                 --quick is the per-fix proof: 8 pairs, no A/A check, no traces, on
+                                 the profiles where the triage found the targets slow. --target
+                                 (step numbers or names; default with --quick: the triage's slow
+                                 steps) decides: exit 0 when a target got faster by at least a frame
+                                 and nothing got slower, 5 when it didn't, 4 when something got slower
 
 Real users and CI
   field crux (--origin URL | --url URL) [--form-factor phone|desktop|tablet|all] [--history
@@ -65,14 +85,14 @@ Real users and CI
 
 Report
   changes  add --audit DIR --title T --status kept|reverted|proposed [--component C] [--file F]
-               [--skill S] [--rule R] [--safety auto|ask|suggest] [--measure NAME] [--commit SHA]
-               [--reason TEXT] [--diff-file FILE] [--gates typecheck=pass,lint=pass,tests=pass]
+               [--skill S] [--rule R] [--safety auto|ask|suggest] [--measure NAME] [--proof BENCH]
+               [--commit SHA] [--reason TEXT] [--diff-file FILE] [--gates typecheck=pass,lint=pass,tests=pass]
   changes  list --audit DIR
   report   --audit DIR [--final NAME] [--bench NAME]
                                  Write DIR/report.html and DIR/report.md
 
-Exit codes: 0 ok, 1 error, 3 behavior changed, 4 renders regressed (bench --fail-on slower: slower),
-5 no improvement.`;
+Exit codes: 0 ok, 1 error, 3 behavior changed (compare), 4 slower (bench --target, --fail-on slower),
+5 no gain (bench --target, --fail-on no-gain).`;
 
 function parseArgs(argv) {
   const positional = [];
@@ -242,6 +262,53 @@ async function main() {
       return 1;
     }
 
+    case 'triage': {
+      const { bench } = await import('./lib/bench.mjs');
+      const { formatTriage, triageOf } = await import('./lib/triage.mjs');
+      const { loadScenario } = await import('./lib/scenario.mjs');
+      const config = loadConfig(flags);
+      if (!config.audit) throw new Error('Missing --audit (the folder that keeps the audit)');
+      const files = list(flags.scenario);
+      if (!files.length) throw new Error('Missing --scenario (one or more scenario files)');
+      const scenarios = files.map((file) => loadScenario(resolve(file)));
+      const url = typeof flags.url === 'string' ? flags.url : config.url;
+      if (!url) throw new Error('Missing --url (the running app, or the address --cmd will serve it on)');
+      const cwd = typeof flags.cwd === 'string' ? resolve(flags.cwd) : (config.detected && config.detected.devCwd) || config.appRoot;
+      const info = gitInfo(cwd);
+      const label = typeof flags.label === 'string' ? flags.label : 'triage';
+      if (!/^[\w.-]+$/.test(label)) throw new Error('--label may only contain letters, digits, ".", "_" and "-"');
+      const result = await bench({
+        label,
+        outDir: join(config.audit, 'bench', label),
+        scenarios,
+        profiles: list(flags.profiles || 'mobile,desktop'),
+        a: { label: info.dirty ? 'working tree' : 'current code', url, command: typeof flags.cmd === 'string' ? flags.cmd : null, cwd, sha: info.sha },
+        b: null,
+        kind: 'triage',
+        pairs: number(flags.runs, 6),
+        warmup: number(flags.warmup, 1),
+        replay: !flags.noReplay,
+        trace: !!flags.trace,
+        cpuMobile: flags.cpuMobile ? number(flags.cpuMobile, null) : null,
+        quietMs: number(flags.quiet, config.quietMs ?? 500),
+        maxSettleMs: number(flags.maxSettle, config.maxSettleMs ?? 10000),
+        cookies: readCookies(flags.cookies || config.cookies),
+        headers: config.headers,
+        ignoreRequests: config.ignoreRequests,
+        headless: !flags.headed,
+        chromeArgs: flags.disableCors ? ['--disable-web-security'] : [],
+        serverTimeoutS: number(flags.serverTimeout, 240),
+      });
+      const triage = triageOf(result);
+      // The default label is the audit's triage, which ranks fixes and leads the report; others (a
+      // production check, say) are kept beside it.
+      const file = join(config.audit, label === 'triage' ? 'triage.json' : `triage-${label}.json`);
+      writeJson(file, triage);
+      out(flags.json ? JSON.stringify(triage, null, 2) : formatTriage(triage));
+      out(`\nSaved ${file} (raw runs in bench/${label}/)${label === 'triage' ? '' : '; the audit\'s triage.json is unchanged'}`);
+      return 0;
+    }
+
     case 'inspect': {
       const { inspect, formatInspect } = await import('./lib/inspect.mjs');
       const config = loadConfig(flags);
@@ -358,7 +425,7 @@ async function main() {
     }
 
     case 'baseline': {
-      const { prepareBaseline, removeBaseline } = await import('./lib/baseline.mjs');
+      const { prepareBaseline, removeBaseline, resetBaseline, syncBaseline } = await import('./lib/baseline.mjs');
       const audit = flags.audit ? resolve(flags.audit) : null;
       const saved = audit ? readJson(join(audit, 'baseline.json'), null) : null;
       if (flags.remove) {
@@ -368,22 +435,41 @@ async function main() {
         out(`Removed the baseline checkout ${dir}`);
         return 0;
       }
+      if (flags.sync || flags.reset) {
+        if (!saved) throw new Error('--sync and --reset need --audit of an audit with a baseline copy; create it with baseline --ref first');
+        if (!existsSync(saved.dir)) throw new Error(`The baseline copy ${saved.dir} is gone; create it again with baseline --ref`);
+        if (flags.reset) {
+          resetBaseline(saved);
+          writeJson(join(audit, 'baseline.json'), { ...saved, synced: [], without: null, syncedAt: null });
+          out(`Baseline copy back at ${saved.ref} (${saved.sha.slice(0, 10)}): ${saved.dir}`);
+          return 0;
+        }
+        const without = typeof flags.without === 'string' ? flags.without : null;
+        const done = syncBaseline(saved, { audit, without });
+        writeJson(join(audit, 'baseline.json'), { ...saved, synced: done.synced, without, syncedAt: new Date().toISOString() });
+        out(`Baseline copy now matches your working tree${without ? ` without ${without}` : ''}: ${done.copied} file(s) copied, ${done.removed} removed${without ? `, ${done.restored.length} as they were before ${without}: ${done.restored.join(', ') || 'none'}` : ''}.`);
+        if (without && !done.restored.length) out(`warning: the backup ${without} lists no files in this repository, so both sides are the same code`);
+        if (done.dependenciesChanged) out('warning: dependency files changed since the copy\'s commit; run baseline --ref HEAD to reinstall the copy\'s dependencies');
+        return 0;
+      }
       const config = loadConfig(flags);
+      const reuse = typeof flags.dir !== 'string' && saved && existsSync(saved.dir);
       const info = await prepareBaseline({
         repoRoot: config.appRoot,
         appRoot: config.appRoot,
         ref: typeof flags.ref === 'string' ? flags.ref : 'HEAD',
-        dir: typeof flags.dir === 'string' ? flags.dir : undefined,
+        dir: typeof flags.dir === 'string' ? flags.dir : reuse ? saved.dir : undefined,
         install: typeof flags.install === 'string' ? flags.install : undefined,
         setup: typeof flags.setup === 'string' ? flags.setup : undefined,
         linkEnv: !flags.noEnv,
         logFile: audit ? join(audit, 'baseline-install.log') : undefined,
+        synced: reuse ? saved.synced || [] : [],
       });
       if (audit) {
         mkdirSync(audit, { recursive: true });
         writeJson(join(audit, 'baseline.json'), info);
       }
-      out(`Baseline ${info.ref} (${info.sha.slice(0, 10)}) ${info.reused ? 'already checked out' : 'checked out'} at ${info.dir}`);
+      out(`Baseline ${info.ref} (${info.sha.slice(0, 10)}) ${info.moved ? `moved there from ${info.moved.slice(0, 10)}` : info.reused ? 'already checked out' : 'checked out'} at ${info.dir}`);
       out(`App folder in the copy: ${info.appDir}`);
       if (info.envLinks.length) out(`Linked env files (not read): ${info.envLinks.join(', ')}`);
       out(info.install ? `Dependencies: ${info.installed ? `installed with "${info.install}"` : 'already installed'} (log: ${info.log})` : 'Dependencies: not installed (--install none)');
@@ -391,13 +477,29 @@ async function main() {
     }
 
     case 'bench': {
-      const { bench, benchExitCode, benchMarkdown, formatBench } = await import('./lib/bench.mjs');
-      const { loadScenario } = await import('./lib/scenario.mjs');
+      const { bench, benchExitCode, benchMarkdown, formatBench, isTarget } = await import('./lib/bench.mjs');
+      const { loadScenario, stepLabel } = await import('./lib/scenario.mjs');
+      const { readTriage } = await import('./lib/triage.mjs');
       const config = loadConfig(flags);
       if (!config.audit) throw new Error('Missing --audit (the folder that keeps the benchmark)');
       const files = list(flags.scenario);
       if (!files.length) throw new Error('Missing --scenario (one or more scenario files)');
       const scenarios = files.map((file) => loadScenario(resolve(file)));
+      // The per-fix proof judges the steps the triage found slow, on the profiles where they were.
+      const quick = !!flags.quick;
+      const triage = readTriage(config.audit);
+      const slowIn = (scenario) => ((triage && triage.scenarios[scenario.name]) || { steps: [] }).steps.filter((step) => step && step.slow);
+      let target = list(flags.target);
+      if (!target.length && quick && triage) target = [...new Set(scenarios.flatMap((scenario) => slowIn(scenario).map((step) => step.name)))];
+      const stepsOf = (scenario) => [{ ...scenario.load, action: 'goto', url: scenario.url, name: scenario.load.name || 'load' }, ...scenario.steps].map((step, index) => ({ index, name: stepLabel(step, index) }));
+      for (const wanted of target) {
+        if (!scenarios.some((scenario) => stepsOf(scenario).some((step) => isTarget(step, [wanted])))) {
+          throw new Error(`--target ${wanted} matches no step. Steps: ${stepsOf(scenarios[0]).map((step) => `${step.index} ${step.name}`).join(', ')}`);
+        }
+      }
+      let profiles = list(flags.profiles);
+      if (!profiles.length && quick && triage) profiles = [...new Set(scenarios.flatMap((scenario) => slowIn(scenario).filter((step) => !target.length || isTarget(step, target)).flatMap((step) => step.profiles)))];
+      if (!profiles.length) profiles = quick ? ['mobile'] : ['mobile', 'desktop'];
       const label = typeof flags.label === 'string' ? flags.label : new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
       if (!/^[\w.-]+$/.test(label)) throw new Error('--label may only contain letters, digits, ".", "_" and "-"');
       const saved = readJson(join(config.audit, 'baseline.json'), null);
@@ -407,37 +509,56 @@ async function main() {
         if (!url || url === true) return null;
         const command = typeof flags[`${key}Cmd`] === 'string' ? flags[`${key}Cmd`] : null;
         let cwd = typeof flags[`${key}Cwd`] === 'string' ? resolve(flags[`${key}Cwd`]) : null;
-        if (!cwd && key === 'a' && saved) cwd = config.detected ? join(saved.dir, relative(saved.repo, devCwd)) : saved.appDir;
+        if (!cwd && key === 'a' && saved) {
+          // The same folder inside the copy. The repository path is real, so the dev folder's must be.
+          let real = devCwd;
+          try {
+            real = realpathSync(devCwd);
+          } catch {
+            // keep it as given
+          }
+          const inside = relative(saved.repo, real);
+          if (inside.startsWith('..')) throw new Error(`The dev folder ${devCwd} isn't inside ${saved.repo}; pass --a-cwd with the folder inside the baseline copy`);
+          cwd = config.detected ? join(saved.dir, inside) : saved.appDir;
+        }
         if (!cwd) cwd = devCwd;
         const info = key === 'a' && saved && !flags.aCwd ? { sha: saved.sha, dirty: false } : gitInfo(cwd);
+        // A runs the baseline copy unless --a-cwd points elsewhere; a synced copy isn't its commit.
+        const usesCopy = key === 'a' && !!saved && !flags.aCwd;
+        const synced = usesCopy && !!saved.syncedAt;
+        const savedLabel = usesCopy ? (synced ? (saved.without ? `without ${saved.without}` : 'working tree copy') : `baseline ${saved.ref}`) : 'A';
         return {
-          label: typeof flags[`${key}Label`] === 'string' ? flags[`${key}Label`] : key === 'a' ? (saved ? `baseline ${saved.ref}` : 'A') : info.dirty ? 'working tree' : 'candidate',
+          label: typeof flags[`${key}Label`] === 'string' ? flags[`${key}Label`] : key === 'a' ? savedLabel : info.dirty ? 'working tree' : 'candidate',
           url,
           command,
           cwd,
-          ref: key === 'a' && saved ? saved.ref : null,
-          sha: info.sha,
+          ref: usesCopy && !synced ? saved.ref : null,
+          sha: synced ? null : info.sha,
         };
       };
       const a = sideOf('a');
       if (!a) throw new Error('Missing --a (the URL of the baseline app; add --a-cmd to start it)');
       const b = sideOf('b');
+      if (target.length && !b) throw new Error('--target and --quick compare two sides: pass --b too');
       const outDir = join(config.audit, 'bench', label);
       const result = await bench({
         label,
         outDir,
         scenarios,
-        profiles: list(flags.profiles || 'mobile,desktop'),
+        profiles,
         a,
         b,
-        pairs: flags.pairs && flags.pairs !== true && flags.pairs !== 'auto' ? number(flags.pairs, 10) : 'auto',
+        kind: quick ? 'proof' : 'full',
+        target: target.length ? target : null,
+        pairs: flags.pairs && flags.pairs !== true && flags.pairs !== 'auto' ? number(flags.pairs, 10) : quick ? 8 : 'auto',
         minPairs: number(flags.minPairs, 8),
         maxPairs: number(flags.maxPairs, 20),
-        aaPairs: number(flags.aa, 6),
+        aaPairs: quick ? number(flags.aa, 0) : number(flags.aa, 6),
         warmup: number(flags.warmup, 1),
         replay: !flags.noReplay,
-        trace: !flags.noTrace,
-        cpuMobile: flags.cpuMobile ? number(flags.cpuMobile, null) : null,
+        trace: quick ? !!flags.trace : !flags.noTrace,
+        // A per-fix proof runs at the slowdown the triage calibrated, like the estimates it checks.
+        cpuMobile: flags.cpuMobile ? number(flags.cpuMobile, null) : quick && triage && triage.calibration ? triage.calibration.rate : null,
         quietMs: number(flags.quiet, config.quietMs ?? 500),
         maxSettleMs: number(flags.maxSettle, config.maxSettleMs ?? 10000),
         cookies: readCookies(flags.cookies || config.cookies),
@@ -452,6 +573,7 @@ async function main() {
         writeFileSync(flags.markdown, `${benchMarkdown(result)}\n`, { flag: 'a' });
       }
       out(`\nSaved to ${outDir} (bench.json${result.results.some((item) => item.traces.a) ? ', Chrome traces in traces/' : ''})`);
+      if (result.target && typeof flags.failOn !== 'string') return result.target.exitCode;
       return benchExitCode(result, typeof flags.failOn === 'string' ? flags.failOn : null);
     }
 

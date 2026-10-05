@@ -1,8 +1,8 @@
 {
   "name": "react-render-audit",
   "displayName": "React Render Audit",
-  "version": "0.2.0",
-  "description": "Measure and cut React re-renders in a real React or Next.js app without changing behavior, then prove the speed-up: /optimize-renders replays a user flow in headless Chrome, counts every component render and why, fixes the worst causes with the react-best-practices skills, proves each fix kept behavior identical, times old and new code side by side on mobile and desktop profiles with confidence intervals, and writes a before/after report.",
+  "version": "0.3.0",
+  "description": "Find where a real React or Next.js app is slow and fix the re-renders that cause it, without changing behavior: /optimize-renders times a user flow in headless Chrome on mobile and desktop profiles first, records every component render with its cause and cost where steps are slow, fixes the causes that cost the most time with the react-best-practices skills, keeps a fix only if behavior stayed identical and a timing benchmark shows the slow step got faster, and writes a before/after report. When nothing is slow, it says so and changes nothing.",
   "author": {
     "name": "Jay Patel",
     "url": "https://github.com/jaypatel1210"

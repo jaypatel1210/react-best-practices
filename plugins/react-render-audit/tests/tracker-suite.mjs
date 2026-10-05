@@ -118,6 +118,44 @@ export function trackerSuite(label, React, createRoot) {
       expect(typeof update.Plain.selfMs).toBe('number');
     });
 
+    it('records render time per component and per cause, including the subtree of a wasted render', () => {
+      const spin = (ms) => {
+        const end = performance.now() + ms;
+        while (performance.now() < end);
+      };
+      let bump;
+      function TimedLeaf() {
+        spin(2);
+        return h('i', null, 'leaf');
+      }
+      function TimedPanel() {
+        spin(2);
+        return h('div', null, h(TimedLeaf));
+      }
+      function TimedPage() {
+        const [n, setN] = useState(0);
+        bump = () => setN((value) => value + 1);
+        return h('section', null, h('b', null, n), h(TimedPanel));
+      }
+
+      const mount = step('mount', () => root.render(h(TimedPage)));
+      expect(byName(mount).TimedPanel.mountMs).toBeGreaterThanOrEqual(1.5);
+      expect(mount.mountMs).toBeGreaterThanOrEqual(3);
+
+      const data = step('bump', () => bump());
+      const rows = byName(data);
+      // Both re-renders were wasted: the panel's own 2 ms, and 4 ms with the leaf it re-rendered.
+      expect(rows.TimedPanel.wastedMs).toBeGreaterThanOrEqual(1.5);
+      expect(rows.TimedPanel.updateMs).toBe(rows.TimedPanel.wastedMs);
+      expect(rows.TimedPanel.wastedTreeMs).toBeGreaterThanOrEqual(rows.TimedPanel.wastedMs + 1.5);
+      expect(rows.TimedPage.wastedMs).toBe(0);
+      expect(data.wastedMs).toBeGreaterThanOrEqual(3);
+      // The state change in TimedPage caused them, so their time is charged to it.
+      const cause = data.sources.find((entry) => entry.id === typeId('TimedPage'));
+      expect(cause.wastedMs).toBeGreaterThanOrEqual(3);
+      expect(cause.ms).toBeGreaterThanOrEqual(cause.wastedMs);
+    });
+
     it('detects context consumers re-rendered by a new value with the same content', () => {
       const Settings = createContext(null);
       Settings.displayName = 'SettingsContext';

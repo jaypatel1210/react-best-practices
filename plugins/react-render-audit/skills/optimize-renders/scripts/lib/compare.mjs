@@ -1,7 +1,9 @@
 // Compares a measurement with the baseline: did behavior stay the same at every step (visible
-// text, accessibility tree, DOM, network requests, console errors), and did renders go down?
-// Lines that already differ between baseline runs (clocks, random ids) are learned as noise and
-// ignored, so only differences the change introduced are reported.
+// text, accessibility tree, DOM, network requests, console errors)? Lines that already differ
+// between baseline runs (clocks, random ids) are learned as noise and ignored, so only differences
+// the change introduced are reported. It also shows how render work changed (renders and React
+// render time), but that doesn't decide anything: whether a fix made the app faster is decided by
+// the timing benchmark (bench --quick).
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { aggregate, loadRuns, scenariosOf } from './analyze.mjs';
@@ -126,16 +128,16 @@ export function compareScenario(config, { base, after, prev, scenario, allowDom 
     const equivalent = Object.values(behavior).every((channel) => channel.same) || (allowDom && domOnly);
     const pick = (agg) => {
       const s = agg.steps[index];
-      return { renders: s.renders, scopeRenders: s.scopeRenders, scopeCaused: s.scopeCaused, wasted: s.wasted, remounts: s.remounts, cascades: s.cascades, commits: s.commits, longFrameMs: s.longFrameMs, interactionMs: s.interactionMs };
+      return { renders: s.renders, scopeRenders: s.scopeRenders, scopeCaused: s.scopeCaused, wasted: s.wasted, remounts: s.remounts, cascades: s.cascades, commits: s.commits, renderMs: s.renderMs, wastedMs: s.wastedMs || 0, longFrameMs: s.longFrameMs, interactionMs: s.interactionMs };
     };
     return { index, name: step.name, before: pick(prevAgg), after: pick(afterAgg), baseline: pick(baseAgg), behavior, equivalent, domOnly };
   });
 
-  // Decisions use every component's renders across all steps: a fix in the scope usually saves
-  // most of its renders in components that live elsewhere (design-system primitives, libraries).
+  // Totals use every component's renders across all steps: a fix in the scope usually saves most
+  // of its renders in components that live elsewhere (design-system primitives, libraries).
   const metric = 'renders';
   const totals = {};
-  for (const field of ['renders', 'wasted', 'scopeRenders', 'scopeCaused', 'remounts', 'cascades', 'commits']) {
+  for (const field of ['renders', 'wasted', 'scopeRenders', 'scopeCaused', 'remounts', 'cascades', 'commits', 'renderMs', 'wastedMs']) {
     totals[field] = { baseline: stepSum(baseAgg.steps, field), before: stepSum(prevAgg.steps, field), after: stepSum(afterAgg.steps, field) };
   }
   totals.longFrameMs = {
@@ -171,23 +173,12 @@ export function compareScenario(config, { base, after, prev, scenario, allowDom 
   deltas.sort((x, y) => Math.abs(y.after - y.before) - Math.abs(x.after - x.before));
 
   const changedSteps = steps.filter((step) => !step.equivalent);
-  const m = totals[metric];
-  const regressed = m.after > m.before * 1.02 + 2 || totals.wasted.after > totals.wasted.before * 1.02 + 2;
-  const improved =
-    m.after < m.before || totals.wasted.after < totals.wasted.before || totals.remounts.after < totals.remounts.before || totals.cascades.after < totals.cascades.before || totals.commits.after < totals.commits.before;
-  let verdict = 'PASS';
-  let exitCode = 0;
-  if (changedSteps.length) {
-    verdict = 'BEHAVIOR CHANGED';
-    exitCode = 3;
-  } else if (regressed) {
-    verdict = 'REGRESSED';
-    exitCode = 4;
-  } else if (!improved) {
-    verdict = 'NO IMPROVEMENT';
-    exitCode = 5;
-  }
-  return { scenario, base, after, prev: prev || base, metric, steps, totals, deltas, verdict, exitCode, allowDom };
+  // Information for the fix loop, not a verdict: did the fix reduce render work at all? A fix
+  // that defers work (useDeferredValue, startTransition) can add renders and still be faster.
+  const timed = totals.renderMs.before > 0 || totals.renderMs.after > 0;
+  const lessWork = timed ? totals.renderMs.after < totals.renderMs.before : totals.renders.after < totals.renders.before || totals.wasted.after < totals.wasted.before;
+  const verdict = changedSteps.length ? 'BEHAVIOR CHANGED' : 'PASS';
+  return { scenario, base, after, prev: prev || base, metric, steps, totals, deltas, timed, lessWork, verdict, exitCode: changedSteps.length ? 3 : 0, allowDom };
 }
 
 export function compareLabels(config, { base = 'baseline', after, prev, allowDom = false }) {
@@ -207,25 +198,26 @@ export function formatCompare(result) {
   lines.push(`Compare "${result.after}" with "${result.base}" (behavior)${result.prev !== result.base ? ` and "${result.prev}" (renders)` : ''}`);
   for (const scenario of result.scenarios) {
     lines.push('', `Scenario ${scenario.scenario}:`);
-    const rows = [['#', 'step', 'renders', 'wasted', 'from scope', 'remounts', 'longest frame', 'behavior']];
+    const rows = [['#', 'step', 'behavior', 'React time', 'renders', 'wasted', 'from scope', 'remounts']];
     for (const step of scenario.steps) {
       const changed = Object.entries(step.behavior).filter(([, channel]) => !channel.same).map(([name]) => name);
       rows.push([
         step.index,
         step.name,
+        changed.length ? `CHANGED (${changed.join(', ')})${step.equivalent ? ' allowed' : ''}` : 'same',
+        scenario.timed ? arrow(round(step.before.renderMs, 1), round(step.after.renderMs, 1), ' ms') : '—',
         `${arrow(step.before.renders, step.after.renders)}${step.before.renders !== step.after.renders ? ` ${percentChange(step.before.renders, step.after.renders)}` : ''}`,
         arrow(step.before.wasted, step.after.wasted),
         arrow(step.before.scopeCaused || 0, step.after.scopeCaused || 0),
         arrow(step.before.remounts || 0, step.after.remounts || 0),
-        step.before.longFrameMs || step.after.longFrameMs ? arrow(step.before.longFrameMs, step.after.longFrameMs, ' ms') : '—',
-        changed.length ? `CHANGED (${changed.join(', ')})${step.equivalent ? ' allowed' : ''}` : 'same',
       ]);
     }
     lines.push(table(rows, { indent: '  ' }));
     const t = scenario.totals;
     lines.push(
-      `  Totals (all steps): renders ${arrow(t.renders.before, t.renders.after)} (${percentChange(t.renders.before, t.renders.after)}), wasted ${arrow(t.wasted.before, t.wasted.after)}, started from scope ${arrow(t.scopeCaused.before, t.scopeCaused.after)}, remounts ${arrow(t.remounts.before, t.remounts.after)}, effect cascades ${arrow(t.cascades.before, t.cascades.after)}, commits ${arrow(t.commits.before, t.commits.after)}`,
+      `  Render work (all steps): ${scenario.timed ? `React time ${arrow(t.renderMs.before, t.renderMs.after, ' ms')} (${percentChange(t.renderMs.before, t.renderMs.after)}), ` : ''}renders ${arrow(t.renders.before, t.renders.after)} (${percentChange(t.renders.before, t.renders.after)}), wasted ${arrow(t.wasted.before, t.wasted.after)}, started from scope ${arrow(t.scopeCaused.before, t.scopeCaused.after)}, remounts ${arrow(t.remounts.before, t.remounts.after)}, effect cascades ${arrow(t.cascades.before, t.cascades.after)}, commits ${arrow(t.commits.before, t.commits.after)}`,
     );
+    if (!scenario.lessWork) lines.push('  Render work did not go down. Unless the fix defers work (useDeferredValue, startTransition), the benchmark is unlikely to show a gain.');
     if (result.prev !== result.base) lines.push(`  Since baseline: renders ${arrow(t.renders.baseline, t.renders.after)} (${percentChange(t.renders.baseline, t.renders.after)})`);
     const drops = scenario.deltas.filter((delta) => delta.after < delta.before).slice(0, 6);
     const rises = scenario.deltas.filter((delta) => delta.after > delta.before).slice(0, 6);
@@ -246,10 +238,8 @@ export function formatCompare(result) {
   }
   lines.push('');
   const explain = {
-    PASS: 'behavior identical at every step and renders went down. Keep the change.',
+    PASS: 'behavior identical at every step. Next, prove the fix made the slow steps faster (bench --quick); keep it only if it did.',
     'BEHAVIOR CHANGED': 'the page behaves differently. Revert the change, or fix it and measure again. If the only difference is in the DOM and is intended (e.g. a hashed class name), re-run compare with --allow-dom and say why in the change log.',
-    REGRESSED: 'behavior is the same but renders went up. Revert the change.',
-    'NO IMPROVEMENT': 'behavior is the same but nothing measurable improved. Revert unless it is a prerequisite for the next fix.',
   };
   lines.push(`Verdict: ${result.verdict} — ${explain[result.verdict]}`);
   return lines.join('\n');

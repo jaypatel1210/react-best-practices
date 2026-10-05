@@ -14,6 +14,10 @@
  *   parent           its parent re-rendered and every prop is equal                      (wasted)
  *   self             it rendered on its own and no cause was detected (forced update, etc.)
  *
+ * Each render also carries its time from React's profiling timers (development builds): self time
+ * (the component alone) and, for wasted renders, the time of the subtree it re-rendered with it.
+ * Times add up per component and per cause, so fixes can be ranked by the time they would save.
+ *
  * Results are grouped into steps that the runner opens and closes around each scenario action.
  * Everything is read through window.__RENDER_AUDIT__. Nothing in here may throw into the app.
  */
@@ -355,6 +359,8 @@
       wasted: 0,
       cascadeCommits: 0,
       renderMs: 0,
+      mountMs: 0,
+      wastedMs: 0,
       byType: new Map(),
       sources: new Map(),
       commitLog: [],
@@ -377,6 +383,11 @@
         contexts: {},
         selfMs: 0,
         maxSelfMs: 0,
+        mountMs: 0,
+        updateMs: 0,
+        updateTreeMs: 0,
+        wastedMs: 0,
+        wastedTreeMs: 0,
         instances: new Set(),
         maxPerCommit: 0,
         causedBy: {},
@@ -391,7 +402,7 @@
   function sourceFor(step, id) {
     let source = step.sources.get(id);
     if (!source) {
-      source = { triggers: 0, renders: 0, wasted: 0, mounts: 0 };
+      source = { triggers: 0, renders: 0, wasted: 0, mounts: 0, ms: 0, wastedMs: 0 };
       step.sources.set(id, source);
     }
     return source;
@@ -400,6 +411,14 @@
   // ---------------------------------------------------------------------------------------------
   // Commit traversal
 
+  // A fiber's render time in this commit, from React's profiling timers (0 without them):
+  // selfBaseDuration is the component alone, actualDuration includes the descendants that
+  // rendered with it.
+  function durationOf(value) {
+    return typeof value === 'number' && value > 0 ? value : 0;
+  }
+
+  /** Counts one render and returns its self time. */
   function addRender(stats, fiber, commit, id, parentId) {
     stats.renders++;
     const owner = ownerIdOf(fiber, parentId);
@@ -408,25 +427,27 @@
     commit.renders++;
     commit.rendered.add(id);
     commit.perType.set(id, (commit.perType.get(id) || 0) + 1);
-    const self = fiber.selfBaseDuration;
-    if (typeof self === 'number' && self >= 0) {
-      stats.selfMs += self;
-      if (self > stats.maxSelfMs) stats.maxSelfMs = self;
-    }
+    const self = durationOf(fiber.selfBaseDuration);
+    stats.selfMs += self;
+    if (self > stats.maxSelfMs) stats.maxSelfMs = self;
+    return self;
   }
 
   function recordMount(fiber, commit, source, parentId) {
     const id = typeIdOf(fiber);
     if (id < 0) return;
     const stats = statsFor(commit.step, id);
-    addRender(stats, fiber, commit, id, parentId);
+    const ms = addRender(stats, fiber, commit, id, parentId);
     stats.mounts++;
+    stats.mountMs += ms;
     commit.step.mounts++;
+    commit.step.mountMs += ms;
     commit.mounted.set(id, (commit.mounted.get(id) || 0) + 1);
     if (source >= 0) {
       const cause = sourceFor(commit.step, source);
       cause.renders++;
       cause.mounts++;
+      cause.ms += ms;
       if (source !== id) stats.causedBy[source] = (stats.causedBy[source] || 0) + 1;
     }
   }
@@ -436,7 +457,10 @@
     const id = typeIdOf(next);
     if (id < 0) return source;
     const stats = statsFor(commit.step, id);
-    addRender(stats, next, commit, id, parentId);
+    const ms = addRender(stats, next, commit, id, parentId);
+    const treeMs = Math.max(ms, durationOf(next.actualDuration));
+    stats.updateMs += ms;
+    stats.updateTreeMs += treeMs;
 
     const hooks = next.tag === TAG.Class ? classStateChanges(next, prev) : hookChanges(next, prev);
     const contexts = contextChanges(next, prev, commit);
@@ -455,7 +479,10 @@
     const wasted = reason === 'parent' || reason === 'propsUnstable' || reason === 'contextUnstable';
     if (wasted) {
       stats.wasted++;
+      stats.wastedMs += ms;
+      stats.wastedTreeMs += treeMs;
       commit.step.wasted++;
+      commit.step.wastedMs += ms;
       commit.wasted++;
     }
 
@@ -481,7 +508,11 @@
     if (cause >= 0) {
       const entry = sourceFor(commit.step, cause);
       entry.renders++;
-      if (wasted) entry.wasted++;
+      entry.ms += ms;
+      if (wasted) {
+        entry.wasted++;
+        entry.wastedMs += ms;
+      }
       if (cause !== id) stats.causedBy[cause] = (stats.causedBy[cause] || 0) + 1;
     }
     return cause;
@@ -664,6 +695,11 @@
         contexts: stats.contexts,
         selfMs: round(stats.selfMs),
         maxSelfMs: round(stats.maxSelfMs),
+        mountMs: round(stats.mountMs),
+        updateMs: round(stats.updateMs),
+        updateTreeMs: round(stats.updateTreeMs),
+        wastedMs: round(stats.wastedMs),
+        wastedTreeMs: round(stats.wastedTreeMs),
         instances: stats.instances.size,
         maxPerCommit: stats.maxPerCommit,
         causedBy: stats.causedBy,
@@ -672,7 +708,7 @@
       });
     }
     const sources = [];
-    for (const [id, source] of step.sources) sources.push({ id, ...source });
+    for (const [id, source] of step.sources) sources.push({ id, ...source, ms: round(source.ms), wastedMs: round(source.wastedMs) });
     const inStep = (start) => start >= step.startedAt && start <= step.endedAt;
     const longFrames = frames.filter((frame) => inStep(frame.start) && frame.duration >= 50);
     const slowInteractions = interactions.filter((entry) => inStep(entry.start));
@@ -687,6 +723,8 @@
       wasted: step.wasted,
       cascadeCommits: step.cascadeCommits,
       renderMs: round(step.renderMs),
+      mountMs: round(step.mountMs),
+      wastedMs: round(step.wastedMs),
       longFrames: {
         count: longFrames.length,
         maxMs: round(longFrames.reduce((max, frame) => Math.max(max, frame.duration), 0)),

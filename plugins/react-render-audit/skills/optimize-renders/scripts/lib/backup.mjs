@@ -37,6 +37,14 @@ export function backup(audit, label, root, files) {
   return added;
 }
 
+/** The files saved under `label`: { path, existed, stored } (stored is the saved copy, or null). */
+export function backedUp(audit, label) {
+  const file = manifestPath(audit, label);
+  if (!existsSync(file)) throw new Error(`No backup named "${label}" in ${audit}`);
+  const manifest = readJson(file);
+  return manifest.files.map((entry) => ({ ...entry, stored: entry.existed ? storedPath(audit, label, manifest.root, entry.path) : null }));
+}
+
 /** Puts every file saved under `label` back, and deletes the ones that didn't exist before. */
 export function restore(audit, label) {
   const file = manifestPath(audit, label);
