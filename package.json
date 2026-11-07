@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:render-audit": "vitest run --config plugins/react-render-audit/vitest.config.mjs",
     "e2e:render-audit": "node plugins/react-render-audit/tests/e2e.mjs",
+    "demo:resize": "node plugins/react-render-audit/tests/resize-demo.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "validate": "claude plugin validate --strict .",

@@ -50,6 +50,36 @@ Claude reads `SKILL.md` first and opens an example or reference only when the ta
 
 They're dependency-free, typed, tested against React 18 and React 19, and clean under the React Compiler lint rules (see [Maintaining](#maintaining)).
 
+## Worked example: a resize that re-renders the whole page
+
+The render audit's test lab has this bug planted in [`broken.jsx`](plugins/react-render-audit/fixtures/lab/src/broken.jsx), and [`fixed.jsx`](plugins/react-render-audit/fixtures/lab/src/fixed.jsx) has the fix. You can reproduce and check it yourself.
+
+The store keeps `window.innerWidth` in state, but only uses it to test `width < 700`. Every resize event sets new state, so the whole store renders again even when the layout stays the same.
+
+Expected behavior: the store renders only when the width crosses 700px, and the promo banner still switches to its compact style at that point.
+
+To reproduce and verify it, start the lab in one terminal:
+
+```bash
+bun install
+cd plugins/react-render-audit/fixtures/lab && bun run dev
+```
+
+Then run the check from the repository root in another:
+
+```bash
+bun run demo:resize
+```
+
+It loads each version at 1000px in headless Chrome, resizes five times between 950px and 750px, then resizes to 650px. It counts committed `Store` renders with the lab's own counter, and exits 1 unless the results below hold.
+
+| Version | Renders over 5 resizes above 700px | Renders on crossing 700px | Banner turns compact |
+|---|---:|---:|---|
+| `broken` | 5 | 1 | Yes |
+| `fixed` | 0 | 1 | Yes |
+
+The fix subscribes to the breakpoint with `matchMedia` and `useSyncExternalStore`, as described in the `react-rerenders` skill's guidance on hooks that hide state.
+
 ## Install
 
 ### Claude Code (recommended): as a plugin
